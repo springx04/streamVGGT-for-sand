@@ -1,0 +1,1045 @@
+OmniVGGT 流式点云实时观察与交互式回放：具体项
+目实现方案
+一、最终实现目标
+项目最终拆分为两个独立进程：
+1. omnivggt_stream_server.exe ：负责持续接收图像、执行差异检测与模型推理、更新权威点云状态、
+生成增量记录、保存历史并向客户端实时发布。
+2. omnivggt_live_viewer.exe ：负责实时渲染点云、保持最新状态、独立重建历史状态、控制帧时间轴
+以及执行三维旋转、缩放和平移。
+系统运行后具有以下确定语义：
+• 每接收到一张输入图像，就生成一个单调递增的 frame_seq 。
+• 每次真正修改点云状态，就生成一个单调递增的 commit_version 。
+• 时间轴以 frame_seq 为单位，而不是绝对时间。
+• 用户停留在历史帧时，后端输入、推理、点云更新和 live_head_frame 继续推进。
+• 用户点击“返回实时”时，不重新加载数据，而是直接切换到持续维护的 LiveState 。
+• 用户切换帧时，三维观察相机不重置，仍可在同一观察视角下比较不同帧。
+• 每一个历史帧都可以确定性地恢复到当时的点云状态。
+• 当前帧发生变化的点可以高亮，必要时还可以同时显示更新前和更新后的点。
+核心架构固定为：
+图像输入
+ ↓
+帧接入与编号
+ ↓
+二维对齐
+ ↓
+差异掩码
+ ↓
+差异合成图推理
+ ↓
+深度对齐
+ ↓
+构造候选点云 Patch
+ ↓
+单写者原子提交
+ ├── 更新权威 CanvasState
+ ├── 写入增量日志
+ ├── 周期性生成快照
+ └── 发布给实时 Viewer
+ ↓
+ LiveState 持续更新
+用户拖动时间轴
+1
+ ↓
+ PlaybackState 独立重建
+二、对当前代码的准确判断
+2.1 当前代码为什么只能在输入结束后看到点云
+当前 omnivggt_stream.cpp 的主循环确实逐帧执行推理和融合，但是在整个循环结束以后才调用：
+write_canvas_ply(out_dir / "stream_pointcloud.ply", canvas, args);
+也就是说，目前所谓“流式”仅发生在推理和 CanvasState 更新层面，输出层仍然是离线的。循环内部没有任
+何以下机制：
+• 点云提交事件；
+• 增量点云数据；
+• 实时发布接口；
+• 非阻塞渲染线程；
+• 历史状态记录；
+• 帧到点云版本的索引。
+因此，不能通过简单地每帧重新写一个 PLY 来真正解决问题。那样不仅开销大，而且无法支持可交互时间轴和
+实时状态与历史状态解耦。
+2.2 当前流式状态本质上是 2.5D 深度画布
+当前 CanvasState 存储的是：
+cv::Mat rgb_f;
+cv::Mat depth;
+cv::Mat conf;
+cv::Mat weight;
+cv::Mat valid;
+cv::Mat support;
+每个首帧画布像素对应至多一个深度值。最终写 PLY 时，三维坐标通过下面的方式得到：
+px = normalized_pixel_x;
+py = normalized_pixel_y;
+pz = canvas.depth[y][x];
+因此，当前流式路径并不是一个可以任意插入和删除无序三维点的通用点云，而是一个固定分辨率的、首帧坐
+标系下的二维栅格深度场，也就是典型的 2.5D 点云。
+2
+这并不妨碍实现用户要求的三维旋转和时间回放。相反，固定的 518×518 像素槽位使第一版实现更简单、更稳
+定：每个像素天然就是一个永久稳定的 point_id ，不用立即引入复杂的三维哈希表、KD-tree 或动态点分配
+器。
+本方案因此明确采用：
+point_id = y * canvas_width + x
+对于 518×518 输入，总槽位数恒定为：
+268324 个 point slot
+每个槽位在不同帧中可以是有效、无效或被更新，但槽位编号永远不变。
+2.3 当前代码并没有真正只对差异区域节省模型计算
+当前流程先计算 change_mask ，但只要变化比例超过 no_change_ratio ，仍然执行：
+Prediction pred = run_model(module, frame, ...);
+传入的是完整当前帧。 change_mask 只在后面的 fuse() 中限制哪些像素被写入 Canvas，并不会减少
+TorchScript 模型的计算量。
+因此必须区分两个概念：
+• 增量点云更新：当前代码已经部分实现，只修改掩码内的状态。
+• 增量神经网络计算：当前代码尚未实现，模型仍然运行完整 518×518 输入。
+本项目的实时可视化系统不依赖模型是否真正实现 ROI 级加速，但为了与设想的“差异点合成新图后单独推
+理”一致，推理输入需要改为锚点坐标下的差异合成图。
+2.4 当前融合语义是加权平均，不是替换
+当前 fuse() 使用：
+new_depth = (old_depth * old_weight + observation * new_weight)
+/ total_weight;
+RGB 也使用相同的加权平均方式。这与“差异区域推理后替换原点云”并不完全一致。
+如果场景中的物体发生移动，加权平均可能留下拖影、旧表面或深度中间值。具体实现中应将更新策略改为：
+• 对于静态重复观测，可以保留轻微融合；
+• 对于被 change_mask 明确判定为变化的区域，默认执行替换；
+• 旧状态必须被保存到 Delta 中，以支持向后回放。
+3
+因此，新的核心操作不再叫 fuse() ，而叫：
+build_replacement_patch()
+apply_patch()
+三、具体工程架构
+3.1 建议的工程目录
+保留当前 omnivggt_edge.cpp 作为离线推理工具，逐步将 omnivggt_stream.cpp 拆分为以下结构：
+setc/
+├── CMakeLists.txt
+├── proto/
+│ └── pointcloud_stream.proto
+│
+├── src/
+│ ├── core/
+│ │ ├── stream_types.hpp
+│ │ ├── frame_source.hpp
+│ │ ├── frame_source.cpp
+│ │ ├── frame_preprocessor.hpp
+│ │ ├── frame_preprocessor.cpp
+│ │ ├── model_runner.hpp
+│ │ ├── model_runner.cpp
+│ │ ├── image_aligner.hpp
+│ │ ├── image_aligner.cpp
+│ │ ├── change_detector.hpp
+│ │ ├── change_detector.cpp
+│ │ ├── canvas_state.hpp
+│ │ ├── canvas_state.cpp
+│ │ ├── patch_builder.hpp
+│ │ ├── patch_builder.cpp
+│ │ ├── version_store.hpp
+│ │ ├── version_store.cpp
+│ │ ├── stream_log.hpp
+│ │ ├── stream_log.cpp
+│ │ └── bounded_queue.hpp
+│ │
+│ ├── server/
+│ │ ├── grpc_stream_service.hpp
+│ │ ├── grpc_stream_service.cpp
+│ │ └── stream_server_main.cpp
+│ │
+│ ├── viewer/
+│ │ ├── viewer_main.cpp
+4
+│ │ ├── stream_client.hpp
+│ │ ├── stream_client.cpp
+│ │ ├── live_state.hpp
+│ │ ├── live_state.cpp
+│ │ ├── playback_state.hpp
+│ │ ├── playback_state.cpp
+│ │ ├── replay_builder.hpp
+│ │ ├── replay_builder.cpp
+│ │ ├── point_renderer.hpp
+│ │ ├── point_renderer.cpp
+│ │ ├── orbit_camera.hpp
+│ │ ├── orbit_camera.cpp
+│ │ ├── timeline_controller.hpp
+│ │ └── timeline_controller.cpp
+│ │
+│ └── tools/
+│ ├── replay_log_main.cpp
+│ └── validate_history_main.cpp
+│
+└── tests/
+ ├── test_patch_roundtrip.cpp
+ ├── test_forward_backward_replay.cpp
+ ├── test_snapshot_rebuild.cpp
+ └── test_live_replay_equivalence.cpp
+最终生成以下目标：
+omnivggt_edge.exe
+omnivggt_stream_server.exe
+omnivggt_live_viewer.exe
+omnivggt_replay_log.exe
+omnivggt_validate_history.exe
+原来的 omnivggt_stream.cpp 在重构完成前保留为行为基准，不直接删除。
+四、核心数据模型
+4.1 帧编号与提交版本
+必须同时维护两个编号。
+using FrameSeq = std::uint64_t;
+using CommitVersion = std::uint64_t;
+frame_seq 表示输入顺序。任何接收到的输入图像都必须获得一个编号，即使该帧最终未运行模型。
+5
+commit_version 表示权威点云状态修改次数。只有成功应用一个 Patch 后才递增。
+例如：
+frame_seq: 100 101 102 103 104 105
+commit_version: 81 82 82 83 83 84
+status: OK OK SKIP OK SKIP OK
+帧 102 没有变化，因此它对应的点云状态仍然是版本 82；但时间轴仍然存在帧 102。
+帧索引定义为：
+enum class FrameStatus : std::uint8_t {
+Received,
+Aligning,
+DiffReady,
+Inferencing,
+Committed,
+NoChange,
+Coalesced,
+Failed
+};
+struct FrameRecord {
+FrameSeq frame_seq;
+CommitVersion base_version;
+CommitVersion commit_version;
+FrameStatus status;
+float changed_ratio;
+float align_error_px;
+std::uint32_t changed_point_count;
+std::uint32_t valid_point_count;
+std::string image_name;
+};
+4.2 点槽位状态
+由于当前 Canvas 是固定二维栅格，不必在第一版使用通用稀疏三维点结构。
+CPU 侧使用 SoA：
+struct CanvasState {
+int width = 518;
+int height = 518;
+6
+std::vector<float> depth;
+std::vector<float> confidence;
+std::vector<std::uint32_t> rgba;
+std::vector<std::uint32_t> last_update_frame;
+std::vector<std::uint8_t> valid;
+cv::Mat anchor_rgb_u8;
+cv::Mat canvas_rgb_f;
+cv::Mat support;
+AnchorCamera anchor_camera;
+CommitVersion version = 0;
+};
+推荐让 cv::Mat 只用于图像处理阶段。权威点云状态的深度、置信度和颜色应逐渐迁移到连续 std::vector
+中，因为：
+• 更适合序列化；
+• 更适合快照；
+• 更适合生成 GPU 数据；
+• 不依赖 OpenCV 的引用计数和步长；
+• 更容易进行精确前后版本比较。
+锚点相机记录为：
+struct AnchorCamera {
+float fx;
+float fy;
+float cx;
+float cy;
+float depth_scale = 1.0f;
+float depth_bias = 0.0f;
+};
+三维位置不必在 CPU 中永久存储，可以由像素槽位和深度即时计算：
+X = (x - cx) / fx * Z;
+Y = -(y - cy) / fy * Z;
+Z = depth;
+这样既比当前归一化 x/y 更符合透视几何，也能减少日志和网络负载。
+4.3 单点前后状态
+为了支持时间轴向前和向后逐帧播放，每次变化必须记录旧值和新值。
+7
+struct SlotValue {
+float depth;
+float confidence;
+std::uint32_t rgba;
+std::uint32_t last_update_frame;
+std::uint8_t valid;
+};
+struct SlotDelta {
+std::uint32_t slot_id;
+SlotValue before;
+SlotValue after;
+};
+单帧点云增量：
+struct PointCloudDelta {
+FrameSeq frame_seq;
+CommitVersion from_version;
+CommitVersion to_version;
+std::vector<SlotDelta> changes;
+float changed_ratio;
+std::uint32_t valid_point_count;
+bool scene_jump;
+};
+存储 before 和 after 的直接收益是：
+apply_forward(delta):
+state[slot_id] = after
+apply_backward(delta):
+state[slot_id] = before
+因此，当用户在相邻帧间拖动时，不需要每次从快照重新构建。
+4.4 Patch 的二维分块
+为了避免将成千上万个离散槽位分别上传 GPU，将 Canvas 划分为 32×32 的 Tile。
+8
+tile_x = x / 32
+tile_y = y / 32
+tile_id = tile_y * tile_count_x + tile_x
+518×518 最终得到约 17×17 个 Tile。
+每个 Delta 构建时同时统计：
+std::vector<std::uint32_t> dirty_tile_ids;
+CPU 侧仍然逐点应用 Patch；GPU 更新时则以 Tile 为单位上传连续数据。这样可以把数千次小型 OpenGL 调用
+变成十几次或几十次连续更新。
+五、对现有推理流程的具体改造
+5.1 重构 Prediction
+当前 Prediction 只保留：
+cv::Mat depth;
+cv::Mat conf;
+而 TorchScript 模型实际输出五个张量：
+pose_enc
+depth
+depth_conf
+world_points
+world_points_conf
+新的定义为：
+struct Prediction {
+cv::Mat depth;
+cv::Mat depth_conf;
+float fov_h;
+float fov_w;
+// 主要用于调试和算法验证，不作为首版权威状态。
+torch::Tensor world_points_cpu;
+9
+torch::Tensor world_points_conf_cpu;
+};
+首帧推理完成后，从 pose_enc 中获得 FOV，计算锚点相机内参：
+fy = (height * 0.5f) / tan(fov_h * 0.5f);
+fx = (width * 0.5f) / tan(fov_w * 0.5f);
+cx = width * 0.5f;
+cy = height * 0.5f;
+如果实际模型的 pose_enc 语义与 omnivggt_edge.cpp 中一致，可以直接复用该文件的解析代码。
+5.2 增加差异合成输入
+现有代码先把当前图像 warp 到首帧 Canvas：
+warped_rgb_f = warp(current_frame, H_current_to_anchor);
+之后新增：
+cv::Mat build_inference_composite(
+const CanvasState& canvas,
+const cv::Mat& warped_current_rgb,
+const cv::Mat& change_mask,
+const cv::Mat& valid_warp);
+合成规则：
+首帧：
+ composite = frame.rgb
+后续帧：
+ composite = canvas 当前 RGB
+ change_mask 内替换为 warped_current_rgb
+ 新出现且 valid_warp 有效的区域替换为当前 RGB
+伪代码：
+cv::Mat composite = canvas.canvas_rgb_f.clone();
+warped_current_rgb.copyTo(composite, change_mask);
+模型随后直接处理锚点坐标系下的 composite ，输出的深度天然对应锚点 Canvas，因此不再需要先对原图推
+理、再对深度进行 Homography warp。
+10
+需要明确：固定形状 TorchScript 模型仍然运行完整 518×518 计算。差异合成保证的是状态语义和输出一致
+性，而不是自动减少网络 FLOPs。若论文声称模型计算量也按变化区域下降，则还需要另外改造模型或实现
+ROI 推理；但这不会影响实时观察与回放系统。
+5.3 将 fuse() 替换为两阶段提交
+当前 fuse() 同时承担状态修改和融合，无法获得修改前的状态，也无法构造可重放 Delta。
+改为：
+CandidatePatch build_replacement_patch(
+const CanvasState& current,
+const cv::Mat& inferred_depth,
+const cv::Mat& inferred_conf,
+const cv::Mat& composite_rgb,
+const cv::Mat& update_mask,
+FrameSeq frame_seq,
+const Args& args);
+然后由唯一的提交器调用：
+PointCloudDelta commit_patch(
+CanvasState& state,
+CandidatePatch&& patch);
+构造 Patch 时，不立即修改 Canvas：
+for each pixel in update_mask:
+read before state
+construct after state
+append SlotDelta
+变化区域的默认更新逻辑为：
+if new_depth valid and confidence >= min_conf:
+after.depth = new_depth
+after.confidence = new_confidence
+after.rgba = new_color
+after.valid = true
+else if region is explicitly confirmed removed:
+after.valid = false
+else:
+do not create SlotDelta
+对于用户描述的“替换”，变化区域不再使用旧权重累积：
+11
+after.depth = inferred_depth;
+after.color = current_color;
+after.confidence = inferred_confidence;
+可在边缘区域增加短距离羽化，但不能对整个变化区域继续无限加权平均，否则动态物体容易产生拖影。
+5.4 无变化帧也必须提交时间轴记录
+当前代码在 skip_model 时什么都不更新。新的逻辑是：
+if changed_ratio <= no_change_ratio:
+append FrameRecord {
+frame_seq,
+base_version = current_version,
+commit_version = current_version,
+status = NoChange
+};
+publish FrameStatusMessage;
+不生成点云 Delta，但时间轴继续向前。
+六、服务器端具体线程模型
+服务器进程采用四条逻辑链路，但只有一个线程可以修改权威点云。
+6.1 FrameSource 线程
+当前 list_images() 在启动时列出固定数量的文件，不支持持续输入。替换为：
+class FrameSource {
+public:
+virtual std::optional<RawFrame> next() = 0;
+};
+第一版实现 DirectoryFrameSource ：
+• 启动时读取已有图片并排序；
+• 之后持续监听目录；
+• 新文件大小和修改时间连续两次扫描不变后才认为写入完成；
+• 每个文件只处理一次；
+• frame_seq 由系统分配，不依赖文件名；
+• 新图片进入容量有限的输入队列。
+12
+Windows 下可以先使用 20–50 ms 周期的 std::filesystem 扫描。目录监视不是系统性能瓶颈，无需一开始
+接入复杂的原生文件系统事件 API。
+6.2 InferenceWorker 线程
+推理线程严格串行运行当前 TorchScript 模块：
+Frame
+ → preprocess
+ → align
+ → diff
+ → composite
+ → model
+ → depth alignment
+ → CandidatePatch
+LibTorch 模型和 CUDA 上下文只由该线程持有。
+推理线程不直接写权威 Canvas，只产生：
+struct CandidateCommit {
+FrameRecord frame;
+CandidatePatch patch;
+StreamMetrics metrics;
+};
+并将其送入 Commit 队列。
+6.3 CommitWorker：唯一写者
+CommitWorker 是整个系统唯一可以修改 CanvasState 、 commit_version 和历史索引的线程。
+处理顺序：
+接收 CandidateCommit
+ ↓
+检查 base_version
+ ↓
+为 Patch 分配 to_version
+ ↓
+应用到权威 CanvasState
+ ↓
+构造含 before/after 的 PointCloudDelta
+ ↓
+写入 append-only 日志
+ ↓
+更新 frame index
+13
+ ↓
+必要时写 Snapshot
+ ↓
+发布给网络订阅者
+这里必须保证：
+磁盘日志成功写入以后，才对客户端发布新版本
+否则服务器崩溃后可能出现客户端曾经看到、但服务器无法恢复的版本。
+6.4 Publisher 线程
+提交完成的 Delta 使用不可变对象发布：
+std::shared_ptr<const PointCloudDelta>
+每个客户端拥有独立的有限队列。慢客户端不得阻塞 CommitWorker。
+若客户端队列溢出：
+停止给该客户端继续塞入逐帧 Delta
+发送 ResyncRequired
+要求客户端重新加载最新 Snapshot
+这比无限积压更合理，因为实时观察首先要求跟上最新状态，而不是让服务器被一个卡顿客户端拖慢。
+七、历史日志和快照实现
+7.1 运行目录
+每次启动创建一个独立运行目录：
+stream_output/
+└── run_20260727_150312/
+ ├── run_meta.bin
+ ├── frame_index.bin
+ ├── deltas.bin
+ ├── deltas.idx
+ ├── snapshots/
+ │ ├── snapshot_0000000000.bin.zst
+ │ ├── snapshot_0000000060.bin.zst
+ │ └── snapshot_0000000120.bin.zst
+14
+ ├── metrics.csv
+ └── final_pointcloud.ply
+PLY 仅保留为最终导出格式，不再作为实时通信或历史存储格式。
+7.2 Append-only Delta 日志
+deltas.bin 按提交版本追加：
+struct DeltaRecordHeader {
+std::uint32_t magic;
+std::uint16_t schema_version;
+std::uint16_t flags;
+FrameSeq frame_seq;
+CommitVersion from_version;
+CommitVersion to_version;
+std::uint32_t change_count;
+std::uint32_t uncompressed_size;
+std::uint32_t compressed_size;
+std::uint32_t crc32;
+};
+后面是 Zstd 压缩的 SlotDelta 数组。
+deltas.idx 保存：
+struct DeltaIndexEntry {
+CommitVersion version;
+std::uint64_t file_offset;
+std::uint32_t record_size;
+};
+这样可以按版本直接定位，而不必扫描整个日志。
+7.3 Frame 索引
+frame_index.bin 保存每个 frame_seq 对应的版本：
+struct FrameIndexEntry {
+FrameSeq frame_seq;
+CommitVersion commit_version;
+FrameStatus status;
+15
+std::uint64_t delta_offset;
+};
+因此时间轴 seek 到第 1200 帧时，首先查询：
+frame 1200 → commit version 873
+而不是假设一帧一定对应一个点云版本。
+7.4 Snapshot
+每隔 60 个有效提交版本生成一个快照，或者累计 Delta 大小超过阈值时提前生成。
+快照保存完整数组：
+depth[N]
+confidence[N]
+rgba[N]
+last_update_frame[N]
+valid[N]
+anchor_camera
+commit_version
+518×518 的完整状态即使不压缩也只有数 MB，生成和加载都很轻，不需要首版就实现复杂的三维分块快照。
+7.5 回放恢复算法
+Seek 到目标帧 f ：
+v = frame_index[f].commit_version
+s = 最大且满足 snapshot.version <= v 的快照
+加载 snapshot s
+顺序应用 delta(s+1 ... v)
+相邻帧拖动时不重新加载快照：
+向前一帧：apply_forward(delta)
+向后一帧：apply_backward(delta)
+只有用户进行大跨度跳转时才执行快照重建。
+16
+八、网络协议
+8.1 两条独立 RPC 流
+虽然实时和历史数据共用一套版本语义，但建议使用两个独立 gRPC 流，避免加载较大的历史快照时阻塞实时
+Delta。
+service PointCloudStreamService {
+rpc SubscribeLive(SubscribeLiveRequest)
+returns (stream LiveMessage);
+rpc FetchReplay(ReplayRequest)
+returns (stream ReplayMessage);
+rpc GetRunInfo(RunInfoRequest)
+returns (RunInfo);
+}
+SubscribeLive 始终传输：
+• 新输入帧状态；
+• 已提交 Delta；
+• 最新 live_head_frame ；
+• 最新 commit_version ；
+• 必要时的重新同步通知。
+FetchReplay 专门传输：
+• 指定版本附近的快照；
+• 快照到目标版本之间的 Delta；
+• 缺失历史范围信息。
+这样用户查看历史时，实时链路仍然持续接收最新点云更新。
+8.2 Protobuf 外层，二进制内层
+不要为每一个点使用 protobuf repeated Point ，否则字段标签和对象构造开销较大。
+外层使用 protobuf：
+message DeltaEnvelope {
+uint64 frame_seq = 1;
+uint64 from_version = 2;
+uint64 to_version = 3;
+uint32 change_count = 4;
+Compression compression = 5;
+17
+bytes packed_delta = 6;
+}
+packed_delta 内使用固定的小端二进制结构。
+实时消息：
+message LiveMessage {
+oneof body {
+RunInfo run_info = 1;
+FrameStatus frame_status = 2;
+DeltaEnvelope delta = 3;
+LiveHead live_head = 4;
+ResyncRequired resync = 5;
+}
+}
+九、Viewer 的双状态设计
+9.1 LiveState
+LiveState 从连接建立开始持续接收并应用最新 Delta。
+class LiveState {
+public:
+void initialize(const Snapshot& snapshot);
+void apply(const PointCloudDelta& delta);
+FrameSeq live_head_frame() const;
+CommitVersion version() const;
+const RenderState& render_state() const;
+};
+即使用户正在看历史， LiveState 也绝不暂停。
+9.2 PlaybackState
+PlaybackState 只服务当前查看游标：
+class PlaybackState {
+public:
+void load_snapshot(const Snapshot& snapshot);
+void apply_forward(const PointCloudDelta& delta);
+18
+void apply_backward(const PointCloudDelta& delta);
+FrameSeq frame() const;
+CommitVersion version() const;
+};
+它和 LiveState 有独立的：
+• CPU 数组；
+• GPU Buffer；
+• Dirty Tile 集合；
+• 当前版本；
+• 更新队列。
+两者不能共享同一份可变 CanvasState ，否则用户回放会与实时 Delta 竞争写入。
+9.3 渲染状态切换
+渲染器每一帧只读取一个原子状态：
+enum class ViewMode {
+FollowLive,
+Playback
+};
+RenderState* active_state =
+mode == FollowLive
+? live_state.render_state()
+: playback_state.render_state();
+点击“返回实时”时：
+mode = FollowLive;
+view_cursor_frame = live_head_frame;
+不需要重新向服务器请求最新点云。
+9.4 时间轴状态
+struct TimelineState {
+std::atomic<FrameSeq> live_head_frame;
+FrameSeq view_cursor_frame;
+bool follow_live = true;
+bool playback_running = false;
+19
+float playback_fps = 10.0f;
+};
+收到新帧时：
+live_head_frame = new_frame_seq;
+if (follow_live) {
+view_cursor_frame = live_head_frame;
+}
+用户拖动时间轴时：
+follow_live = false;
+view_cursor_frame = dragged_frame;
+request_replay(view_cursor_frame);
+关键点是： live_head_frame 始终由后台推进，绝不因为 view_cursor_frame 停留在历史位置而停止。
+9.5 Seek 任务取消
+用户快速拖动时间轴可能连续产生大量 seek 请求。 ReplayBuilder 只处理最后一次用户意图。
+std::atomic<std::uint64_t> seek_generation;
+每次拖动：
+generation = ++seek_generation;
+enqueue_seek(target_frame, generation);
+后台重建时定期检查：
+if (generation != seek_generation.load()) {
+cancel current rebuild;
+}
+时间轴快速拖动期间可以继续显示最近完成的历史状态；用户停止拖动后再完成目标帧的精确重建。
+20
+十、OpenGL 点云渲染实现
+10.1 渲染技术栈
+Viewer 使用：
+GLFW
+Dear ImGui
+OpenGL 4.x
+GLAD
+不需要在第一版引入游戏引擎，也不需要复杂场景图。当前最多约 26.8 万个点，现代 GPU 可以轻松在 60 FPS
+下渲染。
+10.2 GPU Slot 结构
+GPU 中仍保持固定的 N = width × height 个槽位。
+struct alignas(16) GpuPointSlot {
+float depth;
+float confidence;
+std::uint32_t rgba;
+std::uint32_t last_update_frame;
+std::uint32_t flags;
+std::uint32_t padding0;
+std::uint32_t padding1;
+std::uint32_t padding2;
+};
+flags 至少包含：
+constexpr uint32_t POINT_VALID = 1 << 0;
+constexpr uint32_t POINT_CHANGED_AT_CURSOR = 1 << 1;
+Vertex Shader 根据 gl_VertexID 计算像素坐标：
+int x = gl_VertexID % canvas_width;
+int y = gl_VertexID / canvas_width;
+float X = (float(x) - cx) / fx * depth;
+float Y = -(float(y) - cy) / fy * depth;
+float Z = depth;
+21
+无效槽位直接丢弃：
+if ((flags & POINT_VALID) == 0u) {
+gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+return;
+}
+10.3 Dirty Tile 上传
+当 CPU 应用一个 Delta 时，将被修改的 Tile 放入：
+std::vector<uint32_t> dirty_tiles;
+渲染线程在每帧开始时上传这些连续范围：
+for (tile_id : dirty_tiles) {
+glBufferSubData(
+GL_SHADER_STORAGE_BUFFER,
+tile_byte_offset,
+tile_byte_size,
+tile_cpu_data);
+}
+第一版不必马上实现 persistent mapping。固定 Tile 更新已经足够高效，也更容易调试。等确认 
+glBufferSubData 成为性能瓶颈后，再改为持久映射 Ring Buffer。
+10.4 观察相机
+实现标准 Orbit Camera：
+• 左键旋转；
+• 中键或 Shift+左键平移；
+• 滚轮缩放；
+• 双击某点将旋转中心移动到该点；
+• 相机状态独立于时间轴，不随帧切换重置。
+struct OrbitCamera {
+glm::vec3 target;
+float distance;
+float yaw;
+float pitch;
+};
+22
+10.5 变化观察
+为了实现类似“超梦分析”的核心工作方式，不需要复杂视觉设计，只需要保留三类信息：
+1. 当前点云。
+2. 当前查看帧相对于前一个有效版本发生变化的点。
+3. 被替换前的旧点。
+渲染时：
+普通点：原始 RGB
+本帧新增或更新点：高亮
+本帧被删除的旧点：以半透明 ghost 显示
+PointCloudDelta 已经保存 before/after ，因此 Ghost 点无需额外重新计算。
+这会使用户能够直观看到：
+• 某个物体从哪里消失；
+• 新表面在哪里生成；
+• 点云替换区域是否过大；
+• 变化检测是否发生漏检或误检。
+十一、服务器主循环最终形态
+最终的服务器逻辑应接近：
+void inference_loop() {
+while (!stop_requested) {
+RawFrame raw = frame_queue.pop();
+FrameRecord record;
+record.frame_seq = raw.frame_seq;
+record.base_version = committed_version.load();
+record.status = FrameStatus::Aligning;
+publish_frame_status(record);
+Frame frame = preprocessor.load(raw);
+AlignmentResult alignment =
+image_aligner.align(frame, state_reader.anchor_rgb());
+ChangeResult change =
+change_detector.compute(frame, alignment, state_reader);
+if (change.changed_ratio <= args.no_change_ratio) {
+23
+CandidateCommit noop;
+noop.frame = record;
+noop.frame.status = FrameStatus::NoChange;
+commit_queue.push(std::move(noop));
+continue;
+}
+cv::Mat composite =
+composite_builder.build(
+state_reader.canvas_rgb(),
+change.warped_rgb,
+change.mask);
+Prediction prediction =
+model_runner.run(composite);
+cv::Mat aligned_depth =
+depth_aligner.align(
+prediction.depth,
+prediction.depth_conf,
+state_reader);
+CandidatePatch patch =
+patch_builder.build_replacement_patch(
+state_reader,
+aligned_depth,
+prediction.depth_conf,
+composite,
+change.mask,
+raw.frame_seq);
+CandidateCommit candidate;
+candidate.frame = record;
+candidate.frame.status = FrameStatus::Committed;
+candidate.patch = std::move(patch);
+candidate.metrics = collect_metrics();
+commit_queue.push(std::move(candidate));
+}
+}
+提交线程：
+void commit_loop() {
+while (!stop_requested) {
+CandidateCommit candidate = commit_queue.pop();
+if (candidate.frame.status == FrameStatus::NoChange) {
+version_store.append_no_change_frame(candidate.frame);
+publisher.publish_frame(candidate.frame);
+24
+continue;
+}
+PointCloudDelta delta =
+authoritative_state.commit(candidate.patch);
+stream_log.append(delta);
+version_store.append(candidate.frame, delta);
+if (snapshot_policy.should_snapshot(delta)) {
+snapshot_store.write(authoritative_state);
+}
+publisher.publish(delta);
+publisher.publish_live_head(candidate.frame.frame_seq);
+}
+}
+十二、输入速度高于推理速度时的处理
+用户要求时间轴按输入帧继续向前，因此不能简单地让输入线程阻塞到推理结束，也不能悄悄丢弃帧。
+输入队列容量建议设置为 2 或 3。队列满时执行最新帧优先的合并策略：
+frame 100 正在推理
+frame 101 在等待
+frame 102 到达
+frame 103 到达并导致队列满
+此时：
+• 保留最新待处理帧 103；
+• 帧 102 记录为 Coalesced ；
+• 帧 102 的时间轴状态映射到当时最近的已提交版本；
+• 系统继续处理 103。
+时间轴上仍然有帧 102，但明确知道它没有独立点云提交。
+这保证：
+• 输入时间持续推进；
+• 系统不会出现无限延迟积累；
+• Viewer 不会假装每一张输入都已经产生了独立几何结果。
+25
+十三、断线、重连和恢复
+13.1 Viewer 重连
+Viewer 保存：
+last_live_version
+last_live_frame
+重新连接时向服务器发送：
+我当前拥有版本 V
+如果服务器仍保留 V+1...current 的 Delta，直接补发。
+如果对应 Delta 已经不在内存缓存中，则服务器发送：
+ResyncRequired(latest_snapshot_version)
+Viewer 加载最新 Snapshot，再继续接收实时 Delta。
+13.2 Server 重启
+服务器启动时：
+1. 加载最后一个完整 Snapshot；
+2. 从 Snapshot 版本后顺序重放 deltas.bin ；
+3. 校验 CRC；
+4. 恢复 CanvasState 、 commit_version 和 frame index；
+5. 再开始接收新输入。
+因此历史回放不依赖进程一直存活。
+十四、具体 CMake 改造
+当前 CMake 只链接 OpenCV 和 LibTorch。需要增加：
+find_package(Protobuf CONFIG REQUIRED)
+find_package(gRPC CONFIG REQUIRED)
+find_package(OpenGL REQUIRED)
+find_package(glfw3 CONFIG REQUIRED)
+find_package(ZSTD CONFIG REQUIRED)
+26
+Dear ImGui 和 GLAD 可以直接作为项目内第三方源码编译。
+目标结构：
+add_library(stream_core
+src/core/frame_source.cpp
+src/core/model_runner.cpp
+src/core/image_aligner.cpp
+src/core/change_detector.cpp
+src/core/canvas_state.cpp
+src/core/patch_builder.cpp
+src/core/version_store.cpp
+src/core/stream_log.cpp
+)
+target_link_libraries(stream_core
+PUBLIC
+${LIBTORCH_LIBS}
+${OpenCV_LIBS}
+ZSTD::ZSTD
+)
+add_executable(omnivggt_stream_server
+src/server/stream_server_main.cpp
+src/server/grpc_stream_service.cpp
+)
+target_link_libraries(omnivggt_stream_server
+PRIVATE
+stream_core
+gRPC::grpc++
+protobuf::libprotobuf
+)
+add_executable(omnivggt_live_viewer
+src/viewer/viewer_main.cpp
+src/viewer/stream_client.cpp
+src/viewer/live_state.cpp
+src/viewer/playback_state.cpp
+src/viewer/replay_builder.cpp
+src/viewer/point_renderer.cpp
+src/viewer/orbit_camera.cpp
+src/viewer/timeline_controller.cpp
+)
+target_link_libraries(omnivggt_live_viewer
+PRIVATE
+gRPC::grpc++
+protobuf::libprotobuf
+OpenGL::GL
+27
+glfw
+ZSTD::ZSTD
+)
+Windows 下建议使用 vcpkg manifest 管理 gRPC、protobuf、GLFW、GLM 和 Zstd，LibTorch 继续使用当前
+的手工路径配置。
+十五、实现顺序
+阶段一：在不改变结果的前提下拆分现有代码
+首先将以下函数移出 omnivggt_stream.cpp ：
+load_frame
+run_model
+estimate_homography
+compute_change_mask
+align_depth_to_canvas
+形成独立的 stream_core 。此时仍然输出原来的最终 PLY，并使用测试确认重构前后结果一致。
+验收标准：
+同一输入、同一模型、同一参数：
+最终有效点数一致；
+深度数组误差在浮点容差内；
+changed_ratio 一致；
+timing 统计仍然可输出。
+阶段二：引入 Patch、版本和日志
+将 fuse() 改为：
+build_replacement_patch
+commit_patch
+实现：
+• frame_seq ；
+• commit_version ；
+• SlotDelta before/after ；
+• deltas.bin ；
+• frame_index.bin ；
+• Snapshot；
+28
+• 离线 omnivggt_replay_log.exe 。
+这一阶段暂时不做 Viewer，但必须可以从历史日志恢复任意帧并导出对应 PLY。
+验收标准：
+在线运行到第 N 帧得到的 CanvasState
+==
+从 Snapshot + Delta 重放到第 N 帧得到的 CanvasState
+比较时对以下数组计算 Hash：
+depth
+confidence
+rgba
+valid
+阶段三：实现实时发布和 Live Viewer
+加入 gRPC SubscribeLive ，Viewer 加载首个 Snapshot，并持续应用 Delta。
+先实现：
+• 固定点槽位；
+• OpenGL 点渲染；
+• Orbit Camera；
+• Dirty Tile 更新；
+• follow_live=true 。
+这一阶段完成后，用户已经可以在推理进行过程中自由旋转实时点云。
+验收标准：
+推理过程中点云逐帧更新；
+渲染线程始终保持交互；
+模型推理不会阻塞鼠标操作；
+Viewer 中的 live version 与服务器一致。
+阶段四：实现 PlaybackState 和帧时间轴
+加入：
+• FetchReplay ；
+• PlaybackState；
+• Snapshot 恢复；
+• Delta 正向和反向应用；
+• live_head_frame 与 view_cursor_frame 分离；
+29
+• 回到实时按钮；
+• 拖动任务取消。
+验收标准：
+停留在历史帧时 live_head 继续增长；
+回到实时后立即显示最新点云；
+历史帧状态和离线重放状态一致；
+快速拖动不会产生持续积压的 seek 任务。
+阶段五：变化分析和鲁棒性
+加入：
+• 当前 Delta 高亮；
+• 删除点 Ghost；
+• last_update_frame 着色；
+• 慢客户端重新同步；
+• 断线续传；
+• Server 从日志恢复；
+• 输入队列合并；
+• 运行指标。
+十六、必须实现的测试
+16.1 Patch 正向与反向测试
+S0 --apply_forward(D1)--> S1
+S1 --apply_backward(D1)--> S0
+要求所有槽位逐字节一致。
+16.2 Snapshot 重建测试
+随机生成 1000 个 Delta：
+连续提交得到 S1000
+然后从第 600 版 Snapshot 加载并应用 601–1000：
+重建得到 S1000'
+要求：
+30
+hash(S1000) == hash(S1000')
+16.3 Live 与 Playback 一致性测试
+在 Viewer 同时维护 LiveState 和 PlaybackState。Playback seek 到最新帧时：
+hash(LiveState) == hash(PlaybackState)
+16.4 无变化帧测试
+连续输入多个完全相同帧：
+• frame_seq 持续增加；
+• commit_version 不增加；
+• 时间轴存在所有帧；
+• 每个帧映射到同一版本。
+16.5 用户查看历史时持续实时更新
+测试流程：
+1. Live 到帧 100；
+2. 用户 seek 到帧 20；
+3. 后端继续输入到帧 200；
+4. Playback 仍保持帧 20；
+5. LiveState 已经达到帧 200；
+6. 点击返回实时；
+7. 一次状态切换后显示帧 200。
+16.6 长时间运行测试
+至少构造上万输入帧并随机 seek，重点检查：
+• 内存是否持续增长；
+• Delta 索引是否正确；
+• 快照是否可加载；
+• 网络断线后是否可恢复；
+• Viewer GPU Buffer 是否发生越界；
+• frame_seq 和 commit_version 是否混淆。
+十七、性能目标
+对当前 518×518、最多约 26.8 万点的状态规模，可以设定以下验收目标：
+31
+Viewer 渲染帧率： 稳定 60 FPS
+非推理部分点云提交开销： P95 < 10 ms
+Delta 到 Viewer 可见的附加延迟： P95 < 30 ms
+相邻帧前进/后退： P95 < 30 ms
+近快照 Seek： P95 < 150 ms
+任意历史帧 Seek： P95 < 500 ms
+Viewer 断线恢复： 不影响 Server 推理
+用户查看历史： 不影响 LiveState 更新
+真正的端到端延迟仍主要由 OmniVGGT 推理时间决定。该系统的目标是让可视化、存储和回放不再额外阻塞推
+理。
+十八、该方案最关键的三个实现决定
+第一，不要继续把 PLY 当成实时状态格式。PLY 只在运行结束或用户手动导出时生成；实时更新必须使用内存
+状态和二进制 Delta。
+第二，当前代码应优先利用固定 518×518 Canvas 的稳定槽位，而不是立即实现通用的动态三维点云哈希。这
+样可以用较低复杂度完成确定性回放、双状态和 GPU 局部更新。当前算法本身仍然是首帧坐标下的 2.5D 重
+建，系统结构必须如实反映这一点。
+第三，实时状态与历史状态必须是两份独立状态：
+LiveState：永远追赶服务器最新版本
+PlaybackState：只响应用户当前查看帧
+时间轴只控制 PlaybackState，绝不能控制推理循环或 LiveState。这一条是实现“我正在查看历史，但输入时
+间仍然继续向前”的根本条件。
+完成上述结构以后，整个工程的工作方式就是：
+输入图像持续到达
+→ 模型持续产生局部变化
+→ 权威点云按版本提交
+→ Viewer 中最新点云实时变化
+→ 所有提交同时形成可逆历史
+→ 用户可以像播放视频一样拖动帧时间轴
+→ 任意时间点都可以自由旋转和观察三维点云
+32

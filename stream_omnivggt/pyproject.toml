@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stream-omnivggt"
+version = "0.1.0"
+description = "No-training low-latency streaming wrapper for OmniVGGT"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+  "torch==2.7.0",
+  "torchvision==0.22.0",
+  "torchaudio==2.7.0",
+  "numpy>=1.26,<3",
+  "scipy>=1.11",
+  "opencv-python>=4.9,<5",
+  "pillow>=10,<12",
+  "safetensors>=0.4",
+  "trimesh>=4",
+  "tqdm>=4.66",
+  "pydantic==2.10.6",
+  "pytest>=8",
+  "pytest-benchmark>=5",
+  "typer>=0.12",
+  "rich>=13"
+]
+
+[project.optional-dependencies]
+open3d = ["open3d>=0.19,<0.20"]
+onnxruntime = ["onnxruntime-gpu"]
+all = ["open3d>=0.19,<0.20", "onnxruntime-gpu"]
+
+[project.scripts]
+stream-omnivggt-demo = "stream_omnivggt.cli.run_stream_demo:app"
+stream-omnivggt-benchmark = "stream_omnivggt.cli.benchmark_stream:app"
+stream-omnivggt-live-replay = "stream_omnivggt.cli.run_data2_live_replay:main"
+
+[tool.setuptools]
+packages = [
+  "stream_omnivggt",
+  "stream_omnivggt.align",
+  "stream_omnivggt.backend",
+  "stream_omnivggt.cli",
+  "stream_omnivggt.detect",
+  "stream_omnivggt.map",
+  "stream_omnivggt.pipeline",
+  "stream_omnivggt.preprocess",
+  "stream_omnivggt.tests",
+  "stream_omnivggt.window"
+]
+
+[tool.setuptools.package-dir]
+stream_omnivggt = "."
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".."]
+addopts = "-q"
+
