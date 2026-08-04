@@ -169,6 +169,9 @@ setc/scripts/*
 !setc/scripts/export_pair_bucket_family.py
 !setc/scripts/export_torchscript.py
 !setc/scripts/setup_export_venv_torch270.ps1
+!setc/scripts/build_windows_live_observer.bat
+!setc/scripts/build_windows_gpu_manual.bat
+!setc/scripts/install_windows_gpu_deps.ps1
 data2/
 example/
 stream_omnivggt_cold_store/
