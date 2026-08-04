@@ -155,8 +155,16 @@ skyseg.onnx
 *.egg-info
 
 # Project-local models, datasets, environments, and generated outputs
+deprecated_archive/
 checkpoints/
-setc/
+setc/*
+!setc/.gitignore
+!setc/CMakeLists.txt
+!setc/src/
+!setc/src/**
+!setc/scripts/
+setc/scripts/*
+!setc/scripts/start_cpp_live_replay.bat
 data2/
 example/
 stream_omnivggt_cold_store/
