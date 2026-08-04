@@ -165,7 +165,6 @@ setc/*
 !setc/scripts/
 setc/scripts/*
 !setc/scripts/start_cpp_live_replay.bat
-!setc/scripts/export_aoti.py
 !setc/scripts/export_pair_bucket_family.py
 !setc/scripts/export_torchscript.py
 !setc/scripts/setup_export_venv_torch270.ps1
