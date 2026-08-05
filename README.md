@@ -1,6 +1,6 @@
 # Stream OmniVGGT
 
-`stream_omnivggt` is a no-training, system-layer streaming wrapper around OmniVGGT. It does not fine-tune weights, does not add training code, and does not change OmniVGGT attention or token logic. OmniVGGT is treated as a local-window inference black box; persistent state lives in change masks, keyframes, caches, and an incremental hybrid map.
+`stream_omnivggt` is a no-training, system-layer streaming wrapper around OmniVGGT. It does not fine-tune weights, does not add training code, and does not change OmniVGGT attention or token logic. OmniVGGT is treated as a local-window inference black box; persistent state lives in change masks, keyframes, caches, and an incremental hybrid map. C++ model: 'https://www.modelscope.cn/models/springx/sand_vggt/files' python model: 'omnivggt'.
 
 ```mermaid
 flowchart TD
