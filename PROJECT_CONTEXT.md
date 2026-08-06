@@ -1,103 +1,619 @@
 # OmniVGGT Project Context
 
-Last updated: 2026-06-15
+Last updated: 2026-08-05
 
-## First-read rule
+## 文档目的
 
-Read this file before inspecting the full repository. It records the stable project map, environment notes, and low-VRAM inference decisions so future edits do not need a full rescan.
+本文件是推理主流程的技术规格文档。它的目标不是给出高层概述，而是把系统行为写到“可以逐项核对实现是否一致”的粒度。文档应当明确回答：
 
-## Project shape
+1. 每个阶段究竟输入了什么。
+2. 每个阶段改变了哪些状态。
+3. 每个判定条件如何计算，阈值依据是什么。
+4. 每个失败分支何时触发、触发后做什么。
+5. 每个决策会如何影响几何连续性、视觉稳定性和计算负载。
 
-- `inference.py`: CLI demo/inference entry. Loads `OmniVGGT`, reads image/camera/depth folders via `visual_util.py`, runs `model.inference`, converts pose encodings, optionally exports GLB, then starts a `viser` viewer.
-- `visual_util.py`: image/camera/depth loading, resize/crop logic, sky/background masks, GLB conversion helpers.
-- `omnivggt/models/omnivggt.py`: top-level model. Contains `ZeroAggregator`, `CameraHead`, `DPTHead` for depth and point prediction.
-- `omnivggt/models/aggregator.py`: base alternating-attention transformer and DINOv2 patch embedding construction.
-- `omnivggt/models/omnivggt_aggregator.py`: OmniVGGT aggregator with camera/depth auxiliary-token injection and inference path.
-- `omnivggt/heads/`: camera and dense DPT heads.
-- `omnivggt/layers/`: ViT, attention, MLP, RoPE, patch embedding layers.
-- `configs/`: training/test configs. Not required for CLI inference.
-- `checkpoints/`: local model files. `OmniVGGT.safetensors` is present.
-- `example/`: sample image/camera/depth folders.
-- `reconstruct_sand_pointcloud.py`: data2-oriented no-ghost point-cloud CLI. It selects 2-3 keyframes from a rotating aperture sequence, estimates homographies, runs OmniVGGT only on selected frames, warps each depth map into a canonical anchor canvas, locks secondary frames to the anchor depth reference, soft-blends all frames into one height field, then outputs plane-residual Z so the near-planar sand surface stays continuous. It has support regularization, internal-hole filling, post-trim hole filling, two-frame support filtering, and boundary trimming for thin continuous surfaces. It also has optional training-free detail modes: `parallax_flow` from multi-view residual flow, and photometric luminance relief for visualization only.
+## 系统级问题定义
 
-## Current local environment findings
+系统处理的是单目图像序列流，目标是将逐帧观测转换成一个持续演化的二维画布式世界模型。系统没有把全局一致性寄托于外部位姿真值，也不把模型当作全局地图优化器，而是采用下面的分工：
 
-- GPU: `NVIDIA GeForce RTX 5060 Laptop GPU`, total 8151 MiB, compute capability 12.0.
-- At inspection time, available VRAM was about 6264 MiB because other processes were using about 1636 MiB.
-- `C:\Users\30738\anaconda3\envs\omnivggt` now has `torch 2.7.0+cu128`; CUDA is available.
-- `C:\Users\30738\anaconda3\envs\vggt` has `torch 2.7.0+cu128`, CUDA available, and the runtime packages needed by this repo.
-- `C:\Users\30738\miniconda3\envs\cu128` has CUDA PyTorch but is missing several OmniVGGT dependencies.
-- Weight file: `checkpoints/OmniVGGT.safetensors`, 1505 tensors, 1,217,494,552 parameters, all `torch.float32`; raw FP32 parameter storage is about 4.54 GiB.
+1. 模型只负责局部窗口内的几何观测，重点是深度与置信度。
+2. 外部系统负责时序对齐、变化检测、深度校准、写回和回放。
+3. 状态是增量更新的，旧状态不会被新帧无条件覆盖。
+4. 回放不是重新推理，而是对历史状态差分的正反向应用。
 
-## Inference memory risks
+这意味着系统本质上是一个受约束的流式估计器，而不是离线一次性重建器。
 
-- Loading FP32 weights on an 8GB GPU leaves too little room for activations; BF16 is the working path.
-- BF16/FP16 model weights reduce raw parameter memory to about 2.27 GiB. RTX 5060 reports BF16 support.
-- FP8 is not a practical quick fix in this PyTorch model: float8 dtypes exist, but Linear/Conv/LayerNorm/SDPA/DPT coverage and calibration are not drop-in. Prefer BF16 first.
-- `inference.py` now defaults to CUDA + BF16 and loads at most 3 sorted images via `--max_images 3`.
-- The dense point head is optional for visualization because depth + camera can be unprojected into points. Disabling `point_head` can save parameters and compute, but the 3-image 518px smoke test also passes with the point head enabled.
-- `OmniVGGT.forward/inference` now preserves the caller's autocast state for heads. This avoids the BF16/FP32 LayerNorm dtype mismatch caused by forcing autocast off.
-- Aggregator inference originally stores all 24 layer intermediates in `aggregated_tokens_list`, while the DPT heads only use layers `[4, 11, 17, 23]` and the camera head uses the final layer. Keeping only those inference intermediates can reduce activation retention.
+## 两条主流程的关系
 
-## Recommended 8GB GPU path
+系统有 Python 与 C++ 两条主流程，工程形态不同，但方法不变量一致：
 
-1. Use `C:\Users\30738\anaconda3\envs\omnivggt\python.exe`.
-2. Run inference with BF16, which is now the `inference.py` default.
-3. Keep `--max_images` in the 1-3 range. The script now rejects values above 3 for this 8GB setup.
-4. `--target_size 518` is feasible for 3 images in the included smoke test. Drop to `336` only if other desktop processes consume much more VRAM.
-5. Use `--no_visualize` for memory smoke tests; visualization converts outputs to CPU/NumPy and starts a server.
-6. Avoid FP8 unless doing a separate quantization/export path with calibration.
+1. 都先把当前帧对齐到同一个画布域，再谈融合。
+2. 都必须区分几何新增与光度变化。
+3. 都必须在写回前做重叠区校准。
+4. 都以几何稳定优先于纹理激进为原则。
+5. 都把历史回放设计为不重跑推理。
 
-## Verified smoke tests
+Python 更偏单进程调试和迭代，C++ 更偏服务端与可视化分离的部署形态，但两者在行为上应当可对照。
 
-- 1 image, `target_size=336`, BF16, point head disabled: passed; peak allocated VRAM about 2512 MiB.
-- 3 images, `target_size=336`, BF16, point head disabled: passed; peak allocated VRAM about 2691 MiB.
-- 3 images, `target_size=518`, BF16, point head disabled: passed; peak allocated VRAM about 3240 MiB.
-- 3 images, `target_size=518`, BF16, full model with point head enabled: passed; peak allocated VRAM about 3307 MiB.
+## 数据与状态契约
 
-## Useful commands
+## 输入契约
 
-CUDA smoke test:
+每帧输入统一规约为：
 
-```powershell
-& 'C:\Users\30738\anaconda3\envs\omnivggt\python.exe' 'C:\Users\30738\Desktop\project\3dre\VGGT\OmniVGGT\inference.py' `
-  --image_folder 'C:\Users\30738\Desktop\project\3dre\VGGT\OmniVGGT\example\meetingroom\images' `
-  --max_images 3 --no_visualize
-```
+1. 帧序信息：帧索引、顺序位置、必要时的时间戳。
+2. 图像信息：RGB 数据。
+3. 辅助槽位：可空、可占位，但格式必须固定，以保证模型调用接口一致。
 
-Interactive viewer:
+输入阶段只做必要标准化，不提前假设几何结构，也不提前假设场景是平面、刚体或静态。
 
-```powershell
-& 'C:\Users\30738\anaconda3\envs\omnivggt\python.exe' 'C:\Users\30738\Desktop\project\3dre\VGGT\OmniVGGT\inference.py' `
-  --image_folder '<your-image-folder>' --max_images 3
-```
+## 模型调用契约
 
-data2 no-ghost point-cloud reconstruction:
+模型调用采用固定五元输入：
 
-```powershell
-& 'C:\Users\30738\anaconda3\envs\omnivggt\python.exe' 'C:\Users\30738\Desktop\project\3dre\VGGT\OmniVGGT\reconstruct_sand_pointcloud.py' `
-  --image_folder 'C:\Users\30738\Desktop\project\3dre\VGGT\OmniVGGT\data2' `
-  --output_dir 'C:\Users\30738\Desktop\project\3dre\VGGT\OmniVGGT\outputs\data2_pointcloud' `
-  --num_keyframes 3 --mode balanced
-```
+1. 图像序列。
+2. 外参占位。
+3. 内参占位。
+4. 深度占位。
+5. 掩码占位。
 
-Verified output for the default data2 command:
+这里的外参和内参占位不是为了“伪装有相机”，而是为了把模型接口固定成统一的局部估计格式。主流程不会依赖这些占位值提供真实几何约束，真正的跨帧一致性由外部模块完成。
 
-- Selected keyframes: `Image_20260423192541434.jpg`, `Image_20260423192801758.jpg`, `Image_20260423192929499.jpg`.
-- Outputs: `pointcloud.ply`, `scene.glb`, `keyframes.json`, `alignment_report.json`, `alignment_preview.jpg`.
-- Current default point count: 84,026.
-- Peak allocated VRAM: about 3397 MiB.
-- Vertical ghosting fix: default `--depth_align affine` estimates per-keyframe `z_aligned = scale * z + offset` from overlapping canonical cells before fusion. For the verified run, overlap cells were about 61.7k per non-reference frame, and median absolute depth residual dropped from about 0.022/0.027 to about 0.0067/0.0052. Normalized point-cloud Z range narrowed from about `[-0.096, 0.147]` to `[-0.018, 0.040]`.
-- Current seam/ghost/bending fix after visual inspection: default `--fusion_mode soft_blend --surface_model plane_residual` no longer discards secondary frames and no longer trusts a multi-frame 3D pose fusion. It uses one selected anchor image as the canonical 2D coordinate system, keeps `--update_reference_depth` off by default so secondary frames cannot bend the anchor surface, and emits only one point per canonical XY cell.
-- The default output Z is now a robust fitted-plane residual with `--plane_residual_mad_multiplier 3.0`, which clamps high residual edge artifacts while preserving continuous near-planar relief. Use `--surface_model depth` only for diagnosis; it can reintroduce apparent global bending.
-- Latest verified run selected `Image_20260423192929499.jpg`, `Image_20260423192541434.jpg`, `Image_20260423192801758.jpg`; anchor original index was `7`; output point count was 94,171; duplicate canonical XY points after rounding were 0; effective fusion weight fractions were about 40.4%, 27.5%, and 32.1%, so the result is not a single-frame fallback.
-- For the same run, secondary-frame local median absolute depth residuals dropped from about 0.0317 to 0.00435 and from about 0.0126 to 0.00238 before fusion. Robust plane residual MAD was about 0.00438, residual-clipped fraction about 5.8%, and normalized output Z percentiles were approximately `[-0.02497, -0.01615, -0.01100, 0.0, 0.02497, 0.02497, 0.02497]` at `[0,1,5,50,95,99,100]`. Peak allocated VRAM remained about 3397 MiB.
-- Optional anchor override: pass `--anchor_index 0` to force the first file in sorted order as the anchor. Default `-1` auto-selects the best-connected anchor, which is usually safer for low-texture sand.
-- Depth-detail note: BF16/FP32 precision is not the main limiter for sand-grain detail. `fp32 + target_size=700` ran successfully but peak allocated VRAM rose to about 6601 MiB and free VRAM reported 0 MiB; its plane residual MAD was only slightly lower than BF16. Use FP32 only when memory is available and numerical comparison is needed.
-- Accuracy-first output with `--anchor_index 3 --target_size 700 --depth_detail_source none` is at `outputs/data2_pointcloud_anchor3_bf16_700_accurate` and `outputs/data2_pointcloud_anchor3_fp32_700_accurate`. BF16 700 accurate used three images with effective weights about 42.2%, 28.6%, 29.1%, filled 275 internal hole cells, removed 52,356 boundary cells, and output 515,634 points. This is the safer geometry output.
-- Training-free geometric detail output is `outputs/data2_pointcloud_anchor3_bf16_700_parallax`, generated with `--depth_detail_source parallax_flow --depth_detail_strength 0.006 --depth_detail_sigma 7 --parallax_flow_scale 0.5`. It uses residual optical flow after homography alignment, not luminance height. It still used three images with the same weights as the accurate output and added normalized Z detail of about `[-0.0028, 0.0028]` P01-P99. This is relative micro-relief; scale/sign are not physically calibrated.
-- Photometric outputs such as `outputs/data2_pointcloud_anchor3_bf16_700_detail` are not recommended for accuracy. They can make image texture visible in Z but can create a thick-looking layer and edge relief because luminance is not guaranteed to equal depth.
-- BF16 `target_size=1008` ran at `outputs/data2_pointcloud_anchor3_bf16_1008_accurate` with peak allocated VRAM about 6369 MiB and free VRAM reported 0 MiB. It is a useful high-resolution diagnostic but still did not recover strong sand-grain depth detail directly from OmniVGGT.
-- Latest hole/edge fix: keyframe selection is now scored by coverage, compactness, and hole penalties instead of greedy area alone. With `--anchor_index 3`, it selects `Image_20260423192657308.jpg`, `Image_20260423192801758.jpg`, and `Image_20260423192942731.jpg` instead of the earlier `...92517173.jpg` third frame. Z outlier handling in soft blending now clips height instead of deleting points, preventing artificial holes.
-- Current recommended accurate output is `outputs/data2_pointcloud_anchor3_bf16_700_v5_support2`, generated with `--anchor_index 3 --target_size 700 --depth_detail_source none --min_support_frames 2 --support_close 81 --boundary_trim 36`. It outputs 440,911 points, has no detected internal holes, uses three images with effective weights about 45.7%, 31.8%, 22.5%, adds 20,098 support-regularized cells, and removes 95,798 unreliable boundary cells. This is the best current geometry-first output.
-- Current optional geometric-detail output is `outputs/data2_pointcloud_anchor3_bf16_700_v5_parallax`, generated with the same support settings plus `--depth_detail_source parallax_flow --depth_detail_strength 0.006 --depth_detail_sigma 7 --parallax_flow_scale 0.5`. It keeps 440,911 points and adds residual-flow detail of about `[-0.00283, 0.00283]` normalized Z P01-P99.
+## 持久状态契约
+
+跨帧持久状态至少包含：
+
+1. 颜色画布。
+2. 深度画布。
+3. 置信度画布。
+4. 权重画布。
+5. 有效掩码。
+6. 支撑掩码。
+7. 对齐变换历史。
+8. 诊断缓存。
+
+这些状态共同定义“当前世界模型”。新帧只能通过受约束写入改变这些状态，不能跳过写入门槛直接覆盖整图。
+
+## 统一主流程详解
+
+以下阶段定义同时适用于两条主流程。
+
+## 阶段 0：会话初始化与参数收敛
+
+### 输入
+
+1. 运行参数。
+2. 设备可用性。
+3. 输入序列配置。
+
+### 内部状态变化
+
+1. 生成空画布状态。
+2. 生成空历史状态。
+3. 固定关键阈值与尺寸约束。
+4. 记录用于后续诊断的基线信息。
+
+### 判定条件
+
+1. 分辨率是否满足补丁倍数约束。
+2. 设备与精度组合是否可执行。
+3. 阈值是否落在允许范围。
+4. 输入序列是否可枚举。
+
+### 阈值与约束说明
+
+1. 补丁倍数约束不是形式限制，而是为了让模型输入和局部窗口的空间采样对齐。
+2. 精度策略优先保证在目标设备上不溢出显存，也不落到明显不稳定的数值模式。
+3. 阈值范围检查的目的是阻止把明显不合理的参数带入会话，避免后续状态被污染。
+
+### 输出
+
+1. 规范化后的会话配置。
+2. 可运行状态机初态。
+
+### 失败分支
+
+1. 参数非法：直接终止。
+2. 设备不可用：回退到次优设备或安全精度。
+3. 序列不可枚举：终止而不是跳过，因为缺帧会破坏时间线完整性。
+
+### 质量影响
+
+1. 初始化阶段若把分辨率、补丁约束或精度配置放宽过头，后续每一帧都会承担额外误差或额外负载。
+2. 这个阶段是把系统稳定性上限先定住的阶段，不是“只做一次无关紧要的参数读取”。
+
+## 阶段 1：后端就绪与容错
+
+### 输入
+
+1. 权重资源。
+2. 设备与精度策略。
+
+### 内部状态变化
+
+1. 后端实例从未初始化变为可调用。
+2. 记录后端模式：真实后端或模拟后端。
+3. 记录后端冷启动耗时。
+4. 准备后续帧级推理的缓存和张量布局。
+
+### 判定条件
+
+1. 权重是否可读。
+2. 权重是否与模型结构严格匹配。
+3. 后端加载是否成功。
+4. 运行精度是否与设备兼容。
+
+### 置信度与后端质量说明
+
+这里的“后端质量”不是几何置信度，而是模型运行可信度。若真实后端不能正常加载，就算外部流程继续，得到的几何也没有意义。因此这个阶段首先判断的是后端是否真的可用，而不是单帧几何是否好看。
+
+### 输出
+
+1. 推理后端句柄。
+2. 后端类型标识。
+3. 冷启动时间统计。
+
+### 失败分支
+
+1. 真实后端失败：切换模拟后端。
+2. 混合精度异常：降级到安全精度。
+3. 权重结构不匹配：直接停止，因为这通常意味着模型版本与系统假设不一致。
+
+### 质量影响
+
+1. 后端越稳定，后续阈值调试越有意义。
+2. 后端容错的意义是让系统层逻辑可验证，而不是掩盖模型本身的问题。
+
+## 阶段 2：首帧锚定与初始建图
+
+### 输入
+
+1. 首帧图像。
+
+### 内部状态变化
+
+1. 生成锚定参考域。
+2. 初始化画布尺寸与边缘冗余。
+3. 建立第一版深度、置信度、有效掩码。
+4. 保存首帧纹理与支持域作为后续对齐基准。
+
+### 判定条件
+
+1. 首帧有效像素覆盖是否足够。
+2. 首帧推理输出是否包含足够可用深度。
+3. 首帧是否在空间上形成连续可解释的参考域。
+
+### 首帧置信度口径
+
+首帧阶段不存在“和历史画布比”的置信度，因此首帧质量主要来自模型自身输出的深度与深度置信度是否具有足够的空间覆盖。这里的置信度不是“画布更新可信度”，而是模型观测可信度。若首帧置信度过低，说明参考域本身就不稳，后面所有帧都会在错误基座上展开。
+
+### 输出
+
+1. 初始画布状态。
+2. 锚定参考纹理。
+3. 参考支持域。
+
+### 失败分支
+
+1. 首帧无有效输出：保留空状态并等待下一帧重试。
+2. 首帧覆盖过碎：只保留支持一致性高的区域作为初始有效域。
+
+### 质量影响
+
+1. 首帧不是“尽快写进去就行”，而是整个时间线的基座。
+2. 首帧若建立得过窄，后续所有帧都会被边界裁掉；若建立得过宽但噪声太大，会把无效区域也当作真基座。
+
+## 阶段 3：二维对齐
+
+### 输入
+
+1. 当前帧图像。
+2. 锚定参考域。
+3. 当前有效画布。
+
+### 内部状态变化
+
+1. 更新当前帧到画布的变换。
+2. 更新对齐质量诊断缓存。
+3. 记录是否发生降级对齐。
+
+### 判定条件
+
+1. 特征匹配数量是否足够。
+2. 鲁棒估计内点比例是否达标。
+3. 重叠区相位修正响应是否可靠。
+4. 对齐后的投影是否仍与画布重叠到足够面积。
+
+### 对齐质量如何解释
+
+对齐质量不是单一数字，而是多个信号的组合：
+
+1. 特征数量说明结构信息是否够。
+2. 内点比例说明几何一致性是否够。
+3. 相位修正响应说明细微平移是否可信。
+4. 重叠面积说明这次写回还有没有足够共同可见区域作为约束。
+
+这些信息共同决定这帧能不能安全进入后续变化检测和写回。
+
+### 输出
+
+1. 粗到细修正后的对齐变换。
+2. 对齐质量标记。
+3. 降级原因（若有）。
+
+### 失败分支
+
+1. 特征退化：启用平移兜底。
+2. 兜底仍不可靠：标记低可信并限制后续写回。
+3. 重叠太少：降低该帧的写回信任度，优先保守更新。
+
+### 质量影响
+
+1. 对齐质量直接决定接缝风险。
+2. 对齐低可信帧若强写回，会把几何错位写死。
+3. 平移兜底不是“强行救回来”，而是“避免把明显错误的复杂变换写进去”。
+
+## 阶段 4：变化检测
+
+### 输入
+
+1. 当前帧对齐到锚定画布后的 RGB 图像。
+2. 当前帧对齐后的前景支持掩码。
+3. 当前画布的已知有效区域、支持域和颜色。
+
+### 内部状态变化
+
+1. 计算重叠区域的像素亮度差异。
+2. 生成支持变化掩码：当前有效支持与历史支持的差异。
+3. 生成光度变化掩码：重叠区亮度差异超过稳健阈值。
+4. 计算变化候选掩码并膨胀一定半径。
+5. 生成用于模型上下文和校准的锚环掩码。
+6. 记录支持变化率、光度变化率、鲁棒阈值和连通域过滤结果。
+
+### 具体语义与阈值
+
+1. 支撑变化定义为 `valid_warp & ~reference_support`。
+2. 重叠区为 `valid_warp & reference_support & self.valid`。
+3. 亮度差异 `diff` 只在重叠区计算，采用三通道绝对差均值。
+4. 稳健光度阈值 `robust_thr` 取 `max(image_l1_thr * 2, center + 3.0 * 1.4826 * mad)`，再裁剪到 `[0.08, 0.22]`。
+5. 光度变化在重叠区中通过 `diff > robust_thr` 判定，并过滤连通域小于 128 像素。
+6. 当 `photo_ratio > scene_jump_ratio` 或 `(photo_ratio > 0.15 && support_ratio < 0.05)` 时，整张光度变化掩码被抑制为空。
+7. 最终变化掩码 `change = dilate(support_change | photometric_change, dilate_ksize) & valid_warp`。
+8. 支撑提交掩码与光度提交掩码分别来自支持变化和光度变化的膨胀结果，但光度提交仅保留重叠区域。
+
+### 判定条件
+
+1. `change` 的像素比例是否高于最小模型调用阈值。
+2. 支撑变化是否显著，作为新几何候选。
+3. 光度变化是否被判定为曝光/纹理变化而非几何变化。
+4. 对齐是否可靠，否则直接禁用本帧更新。
+
+### 失败分支
+
+1. 对齐失败或 `fallback` 触发且已有画布时，将 `change_mask` 置零并标记 `unreliable_alignment`。
+2. 纯光度变化占比过高时，抑制光度变化以避免错误几何。
+3. 细碎候选区域小于 256 像素时，从融合掩码中过滤，避免无效模型调用。
+
+### 输出
+
+1. `change_mask`：写回候选核心。
+2. `support_change_mask`：几何新增候选。
+3. `photometric_change_mask`：纯光度变化候选。
+4. `fusion_mask`：用于模型输入的上下文扩展区域。
+5. `anchor_ring`：用于深度校准和连续性约束的环带。
+
+### 质量影响
+
+1. 支撑变化误判会把旧面误写为新几何。
+2. 光度变化误判会把曝光差写成深度更新。
+3. 过度膨胀会把上下文区域误当成几何核心。
+4. 变化阶段是“是否进入模型”的第一道硬闸门。
+
+## 阶段 5：窗口构造与模型推理
+
+### 输入
+
+1. `fusion_mask` 和 `change_mask`。
+2. 已完成对齐与变化检测的当前图像。
+3. 之前帧的画布和锚定图像。
+
+### 内部状态变化
+
+1. 构造模型输入 ROI：首帧为全画布，后续帧为双帧对齐 ROI。
+2. 记录 `roi_height` 和 `roi_width`。
+3. 记录是否跳过模型调用。
+4. 更新模型耗时与候选像素统计。
+
+### 真实行为
+
+1. 首帧或尚未初始化画布时，模型输入为整个当前图像的 `target_width/target_size` 目标尺寸。
+2. 后续帧使用 `crop_aligned_roi_pair`，将当前帧与锚帧一起裁剪到 `roi_width/roi_height`。
+3. 若已有画布且 `fusion_mask` 经过 256 像素过滤后为空，则本帧模型调用被跳过。
+4. 模型调用分两种形式：
+   - 单帧：`_single_frame_batch(model_rgb)`。
+   - 双帧：`_two_frame_batch(anchor_roi, current_roi)`。
+5. 双帧分支的目标是让模型在当前变化片段和锚参考之间建立局部对照，而不是跨帧全局融合。
+
+### 判定条件
+
+1. `fusion_mask` 是否足以生成有效 ROI。
+2. 变更比例是否小于 `no_change_ratio`（默认 0.001），若是且已有画布则跳过模型调用。
+3. 模型输入边界是否满足 `patch_multiple` 约束。
+4. ROI 经过几何裁剪后仍有足够可用像素。
+
+### 输出
+
+1. `warped_depth` 和 `warped_conf`。
+2. `warped_roi_valid`：模型 ROI 有效区。
+3. `model_valid`、`quality_valid`、`candidate_valid`。
+4. `warped_confidence` 和 `model_confidence_threshold`。
+
+### 性能影响
+
+1. 首帧模型成本最高，但只执行一次。
+2. 后续帧模型仅在显著变化时执行。
+3. 过滤小变化和纯光度变化是延迟控制的关键。
+
+## 阶段 6：深度校准
+
+### 输入
+
+1. `warped_depth`、`warped_conf`、`valid_warp`。
+2. 历史 `self.depth`、`self.valid`。
+3. `anchor_ring` 和 `quality_valid`。
+
+### 内部状态变化
+
+1. 选择重叠校准样本：`anchor_mask & valid_warp & self.valid & finite warped_depth & finite self.depth & warped_conf > min_conf`。
+2. 如果样本少于 128，则退化为不校准。
+3. 执行迭代加权最小二乘仿射拟合。
+4. 对尺度裁剪到 `[0.25, 4.0]`、对偏置裁剪到 `[-10.0, 10.0]`。
+5. 若接缝区像素数 ≥ 64，计算局部残差场并限制到 `[-0.08, 0.08]`。
+
+### 真实行为
+
+1. 首先用 `np.percentile(src, [2, 98])` 去掉深度尾部。
+2. 使用 `design = [src, 1]` 进行加权线性拟合。
+3. 采用 `residual <= median + 3 * 1.4826 * MAD` 的鲁棒剔除，最多 4 次迭代。
+4. 若拟合结果无效（`scale <= 0` 或 `scale > 8` 或 非有限），回退为 `scale=1`，`bias=median(dst-src)`。
+5. 对齐后深度 `aligned = warped_depth * scale + bias`。
+6. 如果满足 `seam.sum() >= 64`，再使用 `spatial_correction` 和 `propagated_correction` 进行局部边界修正，最终 `correction = clip(0.78 * spatial + 0.22 * propagated, -0.08, 0.08)`。
+
+### 判定条件
+
+1. 校准样本数量是否 ≥ 128。
+2. 样本置信度是否高于 `fuse.min_conf`。
+3. 拟合后 `scale` 和 `bias` 是否在安全范围内。
+4. 接缝残差是否足够稳定，才能启用局部补偿。
+
+### 输出
+
+1. 校准后 `aligned_depth`。
+2. 校准系数 `scale`、`bias`。
+3. `depth_alignment_anchor_pixels` 和 `depth_alignment_spatial_correction`。
+
+### 质量影响
+
+1. 规模/偏置校准是消除全局尺度漂移的主手段。
+2. 局部补偿是减少接缝台阶的辅助手段。
+3. 样本不足时，保守地放弃校准比错误校准更稳定。
+
+## 阶段 7：融合写回
+
+### 输入
+
+1. `aligned_depth`。
+2. `warped_conf`。
+3. `warped_texture` / `warped_rgb`。
+4. `change_mask`、`support_change_mask`、`photometric_change_mask`、`anchor_ring`。
+
+### 内部状态变化
+
+1. 生成最终写入掩码 `update_mask`。
+2. 生成颜色桥接掩码 `color_bridge_mask`。
+3. 计算颜色混合权重 `color_bridge_mix`。
+4. 更新画布深度、置信度、权重、颜色和有效标记。
+
+### 真实行为
+
+1. `photo_only_existing = photometric_change_mask & ~support_change_mask`，并在已有画布时进一步约束为 `self.valid`。
+2. `update_mask = model_valid & change_mask & ~photo_only_existing`。
+3. 若存在 `anchor_ring`，则 `update_mask &= ~anchor_ring`，确保锚环只用于约束，不用于写回。
+4. `color_bridge_mask` 由 `support_change_mask` 膨胀 32px 得到，仅允许在旧画布与当前对齐区域之间填色，不写入新深度。
+5. `color_bridge_mix = clip(distance_to_anchor / 8.0, 0.0, 1.0)`。
+6. 颜色写入使用对齐后的当前纹理，不对模型 ROI 做全局颜色平均。
+7. 只有 `valid_obs = update_mask & finite(depth) & conf >= min_conf` 的像素进入融合。
+
+### 权重与写回策略
+
+1. `w_obs = clip(conf, 1e-4, w_max)`。
+2. `w_new = min(w_old + w_obs, w_max)`。
+3. 对更新像素直接写入 `depth`，而不是与旧深度混合。
+4. `conf` 取最大值；`weight` 累积但上限 `w_max`。
+5. 颜色写入使用 `color_obs = valid_obs & color_update_mask`，避免旧深度与新颜色混合产生伪影。
+
+### 判定条件
+
+1. 是否存在有效融合像素。
+2. 是否应当仅写深度而拒绝颜色桥接。
+3. 是否应当在变化核心外保持旧画布稳定。
+4. 是否应当通过 `anchor_ring` 强制连续性约束。
+
+### 输出
+
+1. 更新后的 `self.depth`、`self.conf`、`self.weight`、`self.rgb`、`self.valid`。
+2. `fused_pixels`。
+3. `write_mask` 和 `color_update_mask`。
+4. `depth_continuity_mask` / `depth_continuity_delta`。
+
+### 失败分支
+
+1. 没有有效观测时，不更新画布。
+2. 颜色桥接为空时，仅写深度。
+3. 写回掩码与锚环冲突时收窄写入范围。
+
+### 质量影响
+
+1. 直接写深度避免了“新旧深度混合产生第三面”的问题。
+2. 颜色桥接仅用于纹理连续性，不用于几何建立。
+3. 锚环不写回是防止写入旧边缘造成重叠条带的关键。
+
+## 阶段 8：历史记录与回放
+
+### 输入
+
+1. 当前提交前的完整画布状态。
+2. 提交后的完整画布状态。
+3. 记录的 `pipeline_mask` 和 `delta_mask`。
+
+### 内部状态变化
+
+1. 第一帧保留全量基线状态。
+2. 后续帧以稀疏字段差分方式保存修改。
+3. 维护 `_state` 与 `_cursor`，使回放状态独立于推理状态。
+4. 通过 `append()` 强制回到实时尾部，避免历史浏览时出现错乱差分。
+
+### 真实行为
+
+1. `ReplayHistory` 只保存 `rgb`、`depth`、`conf`、`weight`、`valid`、`support` 这六个字段。
+2. `make_canvas_delta()` 为每个字段生成稀疏差分，只有更改像素才保存 `index`、`before`、`after`。
+3. 初始帧仍然使用 `delta` 记录全量有效掩码，但不会作为普通差分应用。
+4. `seek()` 前进或后退时，仅对发生变化的像素重新应用差分，时间复杂度近似 O(changed_pixels)。
+
+### 判定条件
+
+1. 是否为首帧。
+2. 是否有实际字段差分。
+3. 浏览请求是否超出 `[0, frame_count-1]`。
+
+### 输出
+
+1. 可逆的时间线状态。
+2. 当前回放帧的 `pipeline_mask` 与 `delta_mask`。
+3. `state()` 返回当前回放画布副本。
+
+### 失败分支
+
+1. 差分序列不一致：优先恢复尾部绝对状态。
+2. 浏览越界：夹紧到合法区间。
+3. 试图对空历史 `seek()`：抛出异常。
+
+### 性能影响
+
+1. 回放成本与变化量相关，而非全图面积。
+2. 稀疏历史避免了每帧保存全画布的内存爆炸。
+3. 这使得 Python 交互回放在调试阶段仍然可用。
+
+## 阶段 9：导出与诊断
+
+### 输入
+
+1. 最终画布 `depth`、`rgb`、`valid`。
+2. 全流程计时与质量统计。
+
+### 内部状态变化
+
+1. 填补窄缝：`_fill_narrow_gaps(..., pixels=5)`。
+2. 规则化高度场：`_regularize_heightfield(..., sigma=4.0, raw_keep=0.15)`。
+3. 裁剪边缘：`trim_px = max(3, min(4, round(min(height, width) * 0.006)))`。
+4. 生成点云与颜色输出。
+
+### 判定条件
+
+1. 有效点数是否大于门限。
+2. 裁剪后是否保留合法连续区域。
+3. 统计结构是否完整。
+
+### 输出
+
+1. 导出点云。
+2. 诊断报告。
+3. 导出前后的差分与边界数据。
+
+### 失败分支
+
+1. 有效点数不足：输出空集并记录诊断。
+2. 清洗后几何断裂：保留原始画布日志供复盘。
+3. 统计缺失：报告不完整。
+
+## Python 主流程与 C++ 主流程的细节差异
+
+### Python 形态
+
+1. `stream_omnivggt/cli/run_data2_live_replay.py` 作为主入口。
+2. 使用 `OmniVGGTBackend` 或 `MockOmniBackend`。若真实 OmniVGGT 加载失败，回退到 `MockOmniBackend`。
+3. 运行时将 `cfg.change.flow_mode = "none"`、`cfg.fuse.min_conf = 0.0`，并禁用 `warmup_buckets` 以减少首次延迟。
+4. 可选 OpenCV 窗口与 `ReplayHistory` 结合，保持历史回放与实时推理解耦。
+5. 适合验证阈值、变化掩码、锚环和颜色桥接策略。
+
+### C++ 形态
+
+1. 入口为 `omnivggt_stream_server.exe` 与 `omnivggt_live_viewer.exe`。
+2. 服务器使用 `--model` 和 `--model-pair` 一次性加载固定形状 TorchScript 模型。
+3. `--pair-letterbox` 保持 700×700 ROI 的长宽比，不在 C++ 端重新编译图。
+4. `--queue-capacity` 1024 使离线回放在单次运行中保持无丢帧历史状态。
+5. 观察器端口默认 `37651`，显示进程和推理进程通过 TCP 解耦。
+6. C++ 流程更偏向性能稳定性验证、长会话以及与外部可视化的运行时契约。
+
+## 一致性保障机制
+
+两条主流程通过以下机制保持行为一致：
+
+1. 同一输入契约与占位相机策略。
+2. 同一变化分层逻辑与抑制逻辑。
+3. 同一深度校准先行规则。
+4. 同一几何优先写回原则。
+5. 同一阶段化统计口径。
+6. 同一“低置信度”判定思想：以模型局部置信度、重叠一致性和统计离群性共同判断。
+
+## 典型异常场景与行为规范
+
+### 场景 A：低纹理或重复纹理
+
+1. 对齐可信度下降。
+2. 触发降级对齐或写回限制。
+3. 优先保证不写错，而不是强行写满。
+
+### 场景 B：剧烈曝光变化
+
+1. 光度变化占比突增。
+2. 触发光度抑制，避免误几何更新。
+3. 颜色写回改为保守策略。
+
+### 场景 C：新增区域细而碎
+
+1. 小连通域过滤可能误杀细节。
+2. 通过上下文扩张与最低面积阈值平衡召回与噪声。
+
+### 场景 D：接缝台阶或双层面
+
+1. 检查深度校准样本量和残差统计。
+2. 检查写入域是否误包含上下文区域。
+3. 必要时收紧写入域并提高校准样本门限。
+
+### 场景 E：帧级延迟抖动
+
+1. 检查窗口尺寸分布是否异常放大。
+2. 检查模型调用跳过率是否过低。
+3. 检查回放与显示链路是否与推理主链路耦合过紧。
+
+## 调参与验收建议
+
+### 调参顺序
+
+1. 先稳定对齐，再调变化检测。
+2. 再稳定深度校准，再调融合写回。
+3. 最后调纹理与导出细节。
+
+### 关键验收指标
+
+1. 对齐可信帧比例。
+2. 有效校准样本数分布。
+3. 提交掩码面积稳定性。
+4. 双层面与暗边出现频率。
+5. 阶段级时延分解稳定性。
+6. 低置信样本被剔除后的误差下降幅度。
+
+## 文档边界
+
+本文档不覆盖训练、全局图优化与通用闭环问题，仅覆盖当前实时增量重建主流程的方法细节与模块行为。
