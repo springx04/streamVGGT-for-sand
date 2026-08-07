@@ -373,3 +373,376 @@ C++ 端不重新实现 transformer，也不读取 safetensors；模型在 Python 侧被导出为固定
 2. C++ 当前外部对齐路径没有 Python callable 插件 ABI；它只实现实际部署所需的 2D homography/phase、heightfield/depth continuity 和融合规则。需要新的旋转/高度对齐器时，应在 C++ 边界增加明确的数据契约，不要把任意 Python callback 假设为可部署能力。
 3. 部署验收至少包括：实际 `device=cuda`；模型输入 shape 与 artifact 一致；首帧/稳态 peak VRAM；S1/S2 输出维度；非有限 depth/conf 过滤；homography inlier 与 fallback 统计；changed ratio/no-change skip；scale/bias 与 seam correction；delta 前进/回退、snapshot 恢复、CRC 校验；viewer 版本不一致时的 resync。
 4. 最终性能指标应分开记录图像读取、匹配/对齐、变化检测、ROI 前处理、模型 forward、输出搬运、depth calibration、fusion、commit 和 TCP/viewer 时间。只报告总帧时间会把首次 TorchScript warmup、CUDA 同步或历史写盘抖动误认为模型推理速度。
+---
+
+## 数据契约补充：每一阶段实际保存的对象
+
+上一节描述的是算法；本节补足实际对象的字段、形状、dtype、生命周期和“哪个计数对应哪个集合”。省略数组内容时只省略重复元素，不省略字段本身。
+
+### 1. Python 输入对象
+
+每一帧进入流式接口时是一个 `InputPacket`：
+
+```text
+InputPacket {
+  frame_id:       int
+  timestamp:      float
+  rgb:            H×W×3, uint8 或 float32
+  depth:          null 或 H×W / H×W×1, float32
+  intrinsic:      null 或 3×3, float32
+  extrinsic_c2w:  null 或 3×4/4×4, float32
+  meta:           dict[str, Any]
+}
+```
+
+`meta` 不参与模型几何计算，但会携带 source 标识、预处理信息、block keys、mean confidence、强制 anchor 等运行时标签。`timestamp` 只用于丢帧判断和 keyframe recency，不会被当作模型输入。
+
+### 2. 模型 batch 对象
+
+通用窗口和锚定画布虽然选帧策略不同，送进 backend 的 batch 都具有以下字段：
+
+```text
+Batch {
+  images:          [1,S,3,Hm,Wm], float32(host) -> BF16/FP16(device)
+  depth:           [1,S,Hm,Wm,1], float32(host) -> model dtype(device)
+  mask:            [1,S,Hm,Wm],   float32(host) -> model dtype(device)
+  intrinsics:      [1,S,3,3],     float32
+  extrinsics:      [1,S,3,4],     float32
+  camera_gt_index: list[int]
+  depth_gt_index:  list[int]
+}
+```
+
+锚定画布无辅助相机/深度时，`camera_gt_index=[]`、`depth_gt_index=[]`，`depth/mask` 全零，`intrinsics/extrinsics` 为单位占位；通用窗口若某帧有真实辅助输入，则只在对应 index 处保留其值。backend 将前四个图像/辅助大张量搬到 CUDA，但不会把 `selected_window` 的 Python 对象复制进模型。
+
+### 3. 预测对象与像素筛选对象
+
+完整模型输出的统一逻辑形状为：
+
+```text
+OmniPrediction {
+  world_points:      [S,Hm,Wm,3] 或 [1,S,Hm,Wm,3]
+  world_points_conf:[S,Hm,Wm]   或 [1,S,Hm,Wm]
+  depth:             null 或 [S,Hm,Wm,1]
+  depth_conf:       null 或 [S,Hm,Wm]
+  pose_enc:          null 或 [S,9]
+  extra:             dict
+}
+```
+
+模型 wrapper 的 batch 维可能保留，也可能在 backend 标准化时 squeeze；进入画布前必须选定 frame index 并压成 `Hm×Wm` 的 `depth/conf`。锚定画布首帧取 index 0，双帧 ROI 后续帧取 index 1。候选像素依次经过：
+
+```text
+candidate_valid
+ = valid_warp
+ & warped_roi_valid
+ & isfinite(depth)
+ & (depth > 0)
+ & isfinite(conf)
+```
+
+后续帧的 `quality_valid` 只用于标定，`model_valid` 才参与写回；因此 `quality_valid.sum()`、`model_valid.sum()`、`fused_pixels` 不能互换。
+
+### 4. 锚定画布状态对象
+
+Python 在线画布的真实数组是：
+
+```text
+CanvasState {
+  rgb:     [Hc,Wc,3], float32, [0,1]
+  depth:   [Hc,Wc],   float32
+  conf:    [Hc,Wc],   float32
+  weight:  [Hc,Wc],   float32
+  valid:   [Hc,Wc],   bool
+  support: [Hc,Wc],   bool
+}
+```
+
+其中 `valid` 表示有可提交几何，`support` 表示当前/历史观测覆盖过该 canonical cell；support 可以为真而 valid 仍为假。`weight` 是累计观测强度，`conf` 是已见置信度上界，RGB 是独立的颜色写回结果。对一个 `y,x` cell，`slot=y×Wc+x` 只在 C++ 版本中显式使用；Python sparse delta 使用二维数组索引。
+
+画布尺寸不是模型尺寸。以本次真实 1920×1200 输入、匹配宽度 700 为例：匹配图高度为 `round(1200×700/1920)=438`，左右 padding 为 32、上 padding 为 128、下 padding 为 64，所以 canonical canvas 为 `630×764`；首帧模型再将未 padding 的 `438×700` 图缩到 patch-compatible 的 `434×700`。
+
+### 5. Python 稀疏回放对象
+
+每个提交帧的回放记录为：
+
+```text
+ReplayFrame {
+  frame_id:       int
+  image_name:     string
+  metrics:        dict[str, Any]
+  pipeline_mask:  [Hc,Wc], bool
+  delta:          null 或 CanvasDelta
+}
+
+CanvasDelta {
+  frame_id:       int
+  fields:         tuple[FieldDelta, ...]
+  changed_mask:   [Hc,Wc], bool
+}
+
+FieldDelta {
+  name:           rgb/depth/conf/weight/valid/support
+  index:          null 或 int64[N]，按 row-major 展平的 cell index
+  before/after:   null 或 [N,*trailing_shape]
+  before_full:    null 或完整字段
+  after_full:     null 或完整字段
+  trailing_shape: ()、(3,) 等
+}
+```
+
+首帧 `delta.fields=()`，但它把完整 `CanvasState` 保存为 initial state，并把 valid 区作为首帧显示 mask；不能把首帧误认为“没有 delta”。后续字段只要任意通道发生差异就产生该 cell 的 index，浮点 NaN 与 NaN 被视为相等；所有字段的 cell mask 做 OR 得到 `changed_mask`。因此：
+
+```text
+fused_pixels = 本帧实际写入新几何的像素数
+delta_pixels  = 六个状态字段中任意字段发生变化的像素数
+anchor_pixels = 仅用于标定的稳定 ring 像素数
+```
+
+颜色桥接或 support-only 更新可以增加 `delta_pixels`，却不增加 `fused_pixels`；回放必须同时保存它们的 before/after 才能精确前进和后退。
+
+### 6. C++ 观察器对象
+
+C++ 观察器把每个 canonical cell 序列化为 slot，而不是保存 Python 的 `weight`：
+
+```text
+CanvasState {
+  width,height:       int
+  depth:              float32[width×height]
+  confidence:         float32[width×height]
+  rgba:               uint32[width×height]       # r | g<<8 | b<<16 | a<<24
+  last_update_frame:  uint32[width×height]
+  valid:              uint8[width×height]
+  support:            uint8[width×height]
+  anchor_rgba:        uint32[width×height]
+  anchor_camera:      fx,fy,cx,cy,depth_scale,depth_bias: float32
+  version:            uint64
+  last_frame:         uint64
+  initialized:        bool
+}
+
+CandidatePatch {
+  frame_seq,base_version: uint64
+  width,height:            int
+  changed_ratio:           float32
+  scene_jump,initialize:   bool
+  anchor_camera:           6×float32
+  anchor_rgba:             uint32[width×height] 或空
+  updates:                 {slot_id:uint32, after:SlotValue}[]
+  observed_slots:          uint32[]
+}
+
+SlotValue {
+  depth,confidence: float32
+  rgba,last_update_frame: uint32
+  valid:            uint8
+}
+```
+
+`observed_slots` 只更新 support；`updates` 才更新 depth/conf/RGBA/valid。提交者先验证 `state.version==base_version`，然后生成 `PointCloudDelta`，其中每个 change 保存 slot 的 before/after。C++ TCP 包头固定 12 字节：little-endian `u32 magic=0x5047564f`（字节为 `4f 56 47 50`）、`u16 schema=1`、`u16 message_type`、`u32 payload_size`；payload 之后不能有未解析尾字节。
+
+## 端到端真实数据样例（精简但字段完整）
+
+### 1. 样例来源和运行覆盖项
+
+下面样例直接取工作区已有的 12 帧 Python aligned-canvas CUDA 输出及其最终 PLY，不重新启动模型。原始 12 张图均为 `1920×1200`，本次运行的实际覆盖项是：
+
+为避免把重复字段铺满全文，只展开四个能覆盖不同分支的 frame：`frame_id=0` 表示首帧初始化，`frame_id=1` 表示正常的 homography 对齐与增量融合，`frame_id=4` 表示变化较大的 ROI，`frame_id=11` 表示 `bad_homography` 后跳过模型的情况；其余 8 帧只在汇总统计和最终结果中体现。
+
+```json
+{
+  "backend": "omnivggt-pytorch",
+  "device": "cuda",
+  "dtype": "bf16",
+  "target_width": 700,
+  "target_size": 700,
+  "patch_multiple": 14,
+  "warmup_buckets": [],
+  "preload_patch_embed": false,
+  "flow_mode": "none",
+  "fuse_min_conf": 0.0,
+  "camera_input": null,
+  "depth_input": null
+}
+```
+
+这里的 `fuse_min_conf=0.0` 是该次 CLI 为了保留边界几何而覆盖的值，不是配置类默认的 `0.1`。所以这个样例中的首帧和后续写回门限不能直接套用默认配置；后续仍会使用第 20 百分位作为标定质量门限。
+
+### 2. 输入数据样式
+
+第一帧的精简实际样本如下；数组主体用形状表示，像素值是该图真实读取值：
+
+```json
+{
+  "frame_id": 0,
+  "timestamp": 0.0,
+  "rgb": {
+    "shape": [1200, 1920, 3],
+    "dtype": "uint8",
+    "range": [0, 255],
+    "mean_rgb": [130.612, 134.535, 57.498],
+    "pixel_0_0": [0, 10, 10],
+    "pixel_center": [213, 217, 96]
+  },
+  "depth": null,
+  "intrinsic": null,
+  "extrinsic_c2w": null,
+  "meta": {"source": "image sequence", "has_camera": false, "has_depth": false}
+}
+```
+
+输入像素进入 `[0,1]` 后，左上角示例变为 `[0.000000,0.039216,0.039216]`，中心像素变为 `[0.835294,0.850980,0.376471]`。缺失的相机/深度不是删除字段，而是由后续 batch 显式补成固定形状的占位张量。
+
+### 3. 第一帧的中间数据样式
+
+第一帧的实际尺寸变化为：
+
+```text
+raw RGB                 [1200,1920,3] uint8
+matching RGB            [438,700,3] float32, [0,1]
+canonical canvas        [630,764,3] float32, [0,1]
+first model RGB         [434,700,3] float32
+images(host)            [1,1,3,434,700] float32
+images(device)          [1,1,3,434,700] bfloat16
+depth(host/device)      [1,1,434,700,1] float32 -> bfloat16
+mask(host/device)       [1,1,434,700] float32 -> bfloat16
+extrinsics/intrinsics   [1,1,3,4]/[1,1,3,3] float32
+```
+
+首帧用单位变换，不需要 homography。模型输出先按 `[1,S,Hm,Wm,*]` 解包，再取 frame 0，warp 回 `[630,764]` 画布。首帧在线状态的有效几何数为 `163010`，RGB/depth/conf/weight/valid/support 都以画布坐标保存；padding 像素存在于数组中，但不因“在数组内”而自动变成 valid。
+
+首帧实际 metrics：
+
+```json
+{
+  "frame_id": 0,
+  "roi": [700, 434],
+  "changed_ratio": 0.336034,
+  "photometric_changed_ratio": 0.0,
+  "support_changed_ratio": 0.336034,
+  "homography_inliers": 0,
+  "homography_error_px": null,
+  "anchor_pixels": 0,
+  "fused_pixels": 163010,
+  "delta_pixels": 163010,
+  "point_count": 163010,
+  "model_ms": 1140.262,
+  "total_ms": 1222.280,
+  "skipped_model": false,
+  "fallback_reason": null
+}
+```
+
+### 4. 后续帧的中间数据样式
+
+第二帧仍使用相同的 `[630,764]` canonical canvas，但变化区域裁剪后得到 `672×700` ROI。它的模型输入是双帧：
+
+```text
+anchor/current ROI       [700,672,3] each, float32 host
+images(host)             [1,2,3,700,672] float32
+images(device)           [1,2,3,700,672] bfloat16
+depth/mask               [1,2,700,672,1]/[1,2,700,672]
+model output current     depth/conf -> [700,672]/[700,672]
+projected candidate      depth/conf -> [630,764]/[630,764]
+```
+
+第二帧真实流程记录如下：SIFT/ORB 对齐得到 67 个内点、内点中位误差 `0.262896px`；变化 mask 占 `2.122861%`，其中光度变化占 `0.075036%`、支持变化占 `1.709132%`；anchor ring 有 `29627` 个像素。`fused_pixels=9714` 只计新几何写回，`delta_pixels=20720` 还包括 RGB/depth/conf/weight/valid/support 中发生变化的 cell，因此两者不相等。
+
+```json
+{
+  "frame_id": 1,
+  "roi": [672, 700],
+  "changed_ratio": 0.021229,
+  "photometric_changed_ratio": 0.000750,
+  "support_changed_ratio": 0.017091,
+  "homography_inliers": 67,
+  "homography_error_px": 0.262896,
+  "anchor_pixels": 29627,
+  "fused_pixels": 9714,
+  "delta_pixels": 20720,
+  "point_count_after": 171301,
+  "model_ms": 1296.620,
+  "total_ms": 2106.987,
+  "skipped_model": false,
+  "fallback_reason": null,
+  "delta_fields": ["rgb", "depth", "conf", "weight", "valid", "support"]
+}
+```
+
+### 5. 变化较大的帧和跳过帧
+
+第 5 个 frame（`frame_id=4`）的变化率升到 `0.050649`，ROI 为 `700×560`，对齐仍有 21 个内点、误差 `0.733780px`；本帧写入 15330 个新几何像素，delta 触及 25798 个 cell，在线 point count 到 `192840`。它说明 ROI 会随变化区域改变，模型尺寸不等于 canonical canvas 尺寸。
+
+最后一个 frame（`frame_id=11`）没有再次推理：对齐被标记 `bad_homography`，变化率为 0，`roi=[0,0]`、`model_ms=0`、`fused_pixels=0`、`delta_pixels=0`，保留在线 point count `193764`。这一帧的 `total_ms=138.873` 仍非零，因为读取、预处理、对齐和失败判定已经执行；`skipped_model=true` 不表示整帧没有任何计算。
+
+### 6. 最终输出数据样式
+
+该次运行的 summary 实际值为：
+
+```json
+{
+  "image_count": 12,
+  "backend_load_ms": 13836.832,
+  "first_input_to_pointcloud_ms_including_backend_load": 15124.111,
+  "first_frame_total_ms": 1222.280,
+  "first_frame_model_ms": 1140.262,
+  "subsequent_avg_total_ms": 1462.262,
+  "subsequent_p90_total_ms": 1859.015,
+  "subsequent_avg_model_ms": 814.393,
+  "subsequent_avg_delta_pixels": 6759.545,
+  "subsequent_avg_anchor_pixels": 15759.273,
+  "final_point_count": 186011,
+  "replay": {"frame_count": 12, "delta_history": true}
+}
+```
+
+最终 ASCII PLY 的字段是 `x,y,z: float` 加 `red,green,blue: uchar`；文件头声明 `vertex=186011`。前三个真实顶点为：
+
+```text
+-0.125974  0.319481  0.012463  212 192  65
+-0.124675  0.319481  0.012510  232 207  75
+-0.123377  0.319481  0.012551  247 221  89
+```
+
+整个输出点云的实际统计为：
+
+```text
+xyz_min      = [-0.457143, -0.329870, -0.010020]
+xyz_max      = [ 0.185714,  0.319481,  0.022858]
+xyz_mean     = [-0.131717,  0.001463,  0.001423]
+z_percentile = p00 -0.010020, p01 -0.008534,
+               p50  0.000000, p99  0.017647, p100 0.022858
+rgb_mean     = [198.043, 203.758, 84.368]
+```
+
+这里 `final_point_count=186011` 小于最后一帧在线 `point_count=193764` 是预期行为：在线 count 统计当前 `valid` canvas；导出阶段还会执行窄缝填补、密集区域平滑、异常/边界裁剪和最终有效性筛选。不能用 PLY 行数反推某一帧的 `fused_pixels`，也不能把 `delta_pixels` 当作最终点数。
+
+### 7. 从输入到输出的最小可复现记录
+
+把上面的对象串成一条完整记录，可以写成：
+
+```text
+raw frame 0
+  [1200,1920,3] uint8
+      ↓ RGB range + resize + zero padding
+matching/canvas
+  [438,700,3] -> [630,764,3] float32
+      ↓ full-frame patch-compatible resize
+model batch
+  images [1,1,3,434,700] BF16 on CUDA
+      ↓ OmniVGGT inference
+prediction frame 0
+  depth/conf [434,700] -> warp -> [630,764]
+      ↓ candidate + finite/depth/conf + first-frame initialization
+canvas state
+  valid cells = 163010
+      ↓ frame 1: homography + change + ROI [672,700]
+      ↓ quality calibration + write mask + six-field sparse delta
+canvas state
+  point count = 171301, delta cells = 20720
+      ↓ 12 frames + reversible history
+export
+  ASCII PLY vertices = 186011, x/y/z float + RGB uchar
+```
+
+这份记录中每个箭头都对应一次数据域变化：`uint8 HWC → float32 matching → padded canvas → BF16 NCHW model input → float32 projected depth/conf → bool masks + float32 state → sparse before/after delta → exported normalized point cloud`。任何实现若跳过其中的 dtype、shape、坐标域或计数语义转换，都不能认为与当前方法等价。
