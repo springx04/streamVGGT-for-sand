@@ -460,7 +460,7 @@ CanvasState {
 
 其中 `valid` 表示有可提交几何，`support` 表示当前/历史观测覆盖过该 canonical cell；support 可以为真而 valid 仍为假。`weight` 是累计观测强度，`conf` 是已见置信度上界，RGB 是独立的颜色写回结果。对一个 `y,x` cell，`slot=y×Wc+x` 只在 C++ 版本中显式使用；Python sparse delta 使用二维数组索引。
 
-画布尺寸不是模型尺寸。以本次真实 1920×1200 输入、匹配宽度 700 为例：匹配图高度为 `round(1200×700/1920)=438`，左右 padding 为 32、上 padding 为 128、下 padding 为 64，所以 canonical canvas 为 `630×764`；首帧模型再将未 padding 的 `438×700` 图缩到 patch-compatible 的 `434×700`。
+画布尺寸不是模型尺寸。以本次真实 1920×1200 输入、匹配宽度 700 为例：匹配图高度为 `round(1200×700/1920)=438`，左右 padding 为 35、上 padding 为 128、下 padding 为 64，所以 canonical canvas 为 `630×770`；首帧模型再将未 padding 的 `438×700` 图缩到 patch-compatible 的 `434×700`。左右 35 来自 `round(700×0.05)`，不是固定 32。
 
 ### 5. Python 稀疏回放对象
 
@@ -580,9 +580,7 @@ SlotValue {
     "shape": [1200, 1920, 3],
     "dtype": "uint8",
     "range": [0, 255],
-    "mean_rgb": [130.612, 134.535, 57.498],
-    "pixel_0_0": [0, 10, 10],
-    "pixel_center": [213, 217, 96]
+    "mean_rgb": [130.612, 134.535, 57.498]
   },
   "depth": null,
   "intrinsic": null,
@@ -591,7 +589,7 @@ SlotValue {
 }
 ```
 
-输入像素进入 `[0,1]` 后，左上角示例变为 `[0.000000,0.039216,0.039216]`，中心像素变为 `[0.835294,0.850980,0.376471]`。缺失的相机/深度不是删除字段，而是由后续 batch 显式补成固定形状的占位张量。
+RGB 像素进入模型前统一转换为 `[0,1] float32`；实际图像内容见后面的输入帧和流程图片。缺失的相机/深度不是删除字段，而是由后续 batch 显式补成固定形状的占位张量。
 
 ### 3. 第一帧的中间数据样式
 
@@ -600,7 +598,7 @@ SlotValue {
 ```text
 raw RGB                 [1200,1920,3] uint8
 matching RGB            [438,700,3] float32, [0,1]
-canonical canvas        [630,764,3] float32, [0,1]
+canonical canvas        [630,770,3] float32, [0,1]
 first model RGB         [434,700,3] float32
 images(host)            [1,1,3,434,700] float32
 images(device)          [1,1,3,434,700] bfloat16
@@ -609,7 +607,7 @@ mask(host/device)       [1,1,434,700] float32 -> bfloat16
 extrinsics/intrinsics   [1,1,3,4]/[1,1,3,3] float32
 ```
 
-首帧用单位变换，不需要 homography。模型输出先按 `[1,S,Hm,Wm,*]` 解包，再取 frame 0，warp 回 `[630,764]` 画布。首帧在线状态的有效几何数为 `163010`，RGB/depth/conf/weight/valid/support 都以画布坐标保存；padding 像素存在于数组中，但不因“在数组内”而自动变成 valid。
+首帧用单位变换，不需要 homography。模型输出先按 `[1,S,Hm,Wm,*]` 解包，再取 frame 0，warp 回 `[630,770]` 画布。首帧在线状态的有效几何数为 `163010`，RGB/depth/conf/weight/valid/support 都以画布坐标保存；padding 像素存在于数组中，但不因“在数组内”而自动变成 valid。
 
 首帧实际 metrics：
 
@@ -635,7 +633,7 @@ extrinsics/intrinsics   [1,1,3,4]/[1,1,3,3] float32
 
 ### 4. 后续帧的中间数据样式
 
-第二帧仍使用相同的 `[630,764]` canonical canvas，但变化区域裁剪后得到 `672×700` ROI。它的模型输入是双帧：
+第二帧仍使用相同的 `[630,770]` canonical canvas，但变化区域裁剪后得到 `672×700` ROI。它的模型输入是双帧：
 
 ```text
 anchor/current ROI       [700,672,3] each, float32 host
@@ -643,7 +641,7 @@ images(host)             [1,2,3,700,672] float32
 images(device)           [1,2,3,700,672] bfloat16
 depth/mask               [1,2,700,672,1]/[1,2,700,672]
 model output current     depth/conf -> [700,672]/[700,672]
-projected candidate      depth/conf -> [630,764]/[630,764]
+projected candidate      depth/conf -> [630,770]/[630,770]
 ```
 
 第二帧真实流程记录如下：SIFT/ORB 对齐得到 67 个内点、内点中位误差 `0.262896px`；变化 mask 占 `2.122861%`，其中光度变化占 `0.075036%`、支持变化占 `1.709132%`；anchor ring 有 `29627` 个像素。`fused_pixels=9714` 只计新几何写回，`delta_pixels=20720` 还包括 RGB/depth/conf/weight/valid/support 中发生变化的 cell，因此两者不相等。
@@ -726,13 +724,13 @@ raw frame 0
   [1200,1920,3] uint8
       ↓ RGB range + resize + zero padding
 matching/canvas
-  [438,700,3] -> [630,764,3] float32
+  [438,700,3] -> [630,770,3] float32
       ↓ full-frame patch-compatible resize
 model batch
   images [1,1,3,434,700] BF16 on CUDA
       ↓ OmniVGGT inference
 prediction frame 0
-  depth/conf [434,700] -> warp -> [630,764]
+  depth/conf [434,700] -> warp -> [630,770]
       ↓ candidate + finite/depth/conf + first-frame initialization
 canvas state
   valid cells = 163010
@@ -746,3 +744,64 @@ export
 ```
 
 这份记录中每个箭头都对应一次数据域变化：`uint8 HWC → float32 matching → padded canvas → BF16 NCHW model input → float32 projected depth/conf → bool masks + float32 state → sparse before/after delta → exported normalized point cloud`。任何实现若跳过其中的 dtype、shape、坐标域或计数语义转换，都不能认为与当前方法等价。
+---
+
+### 8. 图像内容级数据：实际图像流程
+
+上一版只列出 RGB 数值切片；这里改为直接放入从真实输入重新生成的图片。图中的主体内容均来自实际帧，黑色区域是算法产生的 padding 或透视 warp 空间，不是示意纹理。
+
+#### 8.1 输入帧
+
+下面四帧对应首帧初始化、正常增量、大变化和对齐失败四种情况；不展开其余重复帧。
+
+![真实输入帧：0、1、4、11](assets/dataflow/selected_inputs.png)
+
+每个输入仍先按原始 `1920×1200 RGB` 读取；图中显示的是实际相机画面，不是经过模型生成的预览。
+
+#### 8.2 matching 与 canonical canvas
+
+左图是实际的 `700×438` matching RGB，右图是加入左/右 `35 px`、上 `128 px`、下 `64 px` padding 后的 `770×630` canonical canvas。黑色边界会进入数组，但随后由 `valid/support` 决定是否参与几何。
+
+![matching 图与 padded canvas](assets/dataflow/matching_and_canvas.png)
+
+#### 8.3 识别：灰度特征、匹配和单应性
+
+识别阶段在 padded canvas 上生成灰度图，再执行 SIFT（不可用时回退 ORB）、Lowe ratio 筛选、BFMatcher 和 RANSAC 单应性估计。下面是实际 frame 1 到 frame 0 的特征匹配可视化；绿色连线是参与 RANSAC 的匹配。
+
+![真实 SIFT/RANSAC 特征匹配](assets/dataflow/feature_matches_frame1.png)
+
+该步骤输出 current-to-anchor 的几何变换；它不是直接把两张图按相同坐标裁剪，而是先把 current warp 到 anchor canvas，再从变化 mask 的包围盒提取 ROI。
+
+#### 8.4 正常变化帧：anchor/current ROI
+
+frame 1 的实际流程是：变化核心外扩 `32 px` 上下文，得到 `[31,52,565,606)` 的 canvas crop；裁剪后再按 patch multiple `14` 缩放为 `700×672`。左侧是 anchor ROI，右侧是经过当前帧 homography 对齐后的 current ROI。
+
+![frame 1 实际 anchor/current ROI](assets/dataflow/roi_frame1_anchor_current.png)
+
+这两张图随后组成双帧图像 batch：`anchor/current HWC → uint8 round-trip → CHW → [1,2,3,700,672] → CUDA BF16`。图中 current ROI 上方或边缘出现的黑色区域来自透视 warp 的无效支持，后续 `warped_roi_valid` 和 model-space margin 会将其排除。
+
+#### 8.5 大变化帧：更宽的 ROI
+
+frame 4 的上下文 crop 为 `[0,48,558,502)`，裁剪前是 `454×558`，最终 bucket 为 `560×700`；它与 frame 1 使用同一套 anchor/current 机制，但实际图像内容和输入比例不同。
+
+![frame 4 实际 anchor/current ROI](assets/dataflow/roi_frame4_anchor_current.png)
+
+#### 8.6 对齐失败帧：有输入图，但没有模型图像 batch
+
+frame 11 仍然有真实输入图像，但特征识别结果为 `bad_homography`，因此不生成可信 ROI，也不构造新的双帧模型输入；流程保留上一帧 canvas。
+
+![frame 11 实际输入与跳过结果](assets/dataflow/frame11_skip.png)
+
+图像内容的真实流转可以概括为：
+
+```text
+真实 RGB 输入图
+  → matching resize
+  → padded anchor canvas
+  → gray + SIFT/ORB feature matching
+  → homography warp + change/fusion mask
+  → context crop
+  → anchor/current ROI resize
+  → CHW image batch
+  → CUDA BF16 inference
+```
