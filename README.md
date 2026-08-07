@@ -1,71 +1,101 @@
-# Stream OmniVGGT
+# OmniVGGT Main Workflows
 
-`stream_omnivggt` is a no-training, system-layer streaming wrapper around OmniVGGT. It does not fine-tune weights, does not add training code, and does not change OmniVGGT attention or token logic. OmniVGGT is treated as a local-window inference black box; persistent state lives in change masks, keyframes, caches, and an incremental hybrid map.
+This repository currently has two production workflows for live replay on Windows:
 
-```mermaid
-flowchart TD
-  A["InputPacket RGB / optional depth / optional camera"] --> B["Rotation + height preprocessors"]
-  B --> C["Resize/crop to shape bucket"]
-  C --> D["Change mask: image, depth, flow, confidence"]
-  D --> E["Active window selector"]
-  E --> F["OmniVGGTBackend or MockOmniBackend"]
-  F --> G["Changed point extraction"]
-  G --> H["HybridMap surfel foreground"]
-  G --> I["TSDF / voxel background"]
-  H --> J["Hot block cache"]
-  I --> J
-  J --> K["Cold memmap store"]
-  J --> L["Async snapshot / export path"]
+1. Python main workflow (one-click): `stream_omnivggt\start_python_live_replay.bat`
+2. C++ main workflow (one-click): `setc\scripts\start_cpp_live_replay.bat`
+
+Both workflows use the `data2` image directory by default and write outputs to:
+
+- `stream_omnivggt_outputs\data2_python_live_replay`
+
+## 1) Python Main Workflow
+
+### 1.1 Prepare runtime environment
+
+From repository root:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File setc\scripts\setup_export_venv_torch270.ps1
 ```
 
-## Run Without Omni Weights
+This creates/reuses:
 
-From the repository root:
+- `setc\venv_torch270_cu128`
 
-```bash
-python -m pytest stream_omnivggt/tests
-python -m stream_omnivggt.cli.benchmark_stream --strategy block_incremental --output-json stream_benchmark.json
-python -m stream_omnivggt.cli.run_stream_demo --image-dir example/office/images --mock-backend
+### 1.2 One-click start
+
+```powershell
+cmd /c stream_omnivggt\start_python_live_replay.bat
 ```
 
-`MockOmniBackend` deterministically converts RGB/depth into pseudo point maps and confidence maps, so tests and benchmarks run without real weights.
+The launcher runs:
 
-## Connect Real OmniVGGT
+- `python -m stream_omnivggt.cli.run_data2_live_replay`
+- `--image-dir data2`
+- `--output-dir stream_omnivggt_outputs\data2_python_live_replay`
+- `--target-width 700 --target-size 700 --device cuda --dtype bf16`
+- `--display-max-points 0 --no-save-debug`
 
-The default backend is `OmniVGGTBackend`, which looks for:
+### 1.3 Expected outputs
 
-- `cfg.omni.checkpoint_path`
-- `cfg.omni.repo_root/checkpoints/OmniVGGT.safetensors`
-- `./checkpoints/OmniVGGT.safetensors`
+- `stream_omnivggt_outputs\data2_python_live_replay\pointcloud_final.ply`
+- `stream_omnivggt_outputs\data2_python_live_replay\timings.json`
+- `stream_omnivggt_outputs\data2_python_live_replay\timings.md`
 
-It imports `omnivggt.models.omnivggt.OmniVGGT` and calls the official `inference()` API with `camera_gt_index` and `depth_gt_index`. If import, weights, CUDA, or initialization fail, it logs a warning and falls back to `MockOmniBackend`.
+## 2) C++ Main Workflow
 
-`engine_mode="onnxruntime"` and `engine_mode="tensorrt"` are reserved stubs in v0.1. `onnxruntime-gpu` is an optional extra and must match the local CUDA runtime.
+### 2.1 Install C++ dependencies (first machine setup)
 
-## Benchmark
-
-```bash
-python -m stream_omnivggt.cli.benchmark_stream --strategy full_rebuild --output-json full.json
-python -m stream_omnivggt.cli.benchmark_stream --strategy block_incremental --output-json incr.json
-python -m stream_omnivggt.cli.benchmark_stream --strategy keyframe_hybrid --output-json hybrid.json
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File setc\scripts\install_windows_gpu_deps.ps1
 ```
 
-The benchmark writes JSON plus a markdown report with average, p90, p99, updated block count, updated point ratio, total latency, and peak memory.
+Default install targets used by current scripts:
 
-## Tuning
+- `LIBTORCH=C:\Dev\libtorch\2.7.0-cu128`
+- `OpenCV_DIR=C:\Dev\opencv\4.10.0\build`
+- `CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8`
 
-- `small_change_ratio`: below this, keep the default short window; above it, use a medium window.
-- `scene_jump_ratio`: above this, force a refresh-sized window or start a new segment.
-- `window.default_window`, `medium_window`, `refresh_window`: bucketed to 3/4/6/8 frames.
-- `voxel_size`: smaller values increase map detail and block count.
-- `block_resolution`: larger blocks reduce hash overhead but increase per-block fusion work.
-- `max_hot_blocks`: controls LRU eviction pressure; anchor blocks are protected.
+If your local paths differ, set environment variables before build/run.
 
-## Performance Notes
+### 2.2 Build live observer binaries
 
-- Keep input shapes in a small bucket set (`target_width`, `target_size`, `patch_multiple`).
-- Keep rendering/export on the background path; `push()` does not call heavy visualization.
-- Use pinned memory and `non_blocking=True` for CPU-to-GPU tensors when CUDA is active.
-- Warm up GPU hot paths with `warmup_buckets`.
-- Map state is float32 by default even if model inference uses fp16/bf16.
+```powershell
+cmd /c setc\scripts\build_windows_live_observer.bat
+```
+
+Expected binaries:
+
+- `setc\build_live_observer\Release\omnivggt_stream_server.exe`
+- `setc\build_live_observer\Release\omnivggt_live_viewer.exe`
+
+### 2.3 Build required TorchScript artifacts (if missing)
+
+If these files already exist, skip this section:
+
+- `setc\artifacts\omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt`
+- `setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt`
+
+Export commands (from repository root):
+
+```powershell
+setc\venv_torch270_cu128\Scripts\python.exe setc\scripts\export_torchscript.py --output setc\artifacts\omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt --num-images 1 --height 434 --width 700 --dtype bfloat16 --autocast-dtype bfloat16 --observer-depth-only --no-freeze
+
+setc\venv_torch270_cu128\Scripts\python.exe setc\scripts\export_torchscript.py --output setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt --num-images 2 --height 700 --width 700 --dtype bfloat16 --autocast-dtype bfloat16 --observer-depth-only --no-freeze
+```
+
+### 2.4 One-click start
+
+```powershell
+cmd /c setc\scripts\start_cpp_live_replay.bat
+```
+
+The launcher starts `omnivggt_stream_server.exe` in background, then launches `omnivggt_live_viewer.exe`.
+
+## Notes
+
+- Python and C++ launchers are aligned to the same replay target (`data2`, `700x700`, `cuda`, `bf16`).
+- The C++ launcher always kills old viewer/server processes first, then starts a fresh run on port `37651`.
+- For C++ offline replay fidelity, queue capacity is fixed to `1024` in the launcher.
 
