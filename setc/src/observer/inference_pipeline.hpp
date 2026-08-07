@@ -7,6 +7,7 @@
 #include <torch/torch.h>
 
 #include <filesystem>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -122,10 +123,17 @@ private:
     torch::ScalarType dtype_ = torch::kFloat32;
     torch::jit::script::Module module_;
     torch::jit::script::Module pair_module_;
+    // Dynamic pair artifacts are large (about 2.4 GB each in the BF16
+    // observer build). Keep a small GPU LRU so switching between the common
+    // ROI buckets does not deserialize and upload the graph on every frame.
+    std::map<std::pair<int, int>, torch::jit::script::Module> pair_module_cache_;
+    std::vector<std::pair<int, int>> pair_module_lru_;
+    std::vector<std::pair<int, int>> dynamic_pair_shapes_;
     bool has_pair_module_ = false;
     bool pair_module_loaded_ = false;
     std::pair<int, int> pair_module_shape_ = {-1, -1};
     std::filesystem::path pair_model_dir_;
+    bool single_model_released_ = false;
     // Python keeps the aligned float canvas and the original float anchor in
     // memory.  CanvasState serializes colors as RGBA bytes for the protocol;
     // retain these live float buffers inside the external inference engine so
@@ -139,6 +147,12 @@ private:
 
     FrameImage load_frame(const std::filesystem::path& path) const;
     Prediction run_model(const std::vector<cv::Mat>& rgb_u8, int output_frame_index);
+    void activate_dynamic_pair_module(
+        const std::filesystem::path& bucket_path,
+        const std::pair<int, int>& shape);
+    std::pair<int, int> dynamic_pair_shape_for_target(
+        const std::pair<int, int>& target) const;
+    void release_single_model_after_first_frame();
 
     static cv::Mat gray_u8(const cv::Mat& rgb_u8);
     static cv::Mat translation_h(double dx, double dy);
