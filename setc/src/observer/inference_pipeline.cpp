@@ -52,6 +52,8 @@ int floor_to_multiple_14(const double value) {
     return std::max(14, static_cast<int>(std::floor(value / 14.0)) * 14);
 }
 
+constexpr std::size_t kMaxDynamicPairGpuCache = 2U;
+
 // Python's _bucket_roi_size preserves the ROI aspect ratio and only pads the
 // model input through the patch-size floor.  Stretching every ROI to 700x700
 // changes the scene geometry before inference and is the main reason the old
@@ -125,6 +127,44 @@ std::filesystem::path pair_artifact_for_shape(
         }
     }
     return candidate;
+}
+
+std::vector<std::pair<int, int>> discover_dynamic_pair_shapes(
+    const std::filesystem::path& bucket_dir) {
+    std::vector<std::pair<int, int>> shapes;
+    if (bucket_dir.empty() || !std::filesystem::is_directory(bucket_dir)) {
+        return shapes;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(bucket_dir)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".pt") {
+            continue;
+        }
+        const std::string filename = entry.path().filename().string();
+        const std::size_t marker = filename.find("_s2_");
+        if (marker == std::string::npos) {
+            continue;
+        }
+        const std::size_t dimensions_begin = marker + 4U;
+        const std::size_t separator = filename.find('x', dimensions_begin);
+        const std::size_t suffix_begin = filename.find('_', separator + 1U);
+        if (separator == std::string::npos || suffix_begin == std::string::npos) {
+            continue;
+        }
+        try {
+            const int width = std::stoi(filename.substr(
+                dimensions_begin, separator - dimensions_begin));
+            const int height = std::stoi(filename.substr(
+                separator + 1U, suffix_begin - separator - 1U));
+            if (width > 0 && height > 0) {
+                shapes.emplace_back(width, height);
+            }
+        } catch (const std::exception&) {
+            // Ignore unrelated .pt files in the artifact directory.
+        }
+    }
+    std::sort(shapes.begin(), shapes.end());
+    shapes.erase(std::unique(shapes.begin(), shapes.end()), shapes.end());
+    return shapes;
 }
 
 cv::Mat quantize_rgb_u8(const cv::Mat& rgb_f) {
@@ -1112,11 +1152,12 @@ InferenceEngine::InferenceEngine(InferenceOptions options) : options_(std::move(
     configure_torchscript_executor(module_);
 
     pair_model_dir_ = options_.pair_model_dir;
+    dynamic_pair_shapes_ = discover_dynamic_pair_shapes(pair_model_dir_);
     if (!options_.pair_model.empty()) {
         // Loading every possible dynamic ROI graph at startup would keep
         // several multi-gigabyte copies on the GPU.  With a bucket directory,
-        // load exactly the shape currently needed and replace the previous
-        // module before the next shape is requested.
+        // activate only the shapes requested by the stream and retain a small
+        // LRU of already uploaded graphs.
         if (pair_model_dir_.empty() || options_.pair_letterbox) {
             pair_module_ = torch::jit::load(options_.pair_model, device_);
             pair_module_.eval();
@@ -1136,8 +1177,103 @@ InferenceEngine::InferenceEngine(InferenceOptions options) : options_(std::move(
         if (has_pair_module_ && (pair_model_dir_.empty() || options_.pair_letterbox)) {
             const cv::Mat pair_warmup = cv::Mat::zeros(options_.height, options_.width, CV_8UC3);
             (void)run_model({pair_warmup, pair_warmup}, 1);
+        } else if (has_pair_module_ && !pair_model_dir_.empty()
+            && dynamic_pair_shapes_.size() == 1U) {
+            // A single enclosing bucket is the practical low-memory deployment
+            // mode: warm it before the stream starts, then release the
+            // single-frame graph after frame 0. The common 490x700/518x700
+            // replay therefore pays no graph-load cost inside frame timings.
+            const auto shape = dynamic_pair_shapes_.front();
+            const std::filesystem::path bucket_path = pair_artifact_for_shape(
+                options_.pair_model, pair_model_dir_, shape.first, shape.second);
+            activate_dynamic_pair_module(bucket_path, shape);
+            const cv::Mat pair_warmup = cv::Mat::zeros(shape.second, shape.first, CV_8UC3);
+            (void)run_model({pair_warmup, pair_warmup}, 1);
         }
     }
+}
+
+std::pair<int, int> InferenceEngine::dynamic_pair_shape_for_target(
+    const std::pair<int, int>& target) const {
+    if (pair_model_dir_.empty() || options_.pair_letterbox) {
+        return target;
+    }
+    const auto fits = [&target](const std::pair<int, int>& shape) {
+        return shape.first >= target.first && shape.second >= target.second;
+    };
+    // Prefer a resident bucket so a later ROI does not trigger a graph swap.
+    for (auto it = pair_module_lru_.rbegin(); it != pair_module_lru_.rend(); ++it) {
+        if (fits(*it)) {
+            return *it;
+        }
+    }
+    std::pair<int, int> selected = target;
+    std::int64_t selected_area = std::numeric_limits<std::int64_t>::max();
+    for (const auto& shape : dynamic_pair_shapes_) {
+        if (!fits(shape)) {
+            continue;
+        }
+        const std::int64_t area = static_cast<std::int64_t>(shape.first)
+            * static_cast<std::int64_t>(shape.second);
+        if (area < selected_area) {
+            selected = shape;
+            selected_area = area;
+        }
+    }
+    return selected;
+}
+
+void InferenceEngine::activate_dynamic_pair_module(
+    const std::filesystem::path& bucket_path,
+    const std::pair<int, int>& shape) {
+    const auto cached = pair_module_cache_.find(shape);
+    if (cached == pair_module_cache_.end()) {
+        // Release the least-recently-used GPU graph before loading a new one;
+        // otherwise the old graph and the new graph coexist during CUDA
+        // deserialization and can exceed the 8 GB deployment budget.
+        while (pair_module_cache_.size() >= kMaxDynamicPairGpuCache
+            && !pair_module_lru_.empty()) {
+            const std::pair<int, int> victim = pair_module_lru_.front();
+            pair_module_lru_.erase(pair_module_lru_.begin());
+            if (pair_module_loaded_ && pair_module_shape_ == victim) {
+                pair_module_ = torch::jit::script::Module();
+                pair_module_loaded_ = false;
+                pair_module_shape_ = {-1, -1};
+            }
+            const auto victim_it = pair_module_cache_.find(victim);
+            if (victim_it != pair_module_cache_.end()) {
+                victim_it->second.to(torch::Device(torch::kCPU));
+                pair_module_cache_.erase(victim_it);
+            }
+        }
+
+        auto loaded = torch::jit::load(bucket_path.string(), device_);
+        loaded.eval();
+        configure_torchscript_executor(loaded);
+        pair_module_cache_.emplace(shape, std::move(loaded));
+    }
+
+    pair_module_ = pair_module_cache_.at(shape);
+    pair_module_shape_ = shape;
+    pair_module_loaded_ = true;
+
+    const auto lru_it = std::find(pair_module_lru_.begin(), pair_module_lru_.end(), shape);
+    if (lru_it != pair_module_lru_.end()) {
+        pair_module_lru_.erase(lru_it);
+    }
+    pair_module_lru_.push_back(shape);
+}
+
+void InferenceEngine::release_single_model_after_first_frame() {
+    if (!device_.is_cuda() || single_model_released_) {
+        return;
+    }
+    // The single-frame graph is used only for the initial frame. Moving it to
+    // CPU after that call frees enough VRAM for the second dynamic pair
+    // bucket to remain resident instead of forcing a reload/paging cycle.
+    module_.to(torch::Device(torch::kCPU));
+    module_ = torch::jit::script::Module();
+    single_model_released_ = true;
 }
 
 InferenceEngine::FrameImage InferenceEngine::load_frame(const std::filesystem::path& path) const {
@@ -1262,11 +1398,9 @@ InferenceEngine::Prediction InferenceEngine::run_model(
                     + ": " + bucket_path.string());
             }
             if (!pair_module_loaded_ || pair_module_shape_ != std::pair<int, int>{width, height}) {
-                pair_module_ = torch::jit::load(bucket_path.string(), device_);
-                pair_module_.eval();
-                configure_torchscript_executor(pair_module_);
-                pair_module_shape_ = {width, height};
-                pair_module_loaded_ = true;
+                activate_dynamic_pair_module(
+                    bucket_path,
+                    {width, height});
             }
         }
         module = &pair_module_;
@@ -2149,6 +2283,8 @@ CandidateCommit InferenceEngine::process(const RawFrame& raw, const CanvasState&
         cv::Mat current_crop = warped_rgb_f(roi).clone();
         const auto [target_width, target_height] = bucket_roi_size(
             roi.width, roi.height, options_.width, options_.height);
+        const auto [bucket_width, bucket_height] = dynamic_pair_shape_for_target(
+            {target_width, target_height});
         cv::Mat anchor_roi;
         cv::Mat current_roi;
         // Keep the Python float path: resize [0,1] RGB directly instead of
@@ -2160,18 +2296,20 @@ CandidateCommit InferenceEngine::process(const RawFrame& raw, const CanvasState&
         // same content rectangle is copied into the fixed 700x700 graph with
         // replicated edge pixels.  Mapping and support are defined from the
         // content rectangle, so the padding cannot become a second surface.
-        const int model_width = options_.pair_letterbox ? options_.width : target_width;
-        const int model_height = options_.pair_letterbox ? options_.height : target_height;
+        const int model_width = options_.pair_letterbox ? options_.width : bucket_width;
+        const int model_height = options_.pair_letterbox ? options_.height : bucket_height;
         result.metrics.roi_width = target_width;
         result.metrics.roi_height = target_height;
         result.metrics.model_input_width = model_width;
         result.metrics.model_input_height = model_height;
-        const int pad_x = options_.pair_letterbox ? (model_width - target_width) / 2 : 0;
-        const int pad_y = options_.pair_letterbox ? (model_height - target_height) / 2 : 0;
+        const bool needs_padding = options_.pair_letterbox
+            || model_width != target_width || model_height != target_height;
+        const int pad_x = needs_padding ? (model_width - target_width) / 2 : 0;
+        const int pad_y = needs_padding ? (model_height - target_height) / 2 : 0;
         if (model_width < target_width || model_height < target_height) {
             throw std::runtime_error("letterbox model bucket is smaller than the ROI bucket");
         }
-        if (options_.pair_letterbox) {
+        if (needs_padding) {
             cv::Mat anchor_padded;
             cv::Mat current_padded;
             cv::copyMakeBorder(
@@ -2221,6 +2359,9 @@ CandidateCommit InferenceEngine::process(const RawFrame& raw, const CanvasState&
     const int output_frame_index = state.initialized ? 1 : 0;
     const Prediction prediction = run_model(model_inputs, output_frame_index);
     result.metrics.model_ms = model_timer.ms();
+    if (!state.initialized) {
+        release_single_model_after_first_frame();
+    }
 
     const cv::Size canvas_size(state.width, state.height);
     const cv::Mat model_depth_canvas = warp_like(

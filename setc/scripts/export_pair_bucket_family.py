@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export exact-shape two-frame TorchScript buckets for the C++ observer.
+"""Export exact-shape two-frame observer TorchScript buckets for C++.
 
 The Python live path keeps the ROI aspect ratio and changes the model tensor
 shape per frame.  ``torch.jit.trace`` records the output spatial shape, so one
@@ -19,7 +19,7 @@ from typing import Iterable
 import torch
 from safetensors.torch import load_file
 
-from export_torchscript import OmniVGGTTorchScriptWrapper
+from export_torchscript import OmniVGGTObserverDepthWrapper
 
 
 def parse_shapes(value: str) -> list[tuple[int, int]]:
@@ -87,7 +87,11 @@ def export_family(
         depth = torch.zeros((1, 2, height, width, 1), device=device, dtype=dtype)
         mask = torch.zeros((1, 2, height, width), device=device, dtype=dtype)
         extrinsics, intrinsics = _identity_cameras(device, 2)
-        wrapper = OmniVGGTTorchScriptWrapper(
+        # The C++ pipeline consumes only pose, depth and depth confidence.
+        # Exporting the full point head here makes LibTorch copy two additional
+        # large output tensors back to CPU on every frame, defeating the
+        # dynamic-input speedup even though the input ROI is smaller.
+        wrapper = OmniVGGTObserverDepthWrapper(
             model=model,
             depth_indices=[],
             camera_indices=[],
@@ -114,7 +118,7 @@ def export_family(
             "camera_indices": [],
             "depth_indices": [],
             "inputs": ["images", "extrinsics", "intrinsics", "depth", "mask"],
-            "outputs": ["pose_enc", "depth", "depth_conf", "world_points", "world_points_conf"],
+            "outputs": ["pose_enc", "depth", "depth_conf"],
             "frozen": False,
             "preprocess": {
                 "color": "RGB",
