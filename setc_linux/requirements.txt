@@ -1,0 +1,4 @@
+# Optional dependencies for regenerating TorchScript artifacts only.
+# Install a CUDA-enabled PyTorch build separately, matching the target CUDA
+# version and the external OmniVGGT Python model source.
+safetensors>=0.4
