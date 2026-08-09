@@ -74,6 +74,49 @@ std::vector<std::int32_t> nearest_indices(const cv::Mat& source_mask) {
     return nearest;
 }
 
+cv::Mat internal_hole_fill_mask(
+    const cv::Mat& valid,
+    const int close_size = 81,
+    const int max_hole_area = 40000) {
+    if (valid.empty() || cv::countNonZero(valid) == 0
+        || close_size <= 1 || max_hole_area <= 0) {
+        return cv::Mat::zeros(valid.size(), CV_8UC1);
+    }
+    const cv::Mat close_kernel = cv::Mat::ones(close_size, close_size, CV_8UC1);
+    cv::Mat closed;
+    cv::morphologyEx(valid, closed, cv::MORPH_CLOSE, close_kernel);
+    cv::Mat inverse_valid;
+    cv::bitwise_not(valid, inverse_valid);
+    cv::Mat candidates;
+    cv::bitwise_and(closed, inverse_valid, candidates);
+    if (cv::countNonZero(candidates) == 0) {
+        return cv::Mat::zeros(valid.size(), CV_8UC1);
+    }
+
+    // Only fill components completely enclosed by valid support.  A closing
+    // operation also bridges a concave outer boundary; accepting those
+    // pixels would turn the black aperture/background into a false surface.
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count = cv::connectedComponentsWithStats(
+        candidates, labels, stats, centroids, 8, CV_32S);
+    cv::Mat result = cv::Mat::zeros(valid.size(), CV_8UC1);
+    for (int component = 1; component < component_count; ++component) {
+        const int x = stats.at<int>(component, cv::CC_STAT_LEFT);
+        const int y = stats.at<int>(component, cv::CC_STAT_TOP);
+        const int width = stats.at<int>(component, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(component, cv::CC_STAT_HEIGHT);
+        const int area = stats.at<int>(component, cv::CC_STAT_AREA);
+        const bool touches_border = x <= 0 || y <= 0
+            || x + width >= valid.cols || y + height >= valid.rows;
+        if (!touches_border && area > 0 && area <= max_hole_area) {
+            result.setTo(255U, labels == component);
+        }
+    }
+    return result;
+}
+
 void fit_quadratic(
     const std::vector<float>& x,
     const std::vector<float>& y,
@@ -156,15 +199,13 @@ std::vector<ExportPoint> export_clean_canvas_points(
         return {};
     }
 
-    // Python _fill_narrow_gaps: close only narrow internal holes and copy the
-    // nearest valid sample.  This is deliberately not written back to state.
-    const cv::Mat close_kernel = cv::Mat::ones(11, 11, CV_8UC1);
-    cv::Mat closed;
-    cv::morphologyEx(valid, closed, cv::MORPH_CLOSE, close_kernel);
-    cv::Mat fill;
-    cv::Mat inverse_valid;
-    cv::bitwise_not(valid, inverse_valid);
-    cv::bitwise_and(closed, inverse_valid, fill);
+    // The rotating aperture can leave a sizeable internal support gap when a
+    // three-image group is committed as one canvas update.  Match the Python
+    // geometry-first exporter: close up to 81 pixels, fill only enclosed
+    // holes (not the outer aperture), and cap the copied area.  This is an
+    // export/viewer regularization; the authoritative streaming state is not
+    // modified and no extra model forward is introduced.
+    const cv::Mat fill = internal_hole_fill_mask(valid, 81, 40000);
     if (cv::countNonZero(fill) > 0) {
         const std::vector<std::int32_t> nearest = nearest_indices(valid);
         for (int y = 0; y < height; ++y) {

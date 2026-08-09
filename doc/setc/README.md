@@ -618,8 +618,10 @@ setc\build_live_observer\Release\omnivggt_observer_core_smoke.exe
 
 `setc\scripts\start_cpp_live_replay.bat` 默认将稳定图片按步长 1 组成
 `123`、`234`、… 的三图滑窗。三张图在 C++ 端构造成一个 batch，只调用一次
-CUDA TorchScript forward；中间图是锚点，组内深度先做鲁棒标定，颜色和几何最终
-只写入一个 Canvas 层。这样不会把 OmniVGGT 原生 `S=3` 输出直接拼成三层。
+CUDA TorchScript forward；中间图是锚点，组内深度先做鲁棒标定，几何提交以锚图
+support 为所有权掩码，侧图只允许在锚图掩码内部补充可信深度，颜色不把旋转后的
+侧图黑边写进 Canvas。导出/viewer 只填充封闭的内部 support 孔洞，不填充外部黑边。
+这样不会把 OmniVGGT 原生 `S=3` 输出直接拼成三层。
 
 需要的模型是：
 

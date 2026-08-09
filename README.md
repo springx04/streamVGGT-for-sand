@@ -99,8 +99,11 @@ The launcher starts `omnivggt_stream_server.exe` in background, then launches `o
 
 By default it consumes three-image sliding groups (`123`, `234`, …) and performs
 one CUDA forward with `B=3,S=1`. The middle image is the group anchor; the C++
-fusion keeps one height/color layer and rejects side predictions that cannot be
-calibrated to that anchor. The run directory records the exact windows in
+fusion keeps the anchor support as the geometry ownership mask, uses the two
+side predictions only for calibrated holes inside that support, and rejects
+the non-convex side-only strips that otherwise create visible gaps. Export and
+viewer point clouds close only enclosed support holes (never the outer black
+aperture). The run directory records the exact windows in
 `input_groups.csv` and the batching contract in `metrics.csv`.
 
 To run the legacy single-image/pair path, set `INPUT_GROUP_SIZE=1` before launching:

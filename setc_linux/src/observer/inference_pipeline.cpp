@@ -2526,41 +2526,32 @@ CandidateCommit InferenceEngine::process_impl(
         if (grouped_warped_rgb_f.size() != 3U || grouped_valid_warp.size() != 3U) {
             throw std::runtime_error("prepared group must contain exactly three aligned images");
         }
-        cv::Mat union_valid = cv::Mat::zeros(canvas_size, CV_8UC1);
-        for (const cv::Mat& support : grouped_valid_warp) {
-            cv::bitwise_or(union_valid, support, union_valid);
-        }
         const int anchor_index = std::clamp(raw.group_anchor_index, 0, 2);
+        // A three-image batch is a single inference call, but its three
+        // views can span a large, non-convex part of the rotating aperture.
+        // Using that union as one model ROI creates a wide bounding box with
+        // unsupported strips between the views; those strips become visible
+        // holes in the accumulated canvas.  Keep the anchor view as the
+        // authoritative geometry footprint.  The other two views remain in
+        // the batch as same-forward context and their calibrated depth is
+        // considered only inside that footprint.
+        const cv::Mat anchor_valid = grouped_valid_warp[static_cast<std::size_t>(anchor_index)].clone();
         warped_rgb_f = grouped_warped_rgb_f[static_cast<std::size_t>(anchor_index)].clone();
-        valid_warp = union_valid.clone();
-        // The anchor owns overlap RGB.  Side RGB is only allowed to fill a
-        // pixel that the anchor does not observe; this makes the fused color
-        // map single-source in all overlap regions.
-        for (std::size_t source_index = 0; source_index < grouped_warped_rgb_f.size(); ++source_index) {
-            if (static_cast<int>(source_index) == anchor_index) {
-                continue;
-            }
-            for (int y = 0; y < warped_rgb_f.rows; ++y) {
-                for (int x = 0; x < warped_rgb_f.cols; ++x) {
-                    if (grouped_valid_warp[static_cast<std::size_t>(anchor_index)].at<std::uint8_t>(y, x) != 0U
-                        || grouped_valid_warp[source_index].at<std::uint8_t>(y, x) == 0U) {
-                        continue;
-                    }
-                    warped_rgb_f.at<cv::Vec3f>(y, x) =
-                        grouped_warped_rgb_f[source_index].at<cv::Vec3f>(y, x);
-                }
-            }
-        }
+        valid_warp = anchor_valid.clone();
+        // Do not paint side-view RGB into the canvas.  Their rotated support
+        // rectangles are valid model context but are not valid geometry
+        // ownership; compositing them here would expose black/colour wedges
+        // in debug images and could reintroduce a second colour layer.
         const cv::Mat canvas_support = state.initialized
             ? state_mask(state.support, state.width, state.height)
             : cv::Mat::zeros(canvas_size, CV_8UC1);
         cv::Mat group_support_change;
         cv::bitwise_not(canvas_support, group_support_change);
-        cv::bitwise_and(union_valid, group_support_change, group_support_change);
+        cv::bitwise_and(anchor_valid, group_support_change, group_support_change);
         if (state.initialized) {
             cv::bitwise_or(support_change, group_support_change, support_change);
         } else {
-            support_change = union_valid.clone();
+            support_change = anchor_valid.clone();
         }
         cv::bitwise_or(change_mask, support_change, change_mask);
         cv::bitwise_and(change_mask, valid_warp, change_mask);
