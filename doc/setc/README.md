@@ -614,6 +614,32 @@ setc\build_live_observer\Release\omnivggt_replay_log.exe --run_dir setc\observer
 setc\build_live_observer\Release\omnivggt_observer_core_smoke.exe
 ```
 
+### 三图单次批推理（B=3,S=1）
+
+`setc\scripts\start_cpp_live_replay.bat` 默认将稳定图片按步长 1 组成
+`123`、`234`、… 的三图滑窗。三张图在 C++ 端构造成一个 batch，只调用一次
+CUDA TorchScript forward；中间图是锚点，组内深度先做鲁棒标定，颜色和几何最终
+只写入一个 Canvas 层。这样不会把 OmniVGGT 原生 `S=3` 输出直接拼成三层。
+
+需要的模型是：
+
+```text
+setc\artifacts\omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt
+```
+
+模型导出命令：
+
+```powershell
+setc\venv_torch270_cu128\Scripts\python.exe setc\scripts\export_torchscript.py `
+  --output setc\artifacts\omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt `
+  --batch-size 3 --num-images 1 --height 252 --width 406 `
+  --dtype bfloat16 --autocast-dtype bfloat16 --observer-depth-only --no-freeze
+```
+
+每次运行的 `input_groups.csv` 保存实际滑窗和锚点，`metrics.csv` 的
+`forward_calls`、`forward_batch_size`、`forward_sequence_size` 用于确认没有退化为
+三次串行单图推理。设置 `$env:INPUT_GROUP_SIZE="1"` 可回到原有单图/双图路径。
+
 如果不传 `-DOMNIVGGT_ENABLE_LIVE_OBSERVER=ON`，CMake 仍只生成原有的两个 C++
 推理目标，因此该功能不会改变原项目的正常运行路径。
 

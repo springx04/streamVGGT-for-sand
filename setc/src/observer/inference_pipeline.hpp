@@ -16,6 +16,13 @@ namespace omnivggt::observer {
 
 struct InferenceOptions {
     std::string model;
+    // Independent three-image batch graph.  It must be exported with
+    // [B=3,S=1] and is never used as a native S=3 sequence graph.
+    std::string group_model;
+    int group_width = 406;
+    int group_height = 252;
+    int group_stride = 1;
+    bool group_mode = false;
     // Python uses one image for the anchor frame and a two-image
     // anchor/current window for every subsequent frame.  Keep both exported
     // TorchScript signatures available instead of silently reusing the
@@ -78,6 +85,15 @@ struct InferenceMetrics {
     double homography_error_px = -1.0;
     bool skipped_model = false;
     std::string fallback;
+    int group_size = 1;
+    int group_stride = 1;
+    int group_anchor_index = 0;
+    int forward_calls = 0;
+    int forward_batch_size = 1;
+    int forward_sequence_size = 1;
+    int group_fused_sources = 1;
+    int group_rejected_sources = 0;
+    double group_max_depth_residual = -1.0;
 
     std::string csv_line() const;
 };
@@ -118,10 +134,18 @@ private:
         float fov_w = 1.2f;
     };
 
+    struct PreparedGroup {
+        std::vector<cv::Mat> warped_rgb_f;
+        std::vector<cv::Mat> valid_warp;
+        cv::Mat fused_rgb_f;
+        cv::Mat union_valid;
+    };
+
     InferenceOptions options_;
     torch::Device device_ = torch::Device(torch::kCPU);
     torch::ScalarType dtype_ = torch::kFloat32;
     torch::jit::script::Module module_;
+    torch::jit::script::Module group_module_;
     torch::jit::script::Module pair_module_;
     // Dynamic pair artifacts are large (about 2.4 GB each in the BF16
     // observer build). Keep a small GPU LRU so switching between the common
@@ -130,6 +154,7 @@ private:
     std::vector<std::pair<int, int>> pair_module_lru_;
     std::vector<std::pair<int, int>> dynamic_pair_shapes_;
     bool has_pair_module_ = false;
+    bool has_group_module_ = false;
     bool pair_module_loaded_ = false;
     std::pair<int, int> pair_module_shape_ = {-1, -1};
     std::filesystem::path pair_model_dir_;
@@ -147,12 +172,18 @@ private:
 
     FrameImage load_frame(const std::filesystem::path& path) const;
     Prediction run_model(const std::vector<cv::Mat>& rgb_u8, int output_frame_index);
+    std::vector<Prediction> run_group_model(const std::vector<cv::Mat>& rgb_u8);
+    Prediction fuse_group_predictions(
+        const std::vector<Prediction>& predictions,
+        int anchor_index,
+        InferenceMetrics& metrics) const;
     void activate_dynamic_pair_module(
         const std::filesystem::path& bucket_path,
         const std::pair<int, int>& shape);
     std::pair<int, int> dynamic_pair_shape_for_target(
         const std::pair<int, int>& target) const;
     void release_single_model_after_first_frame();
+    cv::Mat estimate_pair_homography(const FrameImage& source, const FrameImage& target) const;
 
     static cv::Mat gray_u8(const cv::Mat& rgb_u8);
     static cv::Mat translation_h(double dx, double dy);
@@ -192,6 +223,13 @@ private:
         const cv::Mat& update_mask,
         const cv::Mat& color_bridge_mask,
         const cv::Mat& fused_rgb) const;
+    CandidateCommit process_impl(
+        const RawFrame& raw,
+        const CanvasState& state,
+        const FrameImage& frame,
+        const PreparedGroup* group,
+        double read_ms);
+    CandidateCommit process_group(const RawFrame& raw, const CanvasState& state);
 };
 
 }  // namespace omnivggt::observer

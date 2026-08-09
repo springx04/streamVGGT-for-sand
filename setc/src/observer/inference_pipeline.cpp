@@ -298,6 +298,21 @@ torch::Tensor make_image_tensor_batch(const std::vector<cv::Mat>& images) {
     return torch::cat(tensors, 1);
 }
 
+torch::Tensor make_image_tensor_independent_batch(const std::vector<cv::Mat>& images) {
+    if (images.empty()) {
+        throw std::runtime_error("OmniVGGT independent batch is empty");
+    }
+    std::vector<torch::Tensor> tensors;
+    tensors.reserve(images.size());
+    for (const cv::Mat& image : images) {
+        tensors.push_back(make_image_tensor(image));
+    }
+    // make_image_tensor returns [1,1,3,H,W].  Concatenating on dim 0 is the
+    // deliberate B=3,S=1 contract; concatenating on dim 1 would recreate the
+    // native S=3 sequence path that produces independent height/color layers.
+    return torch::cat(tensors, 0);
+}
+
 class CudaAutocastGuard {
 public:
     explicit CudaAutocastGuard(const torch::ScalarType dtype)
@@ -1122,12 +1137,24 @@ std::string InferenceMetrics::csv_line() const {
          << model_input_width << ',' << model_input_height << ','
          << photometric_changed_ratio << ',' << support_changed_ratio << ','
          << (skipped_model ? "yes" : "no") << ','
-         << (fallback.empty() ? "None" : fallback);
+         << (fallback.empty() ? "None" : fallback) << ','
+         << group_size << ',' << group_stride << ',' << group_anchor_index << ','
+         << forward_calls << ',' << forward_batch_size << ',' << forward_sequence_size << ','
+         << group_fused_sources << ',' << group_rejected_sources << ','
+         << group_max_depth_residual;
     return line.str();
 }
 
 InferenceEngine::InferenceEngine(InferenceOptions options) : options_(std::move(options)) {
-    if (options_.model.empty()) {
+    if (options_.group_mode) {
+        if (options_.group_model.empty()) {
+            throw std::invalid_argument("group mode requires a B=3,S=1 TorchScript model");
+        }
+        if (options_.group_width <= 0 || options_.group_height <= 0
+            || options_.group_width % 14 != 0 || options_.group_height % 14 != 0) {
+            throw std::invalid_argument("group model dimensions must be positive multiples of 14");
+        }
+    } else if (options_.model.empty()) {
         throw std::invalid_argument("inference model path is empty");
     }
     if (options_.width <= 0 || options_.height <= 0) {
@@ -1147,13 +1174,22 @@ InferenceEngine::InferenceEngine(InferenceOptions options) : options_(std::move(
     }
     device_ = parse_device(options_.device);
     dtype_ = parse_dtype(options_.dtype);
-    module_ = torch::jit::load(options_.model, device_);
-    module_.eval();
-    configure_torchscript_executor(module_);
+    if (!options_.model.empty()) {
+        module_ = torch::jit::load(options_.model, device_);
+        module_.eval();
+        configure_torchscript_executor(module_);
+    }
+
+    if (options_.group_mode) {
+        group_module_ = torch::jit::load(options_.group_model, device_);
+        group_module_.eval();
+        configure_torchscript_executor(group_module_);
+        has_group_module_ = true;
+    }
 
     pair_model_dir_ = options_.pair_model_dir;
     dynamic_pair_shapes_ = discover_dynamic_pair_shapes(pair_model_dir_);
-    if (!options_.pair_model.empty()) {
+    if (!options_.group_mode && !options_.pair_model.empty()) {
         // Loading every possible dynamic ROI graph at startup would keep
         // several multi-gigabyte copies on the GPU.  With a bucket directory,
         // activate only the shapes requested by the stream and retain a small
@@ -1171,6 +1207,12 @@ InferenceEngine::InferenceEngine(InferenceOptions options) : options_(std::move(
     // later frames intentionally use the same one-frame/two-frame split as
     // Python's _single_frame_batch/_two_frame_batch.
     if (device_.is_cuda()) {
+        if (options_.group_mode) {
+            const cv::Mat group_warmup = cv::Mat::zeros(
+                options_.group_height, options_.group_width, CV_8UC3);
+            (void)run_group_model({group_warmup, group_warmup, group_warmup});
+            return;
+        }
         const cv::Mat first_warmup = cv::Mat::zeros(
             options_.first_model_height, options_.first_model_width, CV_8UC3);
         (void)run_model({first_warmup}, 0);
@@ -1265,7 +1307,7 @@ void InferenceEngine::activate_dynamic_pair_module(
 }
 
 void InferenceEngine::release_single_model_after_first_frame() {
-    if (!device_.is_cuda() || single_model_released_) {
+    if (options_.group_mode || !device_.is_cuda() || single_model_released_ || options_.model.empty()) {
         return;
     }
     // The single-frame graph is used only for the initial frame. Moving it to
@@ -1494,6 +1536,239 @@ InferenceEngine::Prediction InferenceEngine::run_model(
     return prediction;
 }
 
+std::vector<InferenceEngine::Prediction> InferenceEngine::run_group_model(
+    const std::vector<cv::Mat>& rgb_u8) {
+    if (!has_group_module_ || rgb_u8.size() != 3U) {
+        throw std::runtime_error("B=3,S=1 group inference requires exactly three images");
+    }
+    const int height = rgb_u8.front().rows;
+    const int width = rgb_u8.front().cols;
+    for (const cv::Mat& image : rgb_u8) {
+        if (image.empty() || image.rows != height || image.cols != width
+            || (image.type() != CV_8UC3 && image.type() != CV_32FC3)) {
+            throw std::runtime_error("group image batch entries must share one CV_8UC3/CV_32FC3 shape");
+        }
+    }
+    c10::InferenceMode inference_mode;
+    CudaAutocastGuard autocast(dtype_);
+    const torch::Tensor images = make_image_tensor_independent_batch(rgb_u8).to(device_, dtype_);
+    const auto float_options = torch::TensorOptions().device(device_).dtype(torch::kFloat32);
+    const torch::Tensor extrinsics = torch::eye(4, float_options)
+        .slice(0, 0, 3)
+        .reshape({1, 1, 3, 4})
+        .repeat({3, 1, 1, 1});
+    const torch::Tensor intrinsics = torch::eye(3, float_options)
+        .reshape({1, 1, 3, 3})
+        .repeat({3, 1, 1, 1});
+    const torch::Tensor depth_input = torch::zeros(
+        {3, 1, height, width, 1}, torch::TensorOptions().dtype(torch::kFloat32)).to(device_, dtype_);
+    const torch::Tensor mask = torch::zeros(
+        {3, 1, height, width}, torch::TensorOptions().dtype(torch::kFloat32)).to(device_, dtype_);
+
+    std::vector<torch::jit::IValue> inputs;
+    inputs.emplace_back(images);
+    inputs.emplace_back(extrinsics);
+    inputs.emplace_back(intrinsics);
+    inputs.emplace_back(depth_input);
+    inputs.emplace_back(mask);
+    const auto output_tuple = group_module_.forward(inputs).toTuple();
+    if (output_tuple->elements().size() < 3U) {
+        throw std::runtime_error("group TorchScript model must return pose, depth and confidence");
+    }
+    const torch::Tensor pose = to_cpu_float(output_tuple->elements()[0].toTensor());
+    const torch::Tensor depth = to_cpu_float(output_tuple->elements()[1].toTensor());
+    const torch::Tensor confidence = to_cpu_float(output_tuple->elements()[2].toTensor());
+    const bool has_world_points = output_tuple->elements().size() >= 5U;
+    torch::Tensor world_points;
+    torch::Tensor world_points_confidence;
+    if (has_world_points) {
+        world_points = to_cpu_float(output_tuple->elements()[3].toTensor());
+        world_points_confidence = to_cpu_float(output_tuple->elements()[4].toTensor());
+    }
+    if (depth.dim() != 5 || confidence.dim() != 4
+        || depth.size(0) != 3 || depth.size(1) != 1
+        || confidence.size(0) != 3 || confidence.size(1) != 1
+        || depth.size(2) != height || depth.size(3) != width
+        || confidence.size(2) != height || confidence.size(3) != width
+        || (has_world_points && (world_points.dim() != 5 || world_points_confidence.dim() != 4
+            || world_points.size(0) != 3 || world_points.size(1) != 1
+            || world_points_confidence.size(0) != 3 || world_points_confidence.size(1) != 1
+            || world_points.size(2) != height || world_points.size(3) != width
+            || world_points_confidence.size(2) != height
+            || world_points_confidence.size(3) != width))) {
+        throw std::runtime_error("group TorchScript output must have shape [3,1,H,W,*]");
+    }
+
+    std::vector<Prediction> predictions;
+    predictions.reserve(3U);
+    const auto depth_access = depth.accessor<float, 5>();
+    const auto confidence_access = confidence.accessor<float, 4>();
+    for (int batch = 0; batch < 3; ++batch) {
+        Prediction prediction;
+        prediction.depth = cv::Mat(height, width, CV_32FC1);
+        prediction.confidence = cv::Mat(height, width, CV_32FC1);
+        if (has_world_points) {
+            prediction.world_points = cv::Mat(height, width, CV_32FC3);
+            prediction.world_points_confidence = cv::Mat(height, width, CV_32FC1);
+        }
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                prediction.depth.at<float>(y, x) = depth_access[batch][0][y][x][0];
+                prediction.confidence.at<float>(y, x) = confidence_access[batch][0][y][x];
+                if (has_world_points) {
+                    const auto points = world_points.accessor<float, 5>();
+                    const auto point_conf = world_points_confidence.accessor<float, 4>();
+                    prediction.world_points.at<cv::Vec3f>(y, x) = cv::Vec3f(
+                        points[batch][0][y][x][0], points[batch][0][y][x][1], points[batch][0][y][x][2]);
+                    prediction.world_points_confidence.at<float>(y, x) = point_conf[batch][0][y][x];
+                }
+            }
+        }
+        if (pose.dim() == 3 && pose.size(0) >= 3 && pose.size(1) >= 1 && pose.size(2) >= 9) {
+            const auto pose_values = pose.accessor<float, 3>();
+            prediction.fov_h = pose_values[batch][0][7];
+            prediction.fov_w = pose_values[batch][0][8];
+        }
+        if (!std::isfinite(prediction.fov_h) || prediction.fov_h <= 0.01f || prediction.fov_h >= 3.1f) {
+            prediction.fov_h = 1.2f;
+        }
+        if (!std::isfinite(prediction.fov_w) || prediction.fov_w <= 0.01f || prediction.fov_w >= 3.1f) {
+            prediction.fov_w = 1.2f;
+        }
+        predictions.push_back(std::move(prediction));
+    }
+    return predictions;
+}
+
+InferenceEngine::Prediction InferenceEngine::fuse_group_predictions(
+    const std::vector<Prediction>& predictions,
+    const int anchor_index,
+    InferenceMetrics& metrics) const {
+    if (predictions.size() != 3U || anchor_index < 0 || anchor_index >= 3) {
+        throw std::runtime_error("group prediction fusion expects three predictions");
+    }
+    Prediction fused = predictions[static_cast<std::size_t>(anchor_index)];
+    const cv::Mat anchor_valid = model_valid_mask(
+        fused.depth, fused.confidence,
+        cv::Mat(fused.depth.size(), CV_8UC1, cv::Scalar(255)),
+        static_cast<float>(options_.min_conf));
+    for (int source_index = 0; source_index < 3; ++source_index) {
+        if (source_index == anchor_index) {
+            continue;
+        }
+        const Prediction& source = predictions[static_cast<std::size_t>(source_index)];
+        std::vector<float> source_values;
+        std::vector<float> anchor_values;
+        const int step = std::max(1, fused.depth.rows * fused.depth.cols / 60000);
+        int ordinal = 0;
+        for (int y = 0; y < fused.depth.rows; ++y) {
+            for (int x = 0; x < fused.depth.cols; ++x) {
+                if ((ordinal++ % step) != 0
+                    || anchor_valid.at<std::uint8_t>(y, x) == 0U) {
+                    continue;
+                }
+                const float side = source.depth.at<float>(y, x);
+                const float anchor = fused.depth.at<float>(y, x);
+                if (std::isfinite(side) && side > 1e-6f && std::isfinite(anchor)
+                    && anchor > 1e-6f
+                    && source.confidence.at<float>(y, x) >= static_cast<float>(options_.min_conf)) {
+                    source_values.push_back(side);
+                    anchor_values.push_back(anchor);
+                }
+            }
+        }
+        if (source_values.size() < 128U) {
+            ++metrics.group_rejected_sources;
+            continue;
+        }
+        double scale = 1.0;
+        double bias = static_cast<double>(median_value(anchor_values))
+            - static_cast<double>(median_value(source_values));
+        std::vector<std::uint8_t> keep(source_values.size(), 1U);
+        for (int iteration = 0; iteration < 4; ++iteration) {
+            double sw = 0.0;
+            double sz = 0.0;
+            double sd = 0.0;
+            double szz = 0.0;
+            double szd = 0.0;
+            for (std::size_t i = 0; i < source_values.size(); ++i) {
+                if (keep[i] == 0U) {
+                    continue;
+                }
+                const double weight = 1.0;
+                const double z = source_values[i];
+                const double dst = anchor_values[i];
+                sw += weight;
+                sz += weight * z;
+                sd += weight * dst;
+                szz += weight * z * z;
+                szd += weight * z * dst;
+            }
+            const double denominator = sw * szz - sz * sz;
+            if (std::abs(denominator) > 1e-9) {
+                scale = (sw * szd - sz * sd) / denominator;
+                bias = (sd - scale * sz) / sw;
+            }
+            std::vector<float> residuals;
+            residuals.reserve(source_values.size());
+            for (std::size_t i = 0; i < source_values.size(); ++i) {
+                residuals.push_back(anchor_values[i]
+                    - static_cast<float>(scale * source_values[i] + bias));
+            }
+            const float center = median_value(residuals);
+            std::vector<float> deviations;
+            deviations.reserve(residuals.size());
+            for (const float value : residuals) {
+                deviations.push_back(std::abs(value - center));
+            }
+            const float limit = std::max(0.08f, 3.0f * 1.4826f
+                * std::max(median_value(deviations), 1e-6f));
+            for (std::size_t i = 0; i < residuals.size(); ++i) {
+                keep[i] = std::abs(residuals[i] - center) <= limit ? 1U : 0U;
+            }
+        }
+        if (!std::isfinite(scale) || !std::isfinite(bias) || scale <= 0.0 || scale > 8.0) {
+            ++metrics.group_rejected_sources;
+            continue;
+        }
+        scale = std::clamp(scale, 0.25, 4.0);
+        bias = std::clamp(bias, -10.0, 10.0);
+        std::vector<float> residuals;
+        residuals.reserve(source_values.size());
+        for (std::size_t i = 0; i < source_values.size(); ++i) {
+            residuals.push_back(std::abs(anchor_values[i]
+                - static_cast<float>(scale * source_values[i] + bias)));
+        }
+        const float median_residual = median_value(residuals);
+        metrics.group_max_depth_residual = std::max(
+            metrics.group_max_depth_residual, static_cast<double>(median_residual));
+        if (!std::isfinite(median_residual) || median_residual > 0.25f) {
+            ++metrics.group_rejected_sources;
+            continue;
+        }
+        ++metrics.group_fused_sources;
+        for (int y = 0; y < fused.depth.rows; ++y) {
+            for (int x = 0; x < fused.depth.cols; ++x) {
+                if (anchor_valid.at<std::uint8_t>(y, x) != 0U) {
+                    // The anchor owns every overlap pixel.  This is the key
+                    // single-layer rule: side predictions can only fill a
+                    // genuinely invalid anchor pixel after calibration.
+                    continue;
+                }
+                const float side = source.depth.at<float>(y, x);
+                const float confidence = source.confidence.at<float>(y, x);
+                if (std::isfinite(side) && side > 1e-6f
+                    && std::isfinite(confidence)
+                    && confidence >= static_cast<float>(options_.min_conf)) {
+                    fused.depth.at<float>(y, x) = static_cast<float>(scale * side + bias);
+                    fused.confidence.at<float>(y, x) = confidence * 0.75f;
+                }
+            }
+        }
+    }
+    return fused;
+}
+
 cv::Mat InferenceEngine::gray_u8(const cv::Mat& rgb_u8) {
     // Match Python's channel-mean matcher.  OpenCV's RGB2GRAY uses
     // luminance weights and changes feature/phase matches on this data.
@@ -1691,6 +1966,62 @@ cv::Mat InferenceEngine::estimate_homography(
         std::nth_element(errors.begin(), errors.begin() + static_cast<std::ptrdiff_t>(errors.size() / 2), errors.end());
         metrics.homography_error_px = errors[errors.size() / 2];
     }
+    return homography;
+}
+
+cv::Mat InferenceEngine::estimate_pair_homography(
+    const FrameImage& source,
+    const FrameImage& target) const {
+    if (source.match_rgb_u8.empty() || target.match_rgb_u8.empty()) {
+        return cv::Mat::eye(3, 3, CV_32FC1);
+    }
+    const cv::Mat source_gray = gray_u8(source.match_rgb_u8);
+    const cv::Mat target_gray = gray_u8(target.match_rgb_u8);
+    cv::Ptr<cv::Feature2D> detector;
+    int norm = cv::NORM_HAMMING;
+    try {
+        detector = cv::SIFT::create(1200);
+        norm = cv::NORM_L2;
+    } catch (const cv::Exception&) {
+        detector = cv::ORB::create(1200);
+    }
+    std::vector<cv::KeyPoint> source_keypoints;
+    std::vector<cv::KeyPoint> target_keypoints;
+    cv::Mat source_descriptors;
+    cv::Mat target_descriptors;
+    detector->detectAndCompute(source_gray, cv::noArray(), source_keypoints, source_descriptors);
+    detector->detectAndCompute(target_gray, cv::noArray(), target_keypoints, target_descriptors);
+    if (source_descriptors.empty() || target_descriptors.empty()
+        || source_keypoints.size() < 8U || target_keypoints.size() < 8U) {
+        return cv::Mat::eye(3, 3, CV_32FC1);
+    }
+    cv::BFMatcher matcher(norm);
+    std::vector<std::vector<cv::DMatch>> knn;
+    matcher.knnMatch(source_descriptors, target_descriptors, knn, 2);
+    std::vector<cv::DMatch> good;
+    for (const auto& pair : knn) {
+        if (pair.size() == 2U && pair[0].distance < 0.75f * pair[1].distance) {
+            good.push_back(pair[0]);
+        }
+    }
+    if (good.size() < 8U) {
+        return cv::Mat::eye(3, 3, CV_32FC1);
+    }
+    std::vector<cv::Point2f> source_points;
+    std::vector<cv::Point2f> target_points;
+    source_points.reserve(good.size());
+    target_points.reserve(good.size());
+    for (const cv::DMatch& match : good) {
+        source_points.push_back(source_keypoints[static_cast<std::size_t>(match.queryIdx)].pt);
+        target_points.push_back(target_keypoints[static_cast<std::size_t>(match.trainIdx)].pt);
+    }
+    cv::Mat inlier_mask;
+    cv::Mat homography = cv::findHomography(
+        source_points, target_points, cv::RANSAC, 3.0, inlier_mask);
+    if (homography.empty() || inlier_mask.empty() || cv::countNonZero(inlier_mask) < 8) {
+        return cv::Mat::eye(3, 3, CV_32FC1);
+    }
+    homography.convertTo(homography, CV_32FC1);
     return homography;
 }
 
@@ -2004,6 +2335,20 @@ void InferenceEngine::save_debug_images(
 }
 
 CandidateCommit InferenceEngine::process(const RawFrame& raw, const CanvasState& state) {
+    if (options_.group_mode && raw.group_paths.size() == 3U) {
+        return process_group(raw, state);
+    }
+    Timer read_timer;
+    const FrameImage frame = load_frame(raw.path);
+    return process_impl(raw, state, frame, nullptr, read_timer.ms());
+}
+
+CandidateCommit InferenceEngine::process_impl(
+    const RawFrame& raw,
+    const CanvasState& state,
+    const FrameImage& frame,
+    const PreparedGroup* prepared_group,
+    const double read_ms) {
     Timer total_timer;
     CandidateCommit result;
     result.frame.frame_seq = raw.frame_seq;
@@ -2013,9 +2358,12 @@ CandidateCommit InferenceEngine::process(const RawFrame& raw, const CanvasState&
     result.metrics.frame_seq = raw.frame_seq;
     result.metrics.image = result.frame.image_name;
 
-    Timer read_timer;
-    const FrameImage frame = load_frame(raw.path);
-    result.metrics.read_ms = read_timer.ms();
+    result.metrics.read_ms = read_ms;
+    result.metrics.group_size = prepared_group == nullptr ? 1 : 3;
+    result.metrics.group_stride = prepared_group == nullptr ? 1 : options_.group_stride;
+    result.metrics.group_anchor_index = prepared_group == nullptr ? 0 : raw.group_anchor_index;
+    result.metrics.forward_batch_size = prepared_group == nullptr ? 1 : 3;
+    result.metrics.forward_sequence_size = 1;
     if (!state.initialized) {
         anchor_rgb_float_ = frame.rgb_f.clone();
         live_rgb_float_ = frame.rgb_f.clone();
@@ -2160,6 +2508,63 @@ CandidateCommit InferenceEngine::process(const RawFrame& raw, const CanvasState&
         valid_warp,
         support_change,
         photometric_change);
+    std::vector<cv::Mat> grouped_warped_rgb_f;
+    std::vector<cv::Mat> grouped_valid_warp;
+    if (prepared_group != nullptr) {
+        const cv::Size canvas_size(state.width, state.height);
+        grouped_warped_rgb_f.reserve(prepared_group->warped_rgb_f.size());
+        grouped_valid_warp.reserve(prepared_group->valid_warp.size());
+        for (std::size_t index = 0; index < prepared_group->warped_rgb_f.size(); ++index) {
+            grouped_warped_rgb_f.push_back(warp_like(
+                prepared_group->warped_rgb_f[index], homography, canvas_size, cv::INTER_LINEAR));
+            cv::Mat support = warp_like(
+                prepared_group->valid_warp[index], homography, canvas_size, cv::INTER_NEAREST);
+            cv::threshold(support, support, 127.0, 255.0, cv::THRESH_BINARY);
+            support.convertTo(support, CV_8UC1);
+            grouped_valid_warp.push_back(std::move(support));
+        }
+        if (grouped_warped_rgb_f.size() != 3U || grouped_valid_warp.size() != 3U) {
+            throw std::runtime_error("prepared group must contain exactly three aligned images");
+        }
+        cv::Mat union_valid = cv::Mat::zeros(canvas_size, CV_8UC1);
+        for (const cv::Mat& support : grouped_valid_warp) {
+            cv::bitwise_or(union_valid, support, union_valid);
+        }
+        const int anchor_index = std::clamp(raw.group_anchor_index, 0, 2);
+        warped_rgb_f = grouped_warped_rgb_f[static_cast<std::size_t>(anchor_index)].clone();
+        valid_warp = union_valid.clone();
+        // The anchor owns overlap RGB.  Side RGB is only allowed to fill a
+        // pixel that the anchor does not observe; this makes the fused color
+        // map single-source in all overlap regions.
+        for (std::size_t source_index = 0; source_index < grouped_warped_rgb_f.size(); ++source_index) {
+            if (static_cast<int>(source_index) == anchor_index) {
+                continue;
+            }
+            for (int y = 0; y < warped_rgb_f.rows; ++y) {
+                for (int x = 0; x < warped_rgb_f.cols; ++x) {
+                    if (grouped_valid_warp[static_cast<std::size_t>(anchor_index)].at<std::uint8_t>(y, x) != 0U
+                        || grouped_valid_warp[source_index].at<std::uint8_t>(y, x) == 0U) {
+                        continue;
+                    }
+                    warped_rgb_f.at<cv::Vec3f>(y, x) =
+                        grouped_warped_rgb_f[source_index].at<cv::Vec3f>(y, x);
+                }
+            }
+        }
+        const cv::Mat canvas_support = state.initialized
+            ? state_mask(state.support, state.width, state.height)
+            : cv::Mat::zeros(canvas_size, CV_8UC1);
+        cv::Mat group_support_change;
+        cv::bitwise_not(canvas_support, group_support_change);
+        cv::bitwise_and(union_valid, group_support_change, group_support_change);
+        if (state.initialized) {
+            cv::bitwise_or(support_change, group_support_change, support_change);
+        } else {
+            support_change = union_valid.clone();
+        }
+        cv::bitwise_or(change_mask, support_change, change_mask);
+        cv::bitwise_and(change_mask, valid_warp, change_mask);
+    }
     result.metrics.changed_ratio = static_cast<double>(cv::countNonZero(change_mask))
         / static_cast<double>(change_mask.total());
     result.metrics.diff_ms = diff_timer.ms();
@@ -2239,7 +2644,71 @@ CandidateCommit InferenceEngine::process(const RawFrame& raw, const CanvasState&
     std::vector<cv::Mat> model_inputs;
     cv::Mat model_to_canvas = cv::Mat::eye(3, 3, CV_32FC1);
     cv::Mat model_support;
-    if (!state.initialized) {
+    if (prepared_group != nullptr) {
+        cv::Rect roi(0, 0, state.width, state.height);
+        int source_width = frame.match_rgb_f.cols;
+        int source_height = frame.match_rgb_f.rows;
+        if (!state.initialized) {
+            const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
+            const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
+            roi = cv::Rect(
+                std::clamp(pad_left, 0, std::max(0, state.width - 1)),
+                std::clamp(pad_top, 0, std::max(0, state.height - 1)),
+                std::min(source_width, state.width - std::clamp(pad_left, 0, std::max(0, state.width - 1))),
+                std::min(source_height, state.height - std::clamp(pad_top, 0, std::max(0, state.height - 1))));
+        } else if (cv::countNonZero(fusion_mask) > 0) {
+            roi = cv::boundingRect(fusion_mask);
+            const int context = 32;
+            const int x0 = std::max(0, roi.x - context);
+            const int y0 = std::max(0, roi.y - context);
+            const int x1 = std::min(state.width, roi.x + roi.width + context);
+            const int y1 = std::min(state.height, roi.y + roi.height + context);
+            roi = cv::Rect(x0, y0, std::max(1, x1 - x0), std::max(1, y1 - y0));
+        }
+        const auto [target_width, target_height] = bucket_roi_size(
+            roi.width, roi.height, options_.group_width, options_.group_height);
+        const int model_width = options_.group_width;
+        const int model_height = options_.group_height;
+        const int pad_x = (model_width - target_width) / 2;
+        const int pad_y = (model_height - target_height) / 2;
+        result.metrics.roi_width = target_width;
+        result.metrics.roi_height = target_height;
+        result.metrics.model_input_width = model_width;
+        result.metrics.model_input_height = model_height;
+        for (const cv::Mat& group_image : grouped_warped_rgb_f) {
+            cv::Rect safe_roi = roi & cv::Rect(0, 0, group_image.cols, group_image.rows);
+            if (safe_roi.width <= 0 || safe_roi.height <= 0) {
+                throw std::runtime_error("group ROI lies outside aligned canvas");
+            }
+            cv::Mat resized;
+            cv::resize(
+                group_image(safe_roi), resized,
+                cv::Size(target_width, target_height), 0.0, 0.0, cv::INTER_AREA);
+            cv::Mat padded;
+            cv::copyMakeBorder(
+                resized, padded,
+                pad_y, model_height - target_height - pad_y,
+                pad_x, model_width - target_width - pad_x,
+                cv::BORDER_REPLICATE);
+            model_inputs.push_back(std::move(padded));
+        }
+        const float scale_x = static_cast<float>(roi.width) / static_cast<float>(target_width);
+        const float scale_y = static_cast<float>(roi.height) / static_cast<float>(target_height);
+        model_to_canvas.at<float>(0, 0) = scale_x;
+        model_to_canvas.at<float>(1, 1) = scale_y;
+        model_to_canvas.at<float>(0, 2) = static_cast<float>(roi.x) - static_cast<float>(pad_x) * scale_x;
+        model_to_canvas.at<float>(1, 2) = static_cast<float>(roi.y) - static_cast<float>(pad_y) * scale_y;
+        model_support = cv::Mat::zeros(model_height, model_width, CV_32FC1);
+        cv::Mat content_support = cv::Mat::ones(target_height, target_width, CV_32FC1);
+        const int margin = (target_width > 18 && target_height > 18) ? 8 : 0;
+        if (margin > 0) {
+            content_support.rowRange(0, margin).setTo(0.0f);
+            content_support.rowRange(target_height - margin, target_height).setTo(0.0f);
+            content_support.colRange(0, margin).setTo(0.0f);
+            content_support.colRange(target_width - margin, target_width).setTo(0.0f);
+        }
+        content_support.copyTo(model_support(cv::Rect(pad_x, pad_y, target_width, target_height)));
+    } else if (!state.initialized) {
         const int first_width = options_.first_model_width;
         const int first_height = options_.first_model_height;
         cv::Mat first_model;
@@ -2357,7 +2826,23 @@ CandidateCommit InferenceEngine::process(const RawFrame& raw, const CanvasState&
 
     Timer model_timer;
     const int output_frame_index = state.initialized ? 1 : 0;
-    const Prediction prediction = run_model(model_inputs, output_frame_index);
+    Prediction prediction;
+    if (prepared_group != nullptr) {
+        const std::vector<Prediction> predictions = run_group_model(model_inputs);
+        prediction = fuse_group_predictions(
+            predictions,
+            std::clamp(raw.group_anchor_index, 0, 2),
+            result.metrics);
+        result.metrics.forward_calls = 1;
+        result.metrics.forward_batch_size = 3;
+        result.metrics.forward_sequence_size = 1;
+        result.metrics.group_size = 3;
+    } else {
+        prediction = run_model(model_inputs, output_frame_index);
+        result.metrics.forward_calls = 1;
+        result.metrics.forward_batch_size = 1;
+        result.metrics.forward_sequence_size = static_cast<int>(model_inputs.size());
+    }
     result.metrics.model_ms = model_timer.ms();
     if (!state.initialized) {
         release_single_model_after_first_frame();
@@ -2677,6 +3162,78 @@ CandidateCommit InferenceEngine::process(const RawFrame& raw, const CanvasState&
         color_bridge_mask,
         fused_rgb);
     return result;
+}
+
+CandidateCommit InferenceEngine::process_group(
+    const RawFrame& raw,
+    const CanvasState& state) {
+    if (raw.group_paths.size() != 3U) {
+        throw std::runtime_error("three-image mode received an incomplete input group");
+    }
+    Timer read_timer;
+    std::vector<FrameImage> frames;
+    frames.reserve(3U);
+    for (const auto& path : raw.group_paths) {
+        frames.push_back(load_frame(path));
+    }
+    const int anchor_index = std::clamp(raw.group_anchor_index, 0, 2);
+    PreparedGroup prepared;
+    prepared.warped_rgb_f.reserve(3U);
+    prepared.valid_warp.reserve(3U);
+    const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
+    const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
+    const cv::Mat pad_translation = [&]() {
+        cv::Mat result = cv::Mat::eye(3, 3, CV_32FC1);
+        result.at<float>(0, 2) = static_cast<float>(pad_left);
+        result.at<float>(1, 2) = static_cast<float>(pad_top);
+        return result;
+    }();
+    const cv::Mat inverse_pad_translation = [&]() {
+        cv::Mat result = cv::Mat::eye(3, 3, CV_32FC1);
+        result.at<float>(0, 2) = -static_cast<float>(pad_left);
+        result.at<float>(1, 2) = -static_cast<float>(pad_top);
+        return result;
+    }();
+    for (int index = 0; index < 3; ++index) {
+        cv::Mat aligned_rgb = frames[static_cast<std::size_t>(index)].rgb_f.clone();
+        cv::Mat aligned_support = frames[static_cast<std::size_t>(index)].support.clone();
+        if (index != anchor_index) {
+            // Feature coordinates are measured on the unpadded matching
+            // image.  Conjugating by the fixed canvas pad applies the same
+            // transform to the padded RGB/support buffers.
+            const cv::Mat match_homography = estimate_pair_homography(
+                frames[static_cast<std::size_t>(index)],
+                frames[static_cast<std::size_t>(anchor_index)]);
+            const cv::Mat canvas_homography = pad_translation
+                * match_homography * inverse_pad_translation;
+            aligned_rgb = warp_like(
+                frames[static_cast<std::size_t>(index)].rgb_f,
+                canvas_homography,
+                cv::Size(options_.canvas_width, options_.canvas_height),
+                cv::INTER_LINEAR);
+            aligned_support = warp_like(
+                frames[static_cast<std::size_t>(index)].support,
+                canvas_homography,
+                cv::Size(options_.canvas_width, options_.canvas_height),
+                cv::INTER_NEAREST);
+            cv::threshold(aligned_support, aligned_support, 127.0, 255.0, cv::THRESH_BINARY);
+            aligned_support.convertTo(aligned_support, CV_8UC1);
+        }
+        prepared.warped_rgb_f.push_back(std::move(aligned_rgb));
+        prepared.valid_warp.push_back(std::move(aligned_support));
+    }
+    prepared.fused_rgb_f = prepared.warped_rgb_f[static_cast<std::size_t>(anchor_index)].clone();
+    prepared.union_valid = cv::Mat::zeros(
+        options_.canvas_height, options_.canvas_width, CV_8UC1);
+    for (const cv::Mat& support : prepared.valid_warp) {
+        cv::bitwise_or(prepared.union_valid, support, prepared.union_valid);
+    }
+    return process_impl(
+        raw,
+        state,
+        frames[static_cast<std::size_t>(anchor_index)],
+        &prepared,
+        read_timer.ms());
 }
 
 }  // namespace omnivggt::observer

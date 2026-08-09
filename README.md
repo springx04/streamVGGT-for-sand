@@ -72,10 +72,12 @@ Expected binaries:
 
 ### 2.3 Build required TorchScript artifacts (if missing)
 
-If these files already exist, skip this section:
+If these files already exist, skip this section. The default C++ launcher now uses
+the three-image batched observer artifact:
 
 - `setc\artifacts\omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt`
 - `setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt`
+- `setc\artifacts\omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt`
 
 Export commands (from repository root):
 
@@ -83,6 +85,8 @@ Export commands (from repository root):
 setc\venv_torch270_cu128\Scripts\python.exe setc\scripts\export_torchscript.py --output setc\artifacts\omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt --num-images 1 --height 434 --width 700 --dtype bfloat16 --autocast-dtype bfloat16 --observer-depth-only --no-freeze
 
 setc\venv_torch270_cu128\Scripts\python.exe setc\scripts\export_torchscript.py --output setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt --num-images 2 --height 700 --width 700 --dtype bfloat16 --autocast-dtype bfloat16 --observer-depth-only --no-freeze
+
+setc\venv_torch270_cu128\Scripts\python.exe setc\scripts\export_torchscript.py --output setc\artifacts\omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt --batch-size 3 --num-images 1 --height 252 --width 406 --dtype bfloat16 --autocast-dtype bfloat16 --observer-depth-only --no-freeze
 ```
 
 ### 2.4 One-click start
@@ -93,9 +97,28 @@ cmd /c setc\scripts\start_cpp_live_replay.bat
 
 The launcher starts `omnivggt_stream_server.exe` in background, then launches `omnivggt_live_viewer.exe`.
 
+By default it consumes three-image sliding groups (`123`, `234`, …) and performs
+one CUDA forward with `B=3,S=1`. The middle image is the group anchor; the C++
+fusion keeps one height/color layer and rejects side predictions that cannot be
+calibrated to that anchor. The run directory records the exact windows in
+`input_groups.csv` and the batching contract in `metrics.csv`.
+
+To run the legacy single-image/pair path, set `INPUT_GROUP_SIZE=1` before launching:
+
+```powershell
+$env:INPUT_GROUP_SIZE="1"
+cmd /c setc\scripts\start_cpp_live_replay.bat
+```
+
 ## Notes
 
 - Python and C++ launchers are aligned to the same replay target (`data2`, `700x700`, `cuda`, `bf16`).
+- The three-image path is deliberately `B=3,S=1`, not native `S=3`; this avoids
+  the three-height/three-color-layer artifact of native multi-image output.
+- Group `model_ms` measures one batched forward, while `total_ms` also includes
+  image loading, homography, fusion and Canvas patch work. Compare single-image
+  timings with the documented dynamic/fixed ROI baseline rather than treating a
+  fixed `700x700` fallback as the dynamic-ROI result.
 - The C++ launcher always kills old viewer/server processes first, then starts a fresh run on port `37651`.
 - For C++ offline replay fidelity, queue capacity is fixed to `1024` in the launcher.
 
