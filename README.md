@@ -101,9 +101,11 @@ By default it consumes three-image sliding groups (`123`, `234`, …) and perfor
 one CUDA forward with `B=3,S=1`. The middle image is the group anchor; the C++
 fusion keeps the anchor support as the geometry ownership mask, uses the two
 side predictions only for calibrated holes inside that support, and rejects
-the non-convex side-only strips that otherwise create visible gaps. Export and
-viewer point clouds close only enclosed support holes (never the outer black
-aperture). The run directory records the exact windows in
+ the non-convex side-only strips that otherwise create visible gaps. Group mode
+ keeps the anchor RGB source-faithful and does not reuse the single-view RGB
+ bridge, because that bridge can create a long rectangular seam on a rotated
+ group edge. Export and viewer point clouds close only enclosed support holes
+ (never the outer black aperture). The run directory records the exact windows in
 `input_groups.csv` and the batching contract in `metrics.csv`.
 
 To run the legacy single-image/pair path, set `INPUT_GROUP_SIZE=1` before launching:

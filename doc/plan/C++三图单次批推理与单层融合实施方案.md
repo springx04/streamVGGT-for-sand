@@ -501,7 +501,9 @@ RawFrameGroup
 - overlap/残差不合格：本组不得把未标定新几何写进旧 Canvas；记录 `global_depth_alignment_rejected`。
 - scene jump 且无法标定：保留旧 Canvas，标记新 segment 候选或失败，不得在同一 Canvas 中生成第二层。
 
-组间 RGB 仍使用当前 `anchor_texture_transfer`、color bridge 和 anchor ring 规则；输入已经是单层组 RGB，不再按三张图分别写颜色。
+组间 RGB 在单图路径中仍使用当前 `anchor_texture_transfer`、color bridge 和 anchor ring 规则；
+三图组路径则保持锚图 RGB source-faithful，不复用单图 color bridge，避免旋转组边缘被扩张
+成一条长方形颜色/空洞伪缝。输入已经是单层组 RGB，不再按三张图分别写颜色。
 
 ### 9.3 历史协议
 
@@ -856,6 +858,7 @@ serial fallback: disabled
 1. B3S1 仍只做一次 CUDA forward，三张图仍全部进入 batch。
 2. 中间锚图 support 是几何所有权掩码；侧图预测只允许在锚图范围内、经过深度标定后补充锚图无效像素，side-only support 不写入 Canvas。
 3. RGB 只使用锚图作为 Canvas 来源，避免旋转矩形黑边或侧图颜色带进入结果。
-4. C++ 导出/viewer 对 valid mask 做 81 px 形态闭运算，但只填充完全封闭且不超过 40,000 像素的内部孔洞；与外部黑色孔径相连的区域保持无效。
+4. 三图组不启用单图 RGB bridge；debug 中 `color_bridge.png` 必须为空，否则判定为长条颜色缝并阻止交付。
+5. C++ 导出/viewer 对 valid mask 做 81 px 形态闭运算，但只填充完全封闭且不超过 40,000 像素的内部孔洞；与外部黑色孔径相连的区域保持无效。
 
 最终验收必须检查 PLY 的 XY 占用连通性、相邻高度差和相邻 RGB 距离，不能只看 `valid_point_count` 或 debug RGB 图。

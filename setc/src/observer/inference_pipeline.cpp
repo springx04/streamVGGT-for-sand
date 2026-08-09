@@ -2986,7 +2986,7 @@ CandidateCommit InferenceEngine::process_impl(
     cv::Mat color_bridge_mask = cv::Mat::zeros(update_mask.size(), CV_8UC1);
     cv::Mat color_bridge_mix = cv::Mat::zeros(update_mask.size(), CV_32FC1);
     cv::Mat canvas_rgb;
-    if (state.initialized && cv::countNonZero(support_change) > 0
+    if (prepared_group == nullptr && state.initialized && cv::countNonZero(support_change) > 0
         && cv::countNonZero(anchor_ring) > 0) {
         canvas_rgb = !live_rgb_float_.empty()
             && live_rgb_float_.size() == cv::Size(state.width, state.height)
@@ -3024,16 +3024,26 @@ CandidateCommit InferenceEngine::process_impl(
 
     cv::Mat color_apply_mask;
     cv::bitwise_or(update_mask, color_bridge_mask, color_apply_mask);
-    cv::Mat fused_rgb = state.initialized
-        ? anchor_texture_transfer(
-            warped_rgb_f,
-            canvas_rgb,
-            canvas_valid,
-            valid_warp,
-            color_apply_mask,
-            support_change,
-            anchor_ring)
-        : warped_rgb_f.clone();
+    // Group mode has one authoritative anchor RGB image.  Reusing the
+    // single-view texture-transfer bridge on a rotated three-image window
+    // can turn a narrow support edge into a long rectangular colour seam.
+    // Keep group updates source-faithful; single-view mode retains the
+    // existing overlap correction.
+    cv::Mat fused_rgb;
+    if (prepared_group != nullptr) {
+        fused_rgb = warped_rgb_f.clone();
+    } else {
+        fused_rgb = state.initialized
+            ? anchor_texture_transfer(
+                warped_rgb_f,
+                canvas_rgb,
+                canvas_valid,
+                valid_warp,
+                color_apply_mask,
+                support_change,
+                anchor_ring)
+            : warped_rgb_f.clone();
+    }
 
     if (state.initialized && cv::countNonZero(color_bridge_mask) > 0) {
         for (int y = 0; y < color_bridge_mask.rows; ++y) {

@@ -296,6 +296,25 @@ stream_omnivggt_outputs/cpp_group_gapfix_final/run_20260809_131059/
 
 Linux C++ 代码与 Windows 实现保持镜像更新；按要求未在本机执行 Linux CUDA 实测。
 
+### 8.1 长方形色缝二次复核
+
+对最终 debug 图逐帧比较 `fused_rgb` 与锚图 `warped`，发现初版仍有一条由单图 RGB
+bridge 产生的长窄矩形暗缝；其对应的 `color_bridge.png` 是一条连续白色长条。三图组路径
+现已关闭该单图 bridge，保留锚图 RGB 原样写入，单图/双图路径不变。修复后 10 个组的
+`color_bridge.png` 非零像素均为 0，`fused_rgb` 与 `warped` 的最大通道差为 1（量化误差），
+未再出现长方形色缝。
+
+二次复测目录为：
+
+```text
+stream_omnivggt_outputs/cpp_group_bridgefix2_final/run_20260809_134229/
+```
+
+该次仍为 10 组、每组一次 B3S1 forward，平均总耗时 597.904 ms/组，等效输入吞吐约
+5.02 张/秒；历史校验 `frames=10, deltas=10, latest_version=10`，`--resume` 后哈希保持
+`12858619506076993154`。最终 PLY 为 192,145 点，XY 单连通，31 px 检测窗内部孔洞 18 px
+（最大 9 px），最大高度差 0.003838，未发现超过 0.005 的高度跳变。
+
 ## 九、结论
 
 本次类平面专项测试证明，动态 bucket 是当前 C++ 流式重建的更优默认方案：它在保持与固定方案相近点云精度的同时，提高了完整流式吞吐，显著降低了后续模型和整体执行时间，并降低了 GPU 峰值占用。固定 `pair-letterbox` 方案作为输入形状固定、部署简单的备选路径仍然有效。两种方案均已完成同一类平面序列上的精度、速度、资源和历史一致性验证，可根据部署条件选择使用。
