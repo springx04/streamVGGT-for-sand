@@ -4,6 +4,7 @@
 #include <opencv2/features2d.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/photo.hpp>
 #include <ATen/autocast_mode.h>
 #include <c10/core/InferenceMode.h>
 #include <torch/csrc/jit/api/function_impl.h>
@@ -554,6 +555,401 @@ cv::Mat nearest_fill_values(const cv::Mat& values, const cv::Mat& source_mask) {
     return result;
 }
 
+void interpolate_group_gap_scalar(
+    cv::Mat& values,
+    const cv::Mat& fill,
+    const cv::Mat& source_mask) {
+    if (values.empty() || fill.empty() || source_mask.empty()
+        || cv::countNonZero(fill) == 0 || cv::countNonZero(source_mask) == 0) {
+        return;
+    }
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count = cv::connectedComponentsWithStats(
+        fill, labels, stats, centroids, 8, CV_32S);
+    for (int component = 1; component < component_count; ++component) {
+        const int left = stats.at<int>(component, cv::CC_STAT_LEFT);
+        const int top = stats.at<int>(component, cv::CC_STAT_TOP);
+        const int width = stats.at<int>(component, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(component, cv::CC_STAT_HEIGHT);
+        const bool horizontal = width >= height;
+        const int first = horizontal ? left : top;
+        const int last = horizontal ? left + width : top + height;
+        int before_probe = horizontal ? top - 1 : left - 1;
+        int after_probe = horizontal ? top + height : left + width;
+        const int before_limit = 0;
+        const int after_limit = horizontal ? values.rows - 1 : values.cols - 1;
+        const auto coverage = [&](const int coordinate) {
+            int count = 0;
+            for (int offset = 0; offset < last - first; ++offset) {
+                const int along = first + offset;
+                const int x = horizontal ? along : coordinate;
+                const int y = horizontal ? coordinate : along;
+                count += source_mask.at<std::uint8_t>(y, x) != 0U ? 1 : 0;
+            }
+            return count;
+        };
+        while (before_probe >= before_limit && coverage(before_probe) < (last - first) / 2) {
+            --before_probe;
+        }
+        while (after_probe <= after_limit && coverage(after_probe) < (last - first) / 2) {
+            ++after_probe;
+        }
+        auto row_mean = [&](const int coordinate, float& mean) {
+            double sum = 0.0;
+            int count = 0;
+            for (int offset = 0; offset < last - first; ++offset) {
+                const int along = first + offset;
+                const int x = horizontal ? along : coordinate;
+                const int y = horizontal ? coordinate : along;
+                if (source_mask.at<std::uint8_t>(y, x) == 0U
+                    || !std::isfinite(values.at<float>(y, x))) {
+                    continue;
+                }
+                sum += values.at<float>(y, x);
+                ++count;
+            }
+            if (count == 0) {
+                return false;
+            }
+            mean = static_cast<float>(sum / static_cast<double>(count));
+            return true;
+        };
+        float before_mean = 0.0f;
+        float after_mean = 0.0f;
+        const bool have_before_mean = before_probe >= before_limit
+            && row_mean(before_probe, before_mean);
+        const bool have_after_mean = after_probe <= after_limit
+            && row_mean(after_probe, after_mean);
+        for (int y = top; y < top + height; ++y) {
+            for (int x = left; x < left + width; ++x) {
+                if (labels.at<int>(y, x) != component) {
+                    continue;
+                }
+                int before = horizontal ? y - 1 : x - 1;
+                int after = horizontal ? y + 1 : x + 1;
+                const int limit_before = horizontal ? 0 : 0;
+                const int limit_after = horizontal
+                    ? values.rows - 1
+                    : values.cols - 1;
+                while (before >= limit_before) {
+                    const int sx = horizontal ? x : before;
+                    const int sy = horizontal ? before : y;
+                    if (source_mask.at<std::uint8_t>(sy, sx) != 0U
+                        && std::isfinite(values.at<float>(sy, sx))) {
+                        break;
+                    }
+                    --before;
+                }
+                while (after <= limit_after) {
+                    const int sx = horizontal ? x : after;
+                    const int sy = horizontal ? after : y;
+                    if (source_mask.at<std::uint8_t>(sy, sx) != 0U
+                        && std::isfinite(values.at<float>(sy, sx))) {
+                        break;
+                    }
+                    ++after;
+                }
+                if (before < limit_before || after > limit_after) {
+                    if (have_before_mean && have_after_mean) {
+                        const float alpha = horizontal
+                            ? static_cast<float>(y - top)
+                                / static_cast<float>(std::max(1, height - 1))
+                            : static_cast<float>(x - left)
+                                / static_cast<float>(std::max(1, width - 1));
+                        values.at<float>(y, x) = before_mean * (1.0f - alpha)
+                            + after_mean * alpha;
+                    } else if (have_before_mean) {
+                        values.at<float>(y, x) = before_mean;
+                    } else if (have_after_mean) {
+                        values.at<float>(y, x) = after_mean;
+                    }
+                    continue;
+                }
+                const int before_x = horizontal ? x : before;
+                const int before_y = horizontal ? before : y;
+                const int after_x = horizontal ? x : after;
+                const int after_y = horizontal ? after : y;
+                const float denominator = static_cast<float>(
+                    (horizontal ? after_y - before_y : after_x - before_x));
+                if (denominator <= 0.0f) {
+                    continue;
+                }
+                const float numerator = static_cast<float>(
+                    (horizontal ? y - before_y : x - before_x));
+                const float alpha = std::clamp(numerator / denominator, 0.0f, 1.0f);
+                values.at<float>(y, x) = values.at<float>(before_y, before_x)
+                    * (1.0f - alpha)
+                    + values.at<float>(after_y, after_x) * alpha;
+            }
+        }
+    }
+}
+
+// A grouped model can predict a valid strip while the previous canvas has a
+// one-sided support boundary immediately next to it.  Nearest/model-only fill
+// then leaves the strip on the model's depth layer and creates a visible step
+// against the already committed canvas.  Interpolate the repaired strip from
+// the nearest finite model sample on one side to the nearest committed canvas
+// sample on the other side.  The operation is restricted to group_gap_fill;
+// ordinary grouped and single-image geometry is untouched.
+void interpolate_group_gap_depth_to_canvas(
+    cv::Mat& depth,
+    const cv::Mat& fill,
+    const cv::Mat& canvas_depth,
+    const cv::Mat& canvas_valid) {
+    if (depth.empty() || fill.empty() || canvas_depth.empty() || canvas_valid.empty()
+        || cv::countNonZero(fill) == 0 || cv::countNonZero(canvas_valid) == 0) {
+        return;
+    }
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count = cv::connectedComponentsWithStats(
+        fill, labels, stats, centroids, 8, CV_32S);
+    for (int component = 1; component < component_count; ++component) {
+        const int left = stats.at<int>(component, cv::CC_STAT_LEFT);
+        const int top = stats.at<int>(component, cv::CC_STAT_TOP);
+        const int width = stats.at<int>(component, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(component, cv::CC_STAT_HEIGHT);
+        const bool horizontal = width >= height;
+        const int first = horizontal ? left : top;
+        const int last = horizontal ? left + width : top + height;
+        const int before_start = horizontal ? top - 1 : left - 1;
+        const int after_start = horizontal ? top + height : left + width;
+        const int before_limit = 0;
+        const int after_limit = horizontal ? depth.rows - 1 : depth.cols - 1;
+        for (int along = first; along < last; ++along) {
+            const int x = horizontal ? along : 0;
+            const int y = horizontal ? 0 : along;
+            int before = before_start;
+            bool have_before = false;
+            while (before >= before_limit) {
+                const int sx = horizontal ? x : before;
+                const int sy = horizontal ? before : y;
+                if (std::isfinite(depth.at<float>(sy, sx))
+                    && depth.at<float>(sy, sx) > 1e-6f) {
+                    have_before = true;
+                    break;
+                }
+                --before;
+            }
+            int after = after_start;
+            bool have_after = false;
+            bool after_from_canvas = false;
+            while (after <= after_limit) {
+                const int sx = horizontal ? x : after;
+                const int sy = horizontal ? after : y;
+                if (canvas_valid.at<std::uint8_t>(sy, sx) != 0U
+                    && std::isfinite(canvas_depth.at<float>(sy, sx))
+                    && canvas_depth.at<float>(sy, sx) > 1e-6f) {
+                    have_after = true;
+                    after_from_canvas = true;
+                    break;
+                }
+                if (!after_from_canvas
+                    && std::isfinite(depth.at<float>(sy, sx))
+                    && depth.at<float>(sy, sx) > 1e-6f) {
+                    have_after = true;
+                    break;
+                }
+                ++after;
+            }
+            if (!have_before && !have_after) {
+                continue;
+            }
+            const int cross_first = horizontal ? top : left;
+            const int cross_last = horizontal ? top + height : left + width;
+            for (int coordinate = cross_first; coordinate < cross_last; ++coordinate) {
+                const int px = horizontal ? along : coordinate;
+                const int py = horizontal ? coordinate : along;
+                if (labels.at<int>(py, px) != component) {
+                    continue;
+                }
+                float value = depth.at<float>(py, px);
+                if (have_before && have_after && after > before) {
+                    const int before_x = horizontal ? x : before;
+                    const int before_y = horizontal ? before : y;
+                    const int after_x = horizontal ? x : after;
+                    const int after_y = horizontal ? after : y;
+                    const float before_value = depth.at<float>(before_y, before_x);
+                    const float after_value = after_from_canvas
+                        ? canvas_depth.at<float>(after_y, after_x)
+                        : depth.at<float>(after_y, after_x);
+                    const float alpha = std::clamp(
+                        static_cast<float>(coordinate - before)
+                            / static_cast<float>(after - before),
+                        0.0f,
+                        1.0f);
+                    value = before_value * (1.0f - alpha) + after_value * alpha;
+                } else if (have_before) {
+                    const int before_x = horizontal ? x : before;
+                    const int before_y = horizontal ? before : y;
+                    value = depth.at<float>(before_y, before_x);
+                } else if (have_after) {
+                    const int after_x = horizontal ? x : after;
+                    const int after_y = horizontal ? after : y;
+                    value = after_from_canvas
+                        ? canvas_depth.at<float>(after_y, after_x)
+                        : depth.at<float>(after_y, after_x);
+                }
+                if (std::isfinite(value) && value > 1e-6f) {
+                    depth.at<float>(py, px) = value;
+                }
+            }
+        }
+    }
+}
+
+cv::Mat fill_group_narrow_gaps(
+    cv::Mat& depth,
+    cv::Mat& confidence,
+    cv::Mat& valid,
+    const cv::Mat& support,
+    const cv::Mat& source_mask) {
+    if (depth.empty() || confidence.empty() || valid.empty() || support.empty()) {
+        return cv::Mat::zeros(valid.size(), CV_8UC1);
+    }
+    cv::Mat inverse_valid;
+    cv::bitwise_not(valid, inverse_valid);
+    cv::Mat candidates;
+    cv::bitwise_and(support, inverse_valid, candidates);
+    const cv::Mat& fill_source = source_mask.empty() ? valid : source_mask;
+    if (cv::countNonZero(candidates) == 0 || cv::countNonZero(fill_source) == 0) {
+        return cv::Mat::zeros(valid.size(), CV_8UC1);
+    }
+
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count = cv::connectedComponentsWithStats(
+        candidates, labels, stats, centroids, 8, CV_32S);
+    cv::Mat fill = cv::Mat::zeros(valid.size(), CV_8UC1);
+    for (int component = 1; component < component_count; ++component) {
+        const int x = stats.at<int>(component, cv::CC_STAT_LEFT);
+        const int y = stats.at<int>(component, cv::CC_STAT_TOP);
+        const int width = stats.at<int>(component, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(component, cv::CC_STAT_HEIGHT);
+        const int area = stats.at<int>(component, cv::CC_STAT_AREA);
+        const int thickness = std::min(width, height);
+        const int length = std::max(width, height);
+        if (area < 32 || area > 30000 || thickness <= 0 || thickness > 24
+            || length < thickness * 6) {
+            continue;
+        }
+
+        // A model-confidence failure is a gap only when valid model samples
+        // exist on both sides.  This rejects the genuine outer aperture while
+        // accepting the long, thin strip inside the anchor support.
+        const bool horizontal = width >= height;
+        const int first = horizontal ? x : y;
+        const int last = horizontal ? x + width : y + height;
+        const int before = horizontal ? std::max(0, y - 2) : std::max(0, x - 2);
+        const int after = horizontal
+            ? std::min(valid.rows - 1, y + height + 1)
+            : std::min(valid.cols - 1, x + width + 1);
+        int before_valid = 0;
+        int after_valid = 0;
+        const int span = std::max(1, last - first);
+        for (int offset = 0; offset < span; ++offset) {
+            const int coordinate = first + offset;
+            if (horizontal) {
+                before_valid += fill_source.at<std::uint8_t>(before, coordinate) != 0U ? 1 : 0;
+                after_valid += fill_source.at<std::uint8_t>(after, coordinate) != 0U ? 1 : 0;
+            } else {
+                before_valid += fill_source.at<std::uint8_t>(coordinate, before) != 0U ? 1 : 0;
+                after_valid += fill_source.at<std::uint8_t>(coordinate, after) != 0U ? 1 : 0;
+            }
+        }
+        if (before_valid * 10 < span * 5 || after_valid * 10 < span * 5) {
+            continue;
+        }
+        fill.setTo(255U, labels == component);
+    }
+    if (cv::countNonZero(fill) == 0) {
+        return fill;
+    }
+
+    const cv::Mat nearest_depth = nearest_fill_values(depth, fill_source);
+    const cv::Mat nearest_confidence = nearest_fill_values(confidence, fill_source);
+    for (int y = 0; y < valid.rows; ++y) {
+        for (int x = 0; x < valid.cols; ++x) {
+            if (fill.at<std::uint8_t>(y, x) == 0U) {
+                continue;
+            }
+            depth.at<float>(y, x) = nearest_depth.at<float>(y, x);
+            confidence.at<float>(y, x) = nearest_confidence.at<float>(y, x);
+            valid.at<std::uint8_t>(y, x) = 255U;
+        }
+    }
+    interpolate_group_gap_scalar(depth, fill, fill_source);
+    interpolate_group_gap_scalar(confidence, fill, fill_source);
+    return fill;
+}
+
+// The model-support margin can leave a one-pixel edge immediately adjacent to
+// an accepted narrow gap.  That edge is still inside the previous canvas
+// support, but is not part of valid_warp, so leaving it untouched produces a
+// hairline black RGB/depth seam above the repaired strip.  Extend each
+// accepted component by one pixel only across its short axis, and only where
+// the dilated old support and finite model prediction both agree.  This does
+// not close outer apertures or create side-only geometry.
+cv::Mat expand_group_gap_edges(
+    cv::Mat& depth,
+    cv::Mat& confidence,
+    cv::Mat& valid,
+    const cv::Mat& fill,
+    const cv::Mat& support,
+    const cv::Mat& canvas_valid,
+    const float min_confidence) {
+    if (fill.empty() || support.empty() || canvas_valid.empty()
+        || cv::countNonZero(fill) == 0) {
+        return fill.clone();
+    }
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count = cv::connectedComponentsWithStats(
+        fill, labels, stats, centroids, 8, CV_32S);
+    cv::Mat expanded = fill.clone();
+    cv::Mat support_halo;
+    cv::dilate(support, support_halo, cv::Mat::ones(5, 5, CV_8U));
+    cv::Mat not_canvas_valid;
+    cv::bitwise_not(canvas_valid, not_canvas_valid);
+    for (int component = 1; component < component_count; ++component) {
+        const int width = stats.at<int>(component, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(component, cv::CC_STAT_HEIGHT);
+        const bool horizontal = width >= height;
+        const cv::Mat kernel = horizontal
+            ? cv::Mat::ones(5, 1, CV_8U)
+            : cv::Mat::ones(1, 5, CV_8U);
+        cv::Mat component_mask;
+        cv::compare(labels, component, component_mask, cv::CMP_EQ);
+        cv::Mat halo;
+        cv::dilate(component_mask, halo, kernel);
+        cv::bitwise_and(halo, support_halo, halo);
+        cv::bitwise_and(halo, not_canvas_valid, halo);
+        for (int y = 0; y < halo.rows; ++y) {
+            for (int x = 0; x < halo.cols; ++x) {
+                if (halo.at<std::uint8_t>(y, x) == 0U) {
+                    continue;
+                }
+                const float z = depth.at<float>(y, x);
+                const float c = confidence.at<float>(y, x);
+                if (!std::isfinite(z) || z <= 1e-6f
+                    || !std::isfinite(c) || c < min_confidence) {
+                    halo.at<std::uint8_t>(y, x) = 0U;
+                    continue;
+                }
+                valid.at<std::uint8_t>(y, x) = 255U;
+            }
+        }
+        cv::bitwise_or(expanded, halo, expanded);
+    }
+    return expanded;
+}
+
 cv::Mat propagate_seam_residual(
     const cv::Mat& residual,
     const cv::Mat& seam_mask,
@@ -970,7 +1366,8 @@ cv::Mat anchor_texture_transfer(
     const cv::Mat& current_valid,
     const cv::Mat& apply_mask,
     const cv::Mat& support_change,
-    const cv::Mat& anchor_ring) {
+    const cv::Mat& anchor_ring,
+    const bool blend_old_overlap) {
     cv::Mat result = current_rgb.clone();
     if (apply_mask.empty() || cv::countNonZero(apply_mask) == 0
         || cv::countNonZero(canvas_valid) == 0 || cv::countNonZero(anchor_ring) == 0) {
@@ -1092,25 +1489,27 @@ cv::Mat anchor_texture_transfer(
         }
     }
 
-    cv::Mat non_anchor;
-    cv::bitwise_not(anchor_ring, non_anchor);
-    cv::Mat distance_to_ring;
-    cv::distanceTransform(non_anchor, distance_to_ring, cv::DIST_L2, 3);
-    cv::Mat support_overlap;
-    cv::bitwise_and(apply_mask, support_change, support_overlap);
-    cv::bitwise_and(support_overlap, old_valid, support_overlap);
-    cv::bitwise_and(support_overlap, new_valid, support_overlap);
-    for (int y = 0; y < transferred.rows; ++y) {
-        for (int x = 0; x < transferred.cols; ++x) {
-            if (support_overlap.at<std::uint8_t>(y, x) == 0U) {
-                continue;
+    if (blend_old_overlap) {
+        cv::Mat non_anchor;
+        cv::bitwise_not(anchor_ring, non_anchor);
+        cv::Mat distance_to_ring;
+        cv::distanceTransform(non_anchor, distance_to_ring, cv::DIST_L2, 3);
+        cv::Mat support_overlap;
+        cv::bitwise_and(apply_mask, support_change, support_overlap);
+        cv::bitwise_and(support_overlap, old_valid, support_overlap);
+        cv::bitwise_and(support_overlap, new_valid, support_overlap);
+        for (int y = 0; y < transferred.rows; ++y) {
+            for (int x = 0; x < transferred.cols; ++x) {
+                if (support_overlap.at<std::uint8_t>(y, x) == 0U) {
+                    continue;
+                }
+                const float old_mix = std::clamp(
+                    1.0f - distance_to_ring.at<float>(y, x) / 16.0f, 0.65f, 0.95f);
+                const cv::Vec3f old_color = canvas_rgb.at<cv::Vec3f>(y, x);
+                const cv::Vec3f new_color = transferred.at<cv::Vec3f>(y, x);
+                transferred.at<cv::Vec3f>(y, x) =
+                    new_color * (1.0f - old_mix) + old_color * old_mix;
             }
-            const float old_mix = std::clamp(
-                1.0f - distance_to_ring.at<float>(y, x) / 16.0f, 0.65f, 0.95f);
-            const cv::Vec3f old_color = canvas_rgb.at<cv::Vec3f>(y, x);
-            const cv::Vec3f new_color = transferred.at<cv::Vec3f>(y, x);
-            transferred.at<cv::Vec3f>(y, x) =
-                new_color * (1.0f - old_mix) + old_color * old_mix;
         }
     }
 
@@ -1123,6 +1522,60 @@ cv::Mat anchor_texture_transfer(
         }
     }
     return result;
+}
+
+// A grouped sliding window can expose a new canvas strip whose RGB is valid,
+// while the immediately adjacent old-canvas pixels still carry the previous
+// view's exposure.  Keep the new texture away from that boundary, but feather
+// only a narrow edge to the nearest committed RGB samples.  The old canvas is
+// never rewritten and the helper is not used by the single-image path.
+void feather_group_new_rgb_to_canvas(
+    cv::Mat& rgb,
+    const cv::Mat& canvas_rgb,
+    const cv::Mat& canvas_valid,
+    const cv::Mat& new_mask,
+    const int radius) {
+    if (rgb.empty() || canvas_rgb.empty() || canvas_valid.empty()
+        || new_mask.empty() || cv::countNonZero(new_mask) == 0
+        || cv::countNonZero(canvas_valid) == 0 || radius <= 0) {
+        return;
+    }
+    cv::Mat not_old_valid;
+    cv::bitwise_not(canvas_valid, not_old_valid);
+    cv::Mat distance_to_old;
+    cv::distanceTransform(not_old_valid, distance_to_old, cv::DIST_L2, 3);
+
+    std::vector<cv::Mat> old_channels;
+    cv::split(canvas_rgb, old_channels);
+    std::vector<cv::Mat> nearest_channels;
+    nearest_channels.reserve(old_channels.size());
+    for (const cv::Mat& channel : old_channels) {
+        nearest_channels.push_back(nearest_fill_values(channel, canvas_valid));
+    }
+
+    for (int y = 0; y < rgb.rows; ++y) {
+        for (int x = 0; x < rgb.cols; ++x) {
+            if (new_mask.at<std::uint8_t>(y, x) == 0U) {
+                continue;
+            }
+            const float distance = distance_to_old.at<float>(y, x);
+            if (!std::isfinite(distance) || distance > static_cast<float>(radius)) {
+                continue;
+            }
+            // Retain some of the new texture even on the first pixel, then
+            // return to the unmodified new RGB after the narrow feather band.
+            const float alpha = std::clamp(
+                0.25f + 0.75f * distance / static_cast<float>(radius),
+                0.25f,
+                1.0f);
+            cv::Vec3f value = rgb.at<cv::Vec3f>(y, x);
+            for (int channel = 0; channel < 3; ++channel) {
+                value[channel] = nearest_channels[channel].at<float>(y, x)
+                    * (1.0f - alpha) + value[channel] * alpha;
+            }
+            rgb.at<cv::Vec3f>(y, x) = value;
+        }
+    }
 }
 
 }  // namespace
@@ -2361,6 +2814,11 @@ CandidateCommit InferenceEngine::process_impl(
     result.metrics.read_ms = read_ms;
     result.metrics.group_size = prepared_group == nullptr ? 1 : 3;
     result.metrics.group_stride = prepared_group == nullptr ? 1 : options_.group_stride;
+    if (prepared_group != nullptr
+        && (!state.initialized
+            || group_gap_protected_.size() != cv::Size(state.width, state.height))) {
+        group_gap_protected_ = cv::Mat::zeros(state.height, state.width, CV_8UC1);
+    }
     result.metrics.group_anchor_index = prepared_group == nullptr ? 0 : raw.group_anchor_index;
     result.metrics.forward_batch_size = prepared_group == nullptr ? 1 : 3;
     result.metrics.forward_sequence_size = 1;
@@ -2840,9 +3298,9 @@ CandidateCommit InferenceEngine::process_impl(
     }
 
     const cv::Size canvas_size(state.width, state.height);
-    const cv::Mat model_depth_canvas = warp_like(
+    cv::Mat model_depth_canvas = warp_like(
         prediction.depth, model_to_canvas, canvas_size, cv::INTER_LINEAR);
-    const cv::Mat model_confidence_canvas = warp_like(
+    cv::Mat model_confidence_canvas = warp_like(
         prediction.confidence, model_to_canvas, canvas_size, cv::INTER_LINEAR);
     const cv::Mat warped_roi_valid_f = warp_like(
         model_support, model_to_canvas, canvas_size, cv::INTER_NEAREST);
@@ -2856,6 +3314,58 @@ CandidateCommit InferenceEngine::process_impl(
         valid_warp,
         static_cast<float>(options_.min_conf));
     cv::bitwise_and(candidate_valid, warped_roi_valid, candidate_valid);
+    cv::Mat group_gap_fill = cv::Mat::zeros(candidate_valid.size(), CV_8UC1);
+    cv::Mat group_rgb_source_valid = candidate_valid.clone();
+    if (prepared_group != nullptr) {
+        // B3S1 can leave a thin strip in the authoritative canvas support
+        // without writing geometry there.  Detect only old-support holes so
+        // this cannot turn a genuinely new outer aperture into a surface.
+        cv::Mat group_support = state.initialized
+            ? state_mask(state.support, state.width, state.height)
+            : cv::Mat::zeros(valid_warp.size(), CV_8UC1);
+        cv::bitwise_and(group_support, valid_warp, group_support);
+        cv::Mat group_detection_valid = canvas_valid.clone();
+        cv::Mat group_hole;
+        cv::Mat not_group_detection_valid;
+        cv::bitwise_not(group_detection_valid, not_group_detection_valid);
+        cv::bitwise_and(group_support, not_group_detection_valid, group_hole);
+        cv::Mat not_group_hole;
+        cv::bitwise_not(group_hole, not_group_hole);
+        cv::bitwise_and(group_rgb_source_valid, not_group_hole, group_rgb_source_valid);
+        group_gap_fill = fill_group_narrow_gaps(
+            model_depth_canvas,
+            model_confidence_canvas,
+            group_detection_valid,
+            group_support,
+            group_rgb_source_valid);
+        // Keep only the part of the support hole that lies on the anchor
+        // silhouette.  The old-support component can extend into the dark
+        // aperture; committing that full rectangle would replace a natural
+        // curved outline with a straight horizontal RGB/depth edge.
+        for (int y = 0; y < group_gap_fill.rows; ++y) {
+            for (int x = 0; x < group_gap_fill.cols; ++x) {
+                if (group_gap_fill.at<std::uint8_t>(y, x) != 0U
+                    && std::max({
+                        warped_rgb_f.at<cv::Vec3f>(y, x)[0],
+                        warped_rgb_f.at<cv::Vec3f>(y, x)[1],
+                        warped_rgb_f.at<cv::Vec3f>(y, x)[2]}) < 0.08f) {
+                    group_gap_fill.at<std::uint8_t>(y, x) = 0U;
+                }
+            }
+        }
+        group_gap_fill = expand_group_gap_edges(
+            model_depth_canvas,
+            model_confidence_canvas,
+            group_detection_valid,
+            group_gap_fill,
+            group_support,
+            canvas_valid,
+            static_cast<float>(options_.min_conf));
+        cv::bitwise_or(candidate_valid, group_gap_fill, candidate_valid);
+        if (cv::countNonZero(group_gap_fill) > 0) {
+            cv::bitwise_or(group_gap_protected_, group_gap_fill, group_gap_protected_);
+        }
+    }
 
     // Python computes a frame-local confidence percentile after projecting
     // the ROI back to the canvas.  A fixed 0.1 threshold lets low-confidence
@@ -2979,6 +3489,50 @@ CandidateCommit InferenceEngine::process_impl(
     cv::Mat not_anchor;
     cv::bitwise_not(anchor_ring, not_anchor);
     cv::bitwise_and(update_mask, not_anchor, update_mask);
+    if (prepared_group != nullptr && !group_gap_protected_.empty()) {
+        cv::Mat not_group_gap_protected;
+        cv::bitwise_not(group_gap_protected_, not_group_gap_protected);
+        cv::bitwise_and(update_mask, not_group_gap_protected, update_mask);
+    }
+    // A grouped model can expose a previously unsupported strip only after
+    // the current sliding window enlarges the anchor footprint.  The strip
+    // is not a photometric/change-mask pixel yet, but its nearest-filled
+    // depth/color is an explicit geometry repair and must be committed.
+    if (!group_gap_fill.empty()) {
+        cv::bitwise_or(update_mask, group_gap_fill, update_mask);
+    }
+
+    cv::Mat group_stale_clear = cv::Mat::zeros(update_mask.size(), CV_8UC1);
+    if (prepared_group != nullptr && state.initialized && result.metrics.fallback.empty()) {
+        cv::Mat current_footprint;
+        cv::bitwise_or(valid_warp, group_gap_fill, current_footprint);
+        const cv::Mat halo_kernel = cv::getStructuringElement(
+            cv::MORPH_ELLIPSE, cv::Size(7, 7));
+        cv::dilate(current_footprint, current_footprint, halo_kernel);
+        cv::Mat outside_current;
+        cv::bitwise_not(current_footprint, outside_current);
+        cv::bitwise_and(canvas_valid, outside_current, group_stale_clear);
+        group_stale_clear = filter_components(group_stale_clear, 256);
+    }
+
+    // In grouped mode the anchor is the only geometry owner for the current
+    // foreground.  Refresh its reliable model pixels on every forward so a
+    // previous sliding window cannot leave a second depth/colour layer inside
+    // the current object silhouette.  Keep the narrow repaired strip and the
+    // anchor ring protected; those regions already use canvas-calibrated
+    // geometry for continuity.
+    cv::Mat group_refresh_mask = cv::Mat::zeros(update_mask.size(), CV_8UC1);
+    if (prepared_group != nullptr) {
+        group_refresh_mask = quality_valid.clone();
+        cv::bitwise_and(group_refresh_mask, not_anchor, group_refresh_mask);
+        if (!group_gap_protected_.empty()) {
+            cv::Mat not_group_gap_protected;
+            cv::bitwise_not(group_gap_protected_, not_group_gap_protected);
+            cv::bitwise_and(
+                group_refresh_mask, not_group_gap_protected, group_refresh_mask);
+        }
+        cv::bitwise_or(update_mask, group_refresh_mask, update_mask);
+    }
 
     // RGB-only bridge: keep the current aligned source authoritative through
     // the old overlap, then fade to the untouched old canvas only in the last
@@ -3022,27 +3576,69 @@ CandidateCommit InferenceEngine::process_impl(
             : state_rgb_float(state);
     }
 
+    // A repaired grouped strip is geometry-authoritative, but its RGB must
+    // follow later grouped views as the surrounding surface is refreshed.
+    // Commit that RGB as a color-only update; never let a later model depth
+    // prediction overwrite the protected geometry.
+    if constexpr (false) {
+        // Refresh the full existing anchor overlap as color-only updates.  A
+        // repaired strip must not retain the exposure/texture layer from the
+        // group that first exposed its geometry; geometry remains protected
+        // by group_gap_protected_ above.
+        cv::Mat group_color_refresh;
+        cv::bitwise_and(valid_warp, canvas_valid, group_color_refresh);
+        if (!group_gap_protected_.empty()) {
+            cv::bitwise_or(group_color_refresh, group_gap_protected_, group_color_refresh);
+            cv::bitwise_and(group_color_refresh, canvas_valid, group_color_refresh);
+        }
+        cv::bitwise_or(color_bridge_mask, group_color_refresh, color_bridge_mask);
+        cv::Mat anchor_distance;
+        cv::distanceTransform(valid_warp, anchor_distance, cv::DIST_L2, 3);
+        for (int y = 0; y < group_color_refresh.rows; ++y) {
+            for (int x = 0; x < group_color_refresh.cols; ++x) {
+                if (group_color_refresh.at<std::uint8_t>(y, x) != 0U) {
+                    const bool protected_gap = !group_gap_protected_.empty()
+                        && group_gap_protected_.at<std::uint8_t>(y, x) != 0U;
+                    color_bridge_mix.at<float>(y, x) = protected_gap
+                        ? 1.0f
+                        : std::clamp(anchor_distance.at<float>(y, x) / 16.0f, 0.0f, 1.0f);
+                }
+            }
+        }
+    }
+
     cv::Mat color_apply_mask;
     cv::bitwise_or(update_mask, color_bridge_mask, color_apply_mask);
-    // Group mode has one authoritative anchor RGB image.  Reusing the
-    // single-view texture-transfer bridge on a rotated three-image window
-    // can turn a narrow support edge into a long rectangular colour seam.
-    // Keep group updates source-faithful; single-view mode retains the
-    // existing overlap correction.
+    // Group mode keeps the anchor as the only RGB source, but still needs the
+    // global overlap correction because each sliding window has a new anchor
+    // exposure/view.  It must not use the single-view hard old-overlap blend:
+    // that blend turns a narrow rotated support edge into a long rectangle.
     cv::Mat fused_rgb;
-    if (prepared_group != nullptr) {
-        fused_rgb = warped_rgb_f.clone();
-    } else {
-        fused_rgb = state.initialized
-            ? anchor_texture_transfer(
-                warped_rgb_f,
-                canvas_rgb,
-                canvas_valid,
-                valid_warp,
-                color_apply_mask,
-                support_change,
-                anchor_ring)
-            : warped_rgb_f.clone();
+    fused_rgb = state.initialized && prepared_group == nullptr
+        ? anchor_texture_transfer(
+            warped_rgb_f,
+            canvas_rgb,
+            canvas_valid,
+            valid_warp,
+            color_apply_mask,
+            support_change,
+            anchor_ring,
+            prepared_group == nullptr)
+        : warped_rgb_f.clone();
+
+    // The grouped anchor RGB is already foreground-masked by valid_warp.  Use
+    // it for every existing foreground slot so stale exposure/texture layers
+    // cannot survive when the depth refresh above does not change a pixel.
+    cv::Mat group_color_refresh = cv::Mat::zeros(update_mask.size(), CV_8UC1);
+    if (prepared_group != nullptr && state.initialized) {
+        cv::bitwise_and(valid_warp, canvas_valid, group_color_refresh);
+        if (!group_stale_clear.empty()) {
+            cv::Mat not_stale;
+            cv::bitwise_not(group_stale_clear, not_stale);
+            cv::bitwise_and(group_color_refresh, not_stale, group_color_refresh);
+        }
+        cv::bitwise_or(color_bridge_mask, group_color_refresh, color_bridge_mask);
+        color_bridge_mix.setTo(1.0f, group_color_refresh);
     }
 
     if (state.initialized && cv::countNonZero(color_bridge_mask) > 0) {
@@ -3055,6 +3651,455 @@ CandidateCommit InferenceEngine::process_impl(
                 fused_rgb.at<cv::Vec3f>(y, x) =
                     fused_rgb.at<cv::Vec3f>(y, x) * alpha
                     + canvas_rgb.at<cv::Vec3f>(y, x) * (1.0f - alpha);
+            }
+        }
+    }
+
+    // The grouped model may expose a thin strip whose current RGB exposure
+    // differs from the committed rows immediately above and below it.  Keep
+    // the current texture, but apply a per-row low-frequency colour offset so
+    // the repaired strip joins those committed boundary colours without
+    // creating a copied/striped texture layer.
+    if constexpr (false) {
+        cv::Mat gap_labels;
+        cv::Mat gap_stats;
+        cv::Mat gap_centroids;
+        const int gap_components = cv::connectedComponentsWithStats(
+            group_gap_protected_, gap_labels, gap_stats, gap_centroids, 8, CV_32S);
+        cv::Mat not_gap_protected;
+        cv::bitwise_not(group_gap_protected_, not_gap_protected);
+        cv::Mat canvas_boundary_valid;
+        cv::bitwise_and(canvas_valid, not_gap_protected, canvas_boundary_valid);
+        cv::Mat valid_f;
+        valid_warp.convertTo(valid_f, CV_32FC1, 1.0 / 255.0);
+        std::vector<cv::Mat> local_channels;
+        cv::split(fused_rgb, local_channels);
+        cv::Mat local_denominator;
+        cv::GaussianBlur(valid_f, local_denominator, cv::Size(9, 9), 0.0, 0.0);
+        for (cv::Mat& channel : local_channels) {
+            cv::Mat weighted;
+            cv::multiply(channel, valid_f, weighted);
+            cv::GaussianBlur(weighted, weighted, cv::Size(9, 9), 0.0, 0.0);
+            cv::Mat safe_denominator;
+            cv::add(local_denominator, cv::Scalar(1e-5), safe_denominator);
+            cv::divide(weighted, safe_denominator, channel);
+        }
+        cv::Mat local_rgb;
+        cv::merge(local_channels, local_rgb);
+        for (int component = 1; component < gap_components; ++component) {
+            const int left = gap_stats.at<int>(component, cv::CC_STAT_LEFT);
+            const int top = gap_stats.at<int>(component, cv::CC_STAT_TOP);
+            const int width = gap_stats.at<int>(component, cv::CC_STAT_WIDTH);
+            const int height = gap_stats.at<int>(component, cv::CC_STAT_HEIGHT);
+            const bool horizontal = width >= height;
+            const int first = horizontal ? left : top;
+            const int last = horizontal ? left + width : top + height;
+            const int span = std::max(1, last - first);
+            int before = horizontal ? top - 1 : left - 1;
+            int after = horizontal ? top + height : left + width;
+            const int before_limit = horizontal ? 0 : 0;
+            const int after_limit = horizontal
+                ? canvas_valid.rows - 1
+                : canvas_valid.cols - 1;
+            auto boundary_coverage = [&](const int coordinate) {
+                int count = 0;
+                for (int offset = 0; offset < span; ++offset) {
+                    const int along = first + offset;
+                    const int x = horizontal ? along : coordinate;
+                    const int y = horizontal ? coordinate : along;
+                    count += canvas_boundary_valid.at<std::uint8_t>(y, x) != 0U ? 1 : 0;
+                }
+                return count;
+            };
+            const int before_canvas_start = before;
+            const int after_canvas_start = after;
+            while (before >= before_limit && boundary_coverage(before) < span / 2) {
+                --before;
+            }
+            while (after <= after_limit && boundary_coverage(after) < span / 2) {
+                ++after;
+            }
+            const bool before_from_canvas = before >= before_limit;
+            const bool after_from_canvas = after <= after_limit;
+            auto current_coverage = [&](const int coordinate) {
+                int count = 0;
+                for (int offset = 0; offset < span; ++offset) {
+                    const int along = first + offset;
+                    const int x = horizontal ? along : coordinate;
+                    const int y = horizontal ? coordinate : along;
+                    count += valid_warp.at<std::uint8_t>(y, x) != 0U ? 1 : 0;
+                }
+                return count;
+            };
+            if (!before_from_canvas) {
+                before = before_canvas_start;
+                while (before >= before_limit && current_coverage(before) < span / 2) {
+                    --before;
+                }
+            }
+            if (!after_from_canvas) {
+                after = after_canvas_start;
+                while (after <= after_limit && current_coverage(after) < span / 2) {
+                    ++after;
+                }
+            }
+            if (before < before_limit || after > after_limit) {
+                continue;
+            }
+            auto boundary_mean = [&](const cv::Mat& mask, const cv::Mat& image,
+                                     const int coordinate) {
+                cv::Vec3f sum(0.0f, 0.0f, 0.0f);
+                int count = 0;
+                for (int offset = 0; offset < span; ++offset) {
+                    const int along = first + offset;
+                    const int x = horizontal ? along : coordinate;
+                    const int y = horizontal ? coordinate : along;
+                    if (mask.at<std::uint8_t>(y, x) == 0U) {
+                        continue;
+                    }
+                    sum += image.at<cv::Vec3f>(y, x);
+                    ++count;
+                }
+                return count > 0 ? sum * (1.0f / static_cast<float>(count))
+                                 : cv::Vec3f(0.0f, 0.0f, 0.0f);
+            };
+            const cv::Vec3f before_mean = before_from_canvas
+                ? boundary_mean(canvas_boundary_valid, canvas_rgb, before)
+                : boundary_mean(valid_warp, fused_rgb, before);
+            const cv::Vec3f after_mean = after_from_canvas
+                ? boundary_mean(canvas_boundary_valid, canvas_rgb, after)
+                : boundary_mean(valid_warp, fused_rgb, after);
+            for (int y = top; y < top + height; ++y) {
+                for (int x = left; x < left + width; ++x) {
+                    if (gap_labels.at<int>(y, x) != component) {
+                        continue;
+                    }
+                    cv::Vec3f current_sum(0.0f, 0.0f, 0.0f);
+                    int current_count = 0;
+                    for (int along = first; along < last; ++along) {
+                        const int px = horizontal ? along : x;
+                        const int py = horizontal ? y : along;
+                        if (gap_labels.at<int>(py, px) != component
+                            || valid_warp.at<std::uint8_t>(py, px) == 0U) {
+                            continue;
+                        }
+                        current_sum += fused_rgb.at<cv::Vec3f>(py, px);
+                        ++current_count;
+                    }
+                    if (current_count == 0) {
+                        continue;
+                    }
+                    const int coordinate = horizontal ? y : x;
+                    const float alpha = std::clamp(
+                        static_cast<float>(coordinate - before)
+                            / static_cast<float>(after - before),
+                        0.0f,
+                        1.0f);
+                    const cv::Vec3f target = before_mean * (1.0f - alpha)
+                        + after_mean * alpha;
+                    const cv::Vec3f current_mean = current_sum
+                        * (1.0f / static_cast<float>(current_count));
+                    cv::Vec3f current_value = fused_rgb.at<cv::Vec3f>(y, x);
+                    bool has_current = valid_warp.at<std::uint8_t>(y, x) != 0U
+                        && std::max({current_value[0], current_value[1], current_value[2]}) >= 0.08f;
+                    if (!has_current) {
+                        if (local_denominator.at<float>(y, x) > 0.05f) {
+                            current_value = local_rgb.at<cv::Vec3f>(y, x);
+                            has_current = true;
+                        }
+                    }
+                    if (!has_current) {
+                        for (int distance = 1; distance < std::max(width, height); ++distance) {
+                            const int before_x = horizontal ? x - distance : x;
+                            const int before_y = horizontal ? y : y - distance;
+                            const int after_x = horizontal ? x + distance : x;
+                            const int after_y = horizontal ? y : y + distance;
+                            if (before_x >= left && before_x < left + width
+                                && before_y >= top && before_y < top + height
+                                && valid_warp.at<std::uint8_t>(before_y, before_x) != 0U) {
+                                current_value = fused_rgb.at<cv::Vec3f>(before_y, before_x);
+                                has_current = true;
+                                break;
+                            }
+                            if (after_x >= left && after_x < left + width
+                                && after_y >= top && after_y < top + height
+                                && valid_warp.at<std::uint8_t>(after_y, after_x) != 0U) {
+                                current_value = fused_rgb.at<cv::Vec3f>(after_y, after_x);
+                                has_current = true;
+                                break;
+                            }
+                        }
+                    }
+                    cv::Vec3f value = has_current
+                        ? current_value + target - current_mean
+                        : target;
+                    for (int channel = 0; channel < 3; ++channel) {
+                        value[channel] = std::clamp(value[channel], 0.0f, 1.0f);
+                    }
+                    fused_rgb.at<cv::Vec3f>(y, x) = value;
+                }
+            }
+        }
+    }
+
+    // In grouped mode an existing canvas colour is authoritative.  The next
+    // three-image window may have a different exposure or ROI, but it must
+    // not rewrite the already committed RGB layer and create a horizontal
+    // colour band.  Newly exposed cells are not in canvas_valid and keep the
+    // current anchor RGB.
+    // Grouped mode refreshes the current foreground anchor above.  The old
+    // implementation copied every canvas-valid pixel back from canvas_rgb
+    // here, which resurrected the stale rectangular texture layer immediately
+    // before the patch was serialized.  Keep that legacy block disabled; the
+    // single-image path does not enter it.
+    if constexpr (false) {
+        cv::Mat group_not_old_valid;
+        cv::bitwise_not(canvas_valid, group_not_old_valid);
+        cv::Mat group_new_mask_for_feather;
+        cv::bitwise_and(valid_warp, group_not_old_valid, group_new_mask_for_feather);
+        std::vector<cv::Mat> group_current_channels;
+        cv::split(fused_rgb, group_current_channels);
+        std::vector<cv::Mat> group_nearest_new_channels;
+        group_nearest_new_channels.reserve(group_current_channels.size());
+        for (const cv::Mat& channel : group_current_channels) {
+            group_nearest_new_channels.push_back(
+                nearest_fill_values(channel, group_new_mask_for_feather));
+        }
+        for (int y = 0; y < fused_rgb.rows; ++y) {
+            for (int x = 0; x < fused_rgb.cols; ++x) {
+                if (canvas_valid.at<std::uint8_t>(y, x) != 0U) {
+                    fused_rgb.at<cv::Vec3f>(y, x) = canvas_rgb.at<cv::Vec3f>(y, x);
+                }
+            }
+        }
+
+        // Newly exposed geometry still needs to meet the old canvas without
+        // an exposure step.  Estimate the old low-frequency colour field and
+        // feather it into only the new cells; the committed canvas itself is
+        // left untouched by this correction.
+        cv::Mat old_valid_f;
+        canvas_valid.convertTo(old_valid_f, CV_32FC1, 1.0 / 255.0);
+        cv::Mat old_denominator;
+        cv::GaussianBlur(old_valid_f, old_denominator, cv::Size(), 16.0, 16.0);
+        std::vector<cv::Mat> old_fields;
+        cv::split(canvas_rgb, old_fields);
+        for (cv::Mat& channel : old_fields) {
+            cv::Mat weighted;
+            cv::multiply(channel, old_valid_f, weighted);
+            cv::GaussianBlur(weighted, weighted, cv::Size(), 16.0, 16.0);
+            cv::Mat safe_denominator;
+            cv::add(old_denominator, cv::Scalar(1e-5), safe_denominator);
+            cv::divide(weighted, safe_denominator, channel);
+        }
+        cv::Mat old_field;
+        cv::merge(old_fields, old_field);
+        cv::Mat not_old_valid;
+        cv::bitwise_not(canvas_valid, not_old_valid);
+        cv::Mat distance_to_old;
+        cv::distanceTransform(not_old_valid, distance_to_old, cv::DIST_L2, 3);
+        cv::Mat new_color_mask;
+        // Use every newly exposed model-supported pixel for the feather.  A
+        // change-mask-only selection can leave the first row outside
+        // update_mask, which is exactly where a thin RGB seam survives.
+        cv::bitwise_and(valid_warp, not_old_valid, new_color_mask);
+        for (int y = 0; y < fused_rgb.rows; ++y) {
+            for (int x = 0; x < fused_rgb.cols; ++x) {
+                if (new_color_mask.at<std::uint8_t>(y, x) == 0U
+                    || old_denominator.at<float>(y, x) <= 0.05f) {
+                    continue;
+                }
+                const float alpha = std::clamp(
+                    0.45f + distance_to_old.at<float>(y, x) / 40.0f,
+                    0.45f,
+                    1.0f);
+                fused_rgb.at<cv::Vec3f>(y, x) =
+                    old_field.at<cv::Vec3f>(y, x) * (1.0f - alpha)
+                    + fused_rgb.at<cv::Vec3f>(y, x) * alpha;
+            }
+        }
+        feather_group_new_rgb_to_canvas(
+            fused_rgb, canvas_rgb, canvas_valid, new_color_mask, 8);
+        // Symmetrically feather the old-canvas side.  Locking only the old
+        // pixels leaves a one-pixel exposure step at the new/old boundary.
+        cv::Mat not_group_new;
+        cv::bitwise_not(group_new_mask_for_feather, not_group_new);
+        cv::Mat distance_to_new;
+        cv::distanceTransform(not_group_new, distance_to_new, cv::DIST_L2, 3);
+        for (int y = 0; y < fused_rgb.rows; ++y) {
+            for (int x = 0; x < fused_rgb.cols; ++x) {
+                if (canvas_valid.at<std::uint8_t>(y, x) == 0U) {
+                    continue;
+                }
+                const float distance = distance_to_new.at<float>(y, x);
+                if (!std::isfinite(distance) || distance > 8.0f) {
+                    continue;
+                }
+                const float old_weight = std::clamp(
+                    0.5f + (distance - 1.0f) / 14.0f, 0.5f, 1.0f);
+                cv::Vec3f value = canvas_rgb.at<cv::Vec3f>(y, x);
+                for (int channel = 0; channel < 3; ++channel) {
+                    value[channel] = value[channel] * old_weight
+                        + group_nearest_new_channels[channel].at<float>(y, x)
+                            * (1.0f - old_weight);
+                }
+                fused_rgb.at<cv::Vec3f>(y, x) = value;
+            }
+        }
+    }
+
+    // A newly repaired narrow support strip has no old RGB samples.  Fill it
+    // once from the surrounding anchor texture; the protected mask prevents
+    // subsequent grouped windows from changing it again.
+    if (prepared_group != nullptr && cv::countNonZero(group_gap_fill) > 0) {
+        // First propagate colours along the strip's short (vertical) axis.
+        // The warped RGB support can start several rows below the geometric
+        // support; ordinary inpainting then sees black background above the
+        // object and reproduces the very band we are removing.  Only pixels
+        // outside the repair mask and brighter than the background are used
+        // as sources.
+        cv::Mat source = cv::Mat::zeros(group_gap_fill.size(), CV_8UC1);
+        for (int y = 0; y < fused_rgb.rows; ++y) {
+            for (int x = 0; x < fused_rgb.cols; ++x) {
+                if (group_gap_fill.at<std::uint8_t>(y, x) != 0U) {
+                    continue;
+                }
+                const cv::Vec3f value = fused_rgb.at<cv::Vec3f>(y, x);
+                if (std::max({value[0], value[1], value[2]}) >= 0.08f) {
+                    source.at<std::uint8_t>(y, x) = 255U;
+                }
+            }
+        }
+        cv::Mat repaired = fused_rgb.clone();
+        cv::Mat gap_labels;
+        cv::Mat gap_stats;
+        cv::Mat gap_centroids;
+        const int gap_components = cv::connectedComponentsWithStats(
+            group_gap_fill, gap_labels, gap_stats, gap_centroids, 8, CV_32S);
+        for (int component = 1; component < gap_components; ++component) {
+            const int left = gap_stats.at<int>(component, cv::CC_STAT_LEFT);
+            const int top = gap_stats.at<int>(component, cv::CC_STAT_TOP);
+            const int width = gap_stats.at<int>(component, cv::CC_STAT_WIDTH);
+            const int height = gap_stats.at<int>(component, cv::CC_STAT_HEIGHT);
+            const bool horizontal = width >= height;
+            const int span = std::max(1, horizontal ? height : width);
+            for (int y = top; y < top + height; ++y) {
+                for (int x = left; x < left + width; ++x) {
+                    if (gap_labels.at<int>(y, x) != component) {
+                        continue;
+                    }
+                    int before = horizontal ? y - span : x - span;
+                    while (before >= 0) {
+                        const int sx = horizontal ? x : before;
+                        const int sy = horizontal ? before : y;
+                        if (source.at<std::uint8_t>(sy, sx) != 0U) {
+                            break;
+                        }
+                        --before;
+                    }
+                    int after = horizontal
+                        ? y + span
+                        : x + span;
+                    const int after_limit = horizontal
+                        ? fused_rgb.rows
+                        : fused_rgb.cols;
+                    while (after < after_limit) {
+                        const int sx = horizontal ? x : after;
+                        const int sy = horizontal ? after : y;
+                        if (source.at<std::uint8_t>(sy, sx) != 0U) {
+                            break;
+                        }
+                        ++after;
+                    }
+                    cv::Vec3f value(0.0f, 0.0f, 0.0f);
+                    if (before >= 0 && after < after_limit) {
+                        const int before_x = horizontal ? x : before;
+                        const int before_y = horizontal ? before : y;
+                        const int after_x = horizontal ? x : after;
+                        const int after_y = horizontal ? after : y;
+                        const float t = horizontal
+                            ? static_cast<float>(y - top)
+                                / static_cast<float>(std::max(1, height - 1))
+                            : static_cast<float>(x - left)
+                                / static_cast<float>(std::max(1, width - 1));
+                        value = fused_rgb.at<cv::Vec3f>(before_y, before_x)
+                            * (1.0f - t)
+                            + fused_rgb.at<cv::Vec3f>(after_y, after_x) * t;
+                    } else if (before >= 0) {
+                        const int before_x = horizontal ? x : before;
+                        const int before_y = horizontal ? before : y;
+                        value = fused_rgb.at<cv::Vec3f>(before_y, before_x);
+                    } else if (after < after_limit) {
+                        const int after_x = horizontal ? x : after;
+                        const int after_y = horizontal ? after : y;
+                        value = fused_rgb.at<cv::Vec3f>(after_y, after_x);
+                    }
+                    // The canvas-boundary feather may already have supplied a
+                    // valid, continuous colour for this pixel.  Do not
+                    // overwrite it with a directional strip sample; only
+                    // fill genuinely dark/unresolved gap pixels.
+                    const cv::Vec3f existing = fused_rgb.at<cv::Vec3f>(y, x);
+                    const bool existing_valid = std::max({
+                        existing[0], existing[1], existing[2]}) >= 0.08f;
+                    repaired.at<cv::Vec3f>(y, x) = existing_valid ? existing : value;
+                }
+            }
+        }
+        // Any component that touches the RGB silhouette may have no vertical
+        // source at all.  Finish only those unresolved pixels with a small
+        // radius inpaint; the directional pass above remains authoritative.
+        cv::Mat unresolved = cv::Mat::zeros(group_gap_fill.size(), CV_8UC1);
+        for (int y = 0; y < fused_rgb.rows; ++y) {
+            for (int x = 0; x < fused_rgb.cols; ++x) {
+                if (group_gap_fill.at<std::uint8_t>(y, x) != 0U
+                    && cv::norm(repaired.at<cv::Vec3f>(y, x)) < 1e-5) {
+                    unresolved.at<std::uint8_t>(y, x) = 255U;
+                }
+            }
+        }
+        if (cv::countNonZero(unresolved) > 0) {
+            cv::Mat repaired_u8;
+            repaired.convertTo(repaired_u8, CV_8UC3, 255.0);
+            cv::Mat inpainted_u8;
+            cv::inpaint(repaired_u8, unresolved, inpainted_u8, 3.0, cv::INPAINT_NS);
+            inpainted_u8.convertTo(repaired, CV_32FC3, 1.0 / 255.0);
+        }
+        fused_rgb = repaired;
+
+        // The directional samples above preserve texture, but a dark model
+        // border can still contribute a one-pixel exposure step at a support
+        // margin.  Re-estimate a normalized low-frequency RGB field from
+        // non-gap, non-background pixels.  Use it only to replace implausibly
+        // dark outliers; keeping the normal current texture avoids turning
+        // the whole strip into a flat, bright horizontal colour band.
+        cv::Mat source_f;
+        source.convertTo(source_f, CV_32FC1, 1.0 / 255.0);
+        cv::Mat source_denominator;
+        cv::GaussianBlur(source_f, source_denominator, cv::Size(), 6.0, 6.0);
+        std::vector<cv::Mat> source_fields;
+        cv::split(fused_rgb, source_fields);
+        for (cv::Mat& channel : source_fields) {
+            cv::Mat weighted;
+            cv::multiply(channel, source_f, weighted);
+            cv::GaussianBlur(weighted, weighted, cv::Size(), 6.0, 6.0);
+            cv::Mat safe_denominator;
+            cv::add(source_denominator, cv::Scalar(1e-5), safe_denominator);
+            cv::divide(weighted, safe_denominator, channel);
+        }
+        cv::Mat source_field;
+        cv::merge(source_fields, source_field);
+        for (int y = 0; y < fused_rgb.rows; ++y) {
+            for (int x = 0; x < fused_rgb.cols; ++x) {
+                if (group_gap_fill.at<std::uint8_t>(y, x) == 0U
+                    || source_denominator.at<float>(y, x) <= 0.03f) {
+                    continue;
+                }
+                const cv::Vec3f field = source_field.at<cv::Vec3f>(y, x);
+                const cv::Vec3f current = fused_rgb.at<cv::Vec3f>(y, x);
+                const float field_mean = (field[0] + field[1] + field[2]) / 3.0f;
+                const float current_mean = (current[0] + current[1] + current[2]) / 3.0f;
+                if (current_mean < field_mean * 0.65f) {
+                    fused_rgb.at<cv::Vec3f>(y, x) = field * 0.8f + current * 0.2f;
+                }
             }
         }
     }
@@ -3079,6 +4124,19 @@ CandidateCommit InferenceEngine::process_impl(
             anchor_ring);
     }
 
+    if (prepared_group != nullptr && state.initialized
+        && cv::countNonZero(group_gap_fill) > 0) {
+        cv::Mat canvas_depth(state.height, state.width, CV_32FC1);
+        for (int y = 0; y < state.height; ++y) {
+            for (int x = 0; x < state.width; ++x) {
+                canvas_depth.at<float>(y, x) = state.depth[
+                    static_cast<std::size_t>(y) * state.width + x];
+            }
+        }
+        interpolate_group_gap_depth_to_canvas(
+            aligned_depth, group_gap_fill, canvas_depth, canvas_valid);
+    }
+
     cv::Mat fused_u8;
     fused_rgb.convertTo(fused_u8, CV_8UC3, 255.0);
 
@@ -3088,6 +4146,19 @@ CandidateCommit InferenceEngine::process_impl(
         for (int x = 0; x < state.width; ++x) {
             if (valid_warp.at<std::uint8_t>(y, x) != 0U) {
                 patch.observed_slots.push_back(static_cast<std::uint32_t>(y * state.width + x));
+            }
+            const bool stale_clear = group_stale_clear.at<std::uint8_t>(y, x) != 0U;
+            if (stale_clear) {
+                SlotValue after;
+                after.depth = 0.0f;
+                after.confidence = 0.0f;
+                after.rgba = 0U;
+                after.last_update_frame = static_cast<std::uint32_t>(raw.frame_seq);
+                after.valid = 0U;
+                const std::uint32_t slot_id = static_cast<std::uint32_t>(y * state.width + x);
+                patch.updates.push_back(SlotUpdate{slot_id, after});
+                patch.cleared_support_slots.push_back(slot_id);
+                continue;
             }
             const bool geometry_update = update_mask.at<std::uint8_t>(y, x) != 0U;
             const bool color_bridge = color_bridge_mask.at<std::uint8_t>(y, x) != 0U;
@@ -3142,8 +4213,15 @@ CandidateCommit InferenceEngine::process_impl(
     std::size_t valid_point_count = static_cast<std::size_t>(
         std::count(state.valid.begin(), state.valid.end(), static_cast<std::uint8_t>(1U)));
     for (const SlotUpdate& update : patch.updates) {
-        if (update.slot_id >= state.valid.size() || state.valid[update.slot_id] == 0U) {
+        if (update.slot_id >= state.valid.size()) {
+            continue;
+        }
+        const bool was_valid = state.valid[update.slot_id] != 0U;
+        const bool is_valid = update.after.valid != 0U;
+        if (!was_valid && is_valid) {
             ++valid_point_count;
+        } else if (was_valid && !is_valid && valid_point_count > 0U) {
+            --valid_point_count;
         }
     }
     result.metrics.valid_point_count = static_cast<std::uint32_t>(valid_point_count);

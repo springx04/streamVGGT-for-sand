@@ -165,6 +165,11 @@ private:
     // matching and seam color transfer do not quantize every frame.
     mutable cv::Mat anchor_rgb_float_;
     mutable cv::Mat live_rgb_float_;
+    // Once a grouped sliding window repairs an old-support hole, later
+    // windows must not overwrite that protected strip with a new ROI colour
+    // layer.  This mask is in-process only; the versioned Canvas remains the
+    // authoritative persisted state.
+    mutable cv::Mat group_gap_protected_;
     // A fixed-anchor SIFT/RANSAC can fail on a late frame even when the
     // inter-frame motion is small. Keep the last accepted canvas transform so
     // one numerical feature-detection miss does not discard the whole frame.
