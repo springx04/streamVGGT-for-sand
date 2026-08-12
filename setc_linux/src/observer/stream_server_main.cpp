@@ -926,6 +926,7 @@ int main(int argc, char** argv) {
         std::signal(SIGTERM, on_signal);
 
         BoundedQueue<RawFrame> frame_queue(args.queue_capacity);
+        BoundedQueue<PreparedInput> prepared_queue(args.queue_capacity);
         BoundedQueue<CandidateCommit> commit_queue(args.queue_capacity + 2U);
 
         DirectorySourceOptions source_options;
@@ -960,6 +961,31 @@ int main(int argc, char** argv) {
             }
         });
 
+        std::thread prepare_thread([&] {
+            try {
+                FramePreprocessor preprocessor(configured_args.inference);
+                while (true) {
+                    const std::optional<RawFrame> raw = frame_queue.pop();
+                    if (!raw.has_value()) {
+                        break;
+                    }
+                    try {
+                        PreparedInput prepared = preprocessor.prepare(*raw);
+                        if (!prepared_queue.push_wait(std::move(prepared))) {
+                            break;
+                        }
+                    } catch (const std::exception& error) {
+                        runtime.record_failed(*raw, error.what());
+                    }
+                }
+            } catch (const std::exception& error) {
+                std::cerr << "preprocess worker: " << error.what() << "\n";
+                stop_requested.store(true);
+                frame_queue.close();
+            }
+            prepared_queue.close();
+        });
+
         std::thread inference_thread([&] {
             try {
                 // LibTorch and the CUDA context are owned by this worker only.
@@ -968,26 +994,27 @@ int main(int argc, char** argv) {
                 // In --once/--num_images mode the queue may be closed while it
                 // still contains the final frame.
                 while (true) {
-                    const std::optional<RawFrame> raw = frame_queue.pop();
-                    if (!raw.has_value()) {
+                    const std::optional<PreparedInput> prepared = prepared_queue.pop();
+                    if (!prepared.has_value()) {
                         break;
                     }
                     try {
                         const CanvasState state = runtime.snapshot();
-                        CandidateCommit candidate = engine.process(*raw, state);
+                        CandidateCommit candidate = engine.process_prepared(*prepared, state);
                         const FrameSeq frame_seq = candidate.frame.frame_seq;
                         if (!commit_queue.push_wait(std::move(candidate))) {
                             break;
                         }
                         runtime.wait_until_frame_handled(frame_seq);
                     } catch (const std::exception& error) {
-                        runtime.record_failed(*raw, error.what());
+                        runtime.record_failed(prepared->raw, error.what());
                     }
                 }
             } catch (const std::exception& error) {
                 std::cerr << "inference worker: " << error.what() << "\n";
                 stop_requested.store(true);
                 frame_queue.close();
+                prepared_queue.close();
             }
             commit_queue.close();
         });
@@ -1007,6 +1034,7 @@ int main(int argc, char** argv) {
 
         if (args.once) {
             source_thread.join();
+            prepare_thread.join();
             inference_thread.join();
             commit_thread.join();
         } else {
@@ -1015,8 +1043,10 @@ int main(int argc, char** argv) {
             }
             stop_requested.store(true);
             frame_queue.close();
+            prepared_queue.close();
             commit_queue.close();
             source_thread.join();
+            prepare_thread.join();
             inference_thread.join();
             commit_thread.join();
         }

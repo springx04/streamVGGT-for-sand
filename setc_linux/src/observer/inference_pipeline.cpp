@@ -2788,12 +2788,28 @@ void InferenceEngine::save_debug_images(
 }
 
 CandidateCommit InferenceEngine::process(const RawFrame& raw, const CanvasState& state) {
-    if (options_.group_mode && raw.group_paths.size() == 3U) {
-        return process_group(raw, state);
+    return process_prepared(FramePreprocessor(options_).prepare(raw), state);
+}
+
+CandidateCommit InferenceEngine::process_prepared(
+    const PreparedInput& prepared,
+    const CanvasState& state) {
+    FrameImage frame;
+    frame.path = prepared.path;
+    frame.rgb_u8 = prepared.rgb_u8;
+    frame.rgb_f = prepared.rgb_f;
+    frame.match_rgb_u8 = prepared.match_rgb_u8;
+    frame.match_rgb_f = prepared.match_rgb_f;
+    frame.support = prepared.support;
+    if (prepared.has_group) {
+        PreparedGroup group;
+        group.warped_rgb_f = prepared.group_warped_rgb_f;
+        group.valid_warp = prepared.group_valid_warp;
+        group.fused_rgb_f = prepared.group_fused_rgb_f;
+        group.union_valid = prepared.group_union_valid;
+        return process_impl(prepared.raw, state, frame, &group, prepared.read_ms);
     }
-    Timer read_timer;
-    const FrameImage frame = load_frame(raw.path);
-    return process_impl(raw, state, frame, nullptr, read_timer.ms());
+    return process_impl(prepared.raw, state, frame, nullptr, prepared.read_ms);
 }
 
 CandidateCommit InferenceEngine::process_impl(
@@ -4246,73 +4262,236 @@ CandidateCommit InferenceEngine::process_impl(
 CandidateCommit InferenceEngine::process_group(
     const RawFrame& raw,
     const CanvasState& state) {
-    if (raw.group_paths.size() != 3U) {
-        throw std::runtime_error("three-image mode received an incomplete input group");
-    }
-    Timer read_timer;
-    std::vector<FrameImage> frames;
-    frames.reserve(3U);
-    for (const auto& path : raw.group_paths) {
-        frames.push_back(load_frame(path));
-    }
-    const int anchor_index = std::clamp(raw.group_anchor_index, 0, 2);
-    PreparedGroup prepared;
-    prepared.warped_rgb_f.reserve(3U);
-    prepared.valid_warp.reserve(3U);
+    return process(raw, state);
+}
+
+FramePreprocessor::FramePreprocessor(InferenceOptions options)
+    : options_(std::move(options)) {}
+
+FramePreprocessor::FrameImage FramePreprocessor::load_frame(
+    const std::filesystem::path& path) const {
+    FrameImage frame;
+    frame.path = path;
+    const cv::Mat original = read_rgb(path);
+    const double scale_x = static_cast<double>(options_.width) / static_cast<double>(original.cols);
+    const int resized_height = std::max(
+        1, static_cast<int>(std::round(static_cast<double>(original.rows) * scale_x)));
+    cv::Mat original_f;
+    original.convertTo(original_f, CV_32FC3, 1.0 / 255.0);
+    cv::resize(
+        original_f,
+        frame.match_rgb_f,
+        cv::Size(options_.width, resized_height),
+        0.0,
+        0.0,
+        cv::INTER_AREA);
+    frame.match_rgb_u8 = quantize_rgb_u8(frame.match_rgb_f);
+
+    frame.rgb_f = cv::Mat::zeros(options_.canvas_height, options_.canvas_width, CV_32FC3);
+    frame.rgb_u8 = cv::Mat::zeros(options_.canvas_height, options_.canvas_width, CV_8UC3);
     const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
     const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
-    const cv::Mat pad_translation = [&]() {
-        cv::Mat result = cv::Mat::eye(3, 3, CV_32FC1);
-        result.at<float>(0, 2) = static_cast<float>(pad_left);
-        result.at<float>(1, 2) = static_cast<float>(pad_top);
-        return result;
-    }();
-    const cv::Mat inverse_pad_translation = [&]() {
-        cv::Mat result = cv::Mat::eye(3, 3, CV_32FC1);
-        result.at<float>(0, 2) = -static_cast<float>(pad_left);
-        result.at<float>(1, 2) = -static_cast<float>(pad_top);
-        return result;
-    }();
-    for (int index = 0; index < 3; ++index) {
-        cv::Mat aligned_rgb = frames[static_cast<std::size_t>(index)].rgb_f.clone();
-        cv::Mat aligned_support = frames[static_cast<std::size_t>(index)].support.clone();
-        if (index != anchor_index) {
-            // Feature coordinates are measured on the unpadded matching
-            // image.  Conjugating by the fixed canvas pad applies the same
-            // transform to the padded RGB/support buffers.
-            const cv::Mat match_homography = estimate_pair_homography(
-                frames[static_cast<std::size_t>(index)],
-                frames[static_cast<std::size_t>(anchor_index)]);
-            const cv::Mat canvas_homography = pad_translation
-                * match_homography * inverse_pad_translation;
-            aligned_rgb = warp_like(
-                frames[static_cast<std::size_t>(index)].rgb_f,
-                canvas_homography,
-                cv::Size(options_.canvas_width, options_.canvas_height),
-                cv::INTER_LINEAR);
-            aligned_support = warp_like(
-                frames[static_cast<std::size_t>(index)].support,
-                canvas_homography,
-                cv::Size(options_.canvas_width, options_.canvas_height),
-                cv::INTER_NEAREST);
-            cv::threshold(aligned_support, aligned_support, 127.0, 255.0, cv::THRESH_BINARY);
-            aligned_support.convertTo(aligned_support, CV_8UC1);
+    const int copy_x = pad_left;
+    const int copy_y = pad_top;
+    if (copy_x >= 0 && copy_y >= 0
+        && copy_x + frame.match_rgb_u8.cols <= frame.rgb_u8.cols
+        && copy_y + frame.match_rgb_u8.rows <= frame.rgb_u8.rows) {
+        frame.match_rgb_u8.copyTo(frame.rgb_u8(cv::Rect(
+            copy_x, copy_y, frame.match_rgb_u8.cols, frame.match_rgb_u8.rows)));
+        frame.match_rgb_f.copyTo(frame.rgb_f(cv::Rect(
+            copy_x, copy_y, frame.match_rgb_f.cols, frame.match_rgb_f.rows)));
+    } else {
+        const int copy_width = std::min(frame.match_rgb_u8.cols, frame.rgb_u8.cols);
+        const int copy_height = std::min(frame.match_rgb_u8.rows, frame.rgb_u8.rows);
+        const int source_x = std::max(0, (frame.match_rgb_u8.cols - copy_width) / 2);
+        const int source_y = std::max(0, (frame.match_rgb_u8.rows - copy_height) / 2);
+        const int target_x = std::max(0, (frame.rgb_u8.cols - copy_width) / 2);
+        const int target_y = std::max(0, (frame.rgb_u8.rows - copy_height) / 2);
+        frame.match_rgb_u8(
+            cv::Rect(source_x, source_y, copy_width, copy_height)).copyTo(
+                frame.rgb_u8(cv::Rect(target_x, target_y, copy_width, copy_height)));
+        frame.match_rgb_f(
+            cv::Rect(source_x, source_y, copy_width, copy_height)).copyTo(
+                frame.rgb_f(cv::Rect(target_x, target_y, copy_width, copy_height)));
+    }
+    frame.support = foreground_mask(frame.rgb_f);
+    return frame;
+}
+
+cv::Mat FramePreprocessor::warp_like(
+    const cv::Mat& source,
+    const cv::Mat& homography,
+    const cv::Size size,
+    const int interpolation) {
+    cv::Mat warped;
+    cv::warpPerspective(
+        source,
+        warped,
+        homography,
+        size,
+        interpolation,
+        cv::BORDER_CONSTANT,
+        cv::Scalar(0, 0, 0));
+    return warped;
+}
+
+cv::Mat FramePreprocessor::gray_u8(const cv::Mat& rgb_u8) {
+    std::vector<cv::Mat> channels;
+    cv::split(rgb_u8, channels);
+    cv::Mat c0;
+    cv::Mat c1;
+    cv::Mat c2;
+    channels[0].convertTo(c0, CV_32FC1);
+    channels[1].convertTo(c1, CV_32FC1);
+    channels[2].convertTo(c2, CV_32FC1);
+    cv::Mat gray = (c0 + c1 + c2) / 3.0f;
+    cv::Mat gray_u8(gray.rows, gray.cols, CV_8UC1, cv::Scalar(0));
+    const float scale = rgb_u8.type() == CV_32FC3 ? 255.0f : 1.0f;
+    for (int y = 0; y < gray.rows; ++y) {
+        for (int x = 0; x < gray.cols; ++x) {
+            gray_u8.at<std::uint8_t>(y, x) = static_cast<std::uint8_t>(std::clamp(
+                static_cast<int>(gray.at<float>(y, x) * scale), 0, 255));
         }
-        prepared.warped_rgb_f.push_back(std::move(aligned_rgb));
-        prepared.valid_warp.push_back(std::move(aligned_support));
     }
-    prepared.fused_rgb_f = prepared.warped_rgb_f[static_cast<std::size_t>(anchor_index)].clone();
-    prepared.union_valid = cv::Mat::zeros(
-        options_.canvas_height, options_.canvas_width, CV_8UC1);
-    for (const cv::Mat& support : prepared.valid_warp) {
-        cv::bitwise_or(prepared.union_valid, support, prepared.union_valid);
+    return gray_u8;
+}
+
+cv::Mat FramePreprocessor::estimate_pair_homography(
+    const FrameImage& source,
+    const FrameImage& target) const {
+    if (source.match_rgb_u8.empty() || target.match_rgb_u8.empty()) {
+        return cv::Mat::eye(3, 3, CV_32FC1);
     }
-    return process_impl(
-        raw,
-        state,
-        frames[static_cast<std::size_t>(anchor_index)],
-        &prepared,
-        read_timer.ms());
+    const cv::Mat source_gray = gray_u8(source.match_rgb_u8);
+    const cv::Mat target_gray = gray_u8(target.match_rgb_u8);
+    cv::Ptr<cv::Feature2D> detector;
+    int norm = cv::NORM_HAMMING;
+    try {
+        detector = cv::SIFT::create(1200);
+        norm = cv::NORM_L2;
+    } catch (const cv::Exception&) {
+        detector = cv::ORB::create(1200);
+    }
+    std::vector<cv::KeyPoint> source_keypoints;
+    std::vector<cv::KeyPoint> target_keypoints;
+    cv::Mat source_descriptors;
+    cv::Mat target_descriptors;
+    detector->detectAndCompute(source_gray, cv::noArray(), source_keypoints, source_descriptors);
+    detector->detectAndCompute(target_gray, cv::noArray(), target_keypoints, target_descriptors);
+    if (source_descriptors.empty() || target_descriptors.empty()
+        || source_keypoints.size() < 8U || target_keypoints.size() < 8U) {
+        return cv::Mat::eye(3, 3, CV_32FC1);
+    }
+    cv::BFMatcher matcher(norm);
+    std::vector<std::vector<cv::DMatch>> knn;
+    matcher.knnMatch(source_descriptors, target_descriptors, knn, 2);
+    std::vector<cv::DMatch> good;
+    for (const auto& pair : knn) {
+        if (pair.size() == 2U && pair[0].distance < 0.75f * pair[1].distance) {
+            good.push_back(pair[0]);
+        }
+    }
+    if (good.size() < 8U) {
+        return cv::Mat::eye(3, 3, CV_32FC1);
+    }
+    std::vector<cv::Point2f> source_points;
+    std::vector<cv::Point2f> target_points;
+    source_points.reserve(good.size());
+    target_points.reserve(good.size());
+    for (const cv::DMatch& match : good) {
+        source_points.push_back(source_keypoints[static_cast<std::size_t>(match.queryIdx)].pt);
+        target_points.push_back(target_keypoints[static_cast<std::size_t>(match.trainIdx)].pt);
+    }
+    cv::Mat inlier_mask;
+    cv::Mat homography = cv::findHomography(
+        source_points, target_points, cv::RANSAC, 3.0, inlier_mask);
+    if (homography.empty() || inlier_mask.empty() || cv::countNonZero(inlier_mask) < 8) {
+        return cv::Mat::eye(3, 3, CV_32FC1);
+    }
+    homography.convertTo(homography, CV_32FC1);
+    return homography;
+}
+
+PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
+    PreparedInput prepared_input;
+    prepared_input.raw = raw;
+    prepared_input.frame_seq = raw.frame_seq;
+    Timer read_timer;
+    if (options_.group_mode && raw.group_paths.size() == 3U) {
+        std::vector<FrameImage> frames;
+        frames.reserve(3U);
+        for (const auto& path : raw.group_paths) {
+            frames.push_back(load_frame(path));
+        }
+        const int anchor_index = std::clamp(raw.group_anchor_index, 0, 2);
+        const FrameImage& anchor = frames[static_cast<std::size_t>(anchor_index)];
+        prepared_input.path = anchor.path;
+        prepared_input.rgb_u8 = anchor.rgb_u8;
+        prepared_input.rgb_f = anchor.rgb_f;
+        prepared_input.match_rgb_u8 = anchor.match_rgb_u8;
+        prepared_input.match_rgb_f = anchor.match_rgb_f;
+        prepared_input.support = anchor.support;
+        prepared_input.has_group = true;
+        prepared_input.group_warped_rgb_f.reserve(3U);
+        prepared_input.group_valid_warp.reserve(3U);
+        const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
+        const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
+        const cv::Mat pad_translation = [&]() {
+            cv::Mat result = cv::Mat::eye(3, 3, CV_32FC1);
+            result.at<float>(0, 2) = static_cast<float>(pad_left);
+            result.at<float>(1, 2) = static_cast<float>(pad_top);
+            return result;
+        }();
+        const cv::Mat inverse_pad_translation = [&]() {
+            cv::Mat result = cv::Mat::eye(3, 3, CV_32FC1);
+            result.at<float>(0, 2) = -static_cast<float>(pad_left);
+            result.at<float>(1, 2) = -static_cast<float>(pad_top);
+            return result;
+        }();
+        for (int index = 0; index < 3; ++index) {
+            cv::Mat aligned_rgb = frames[static_cast<std::size_t>(index)].rgb_f.clone();
+            cv::Mat aligned_support = frames[static_cast<std::size_t>(index)].support.clone();
+            if (index != anchor_index) {
+                const cv::Mat match_homography = estimate_pair_homography(
+                    frames[static_cast<std::size_t>(index)],
+                    frames[static_cast<std::size_t>(anchor_index)]);
+                const cv::Mat canvas_homography = pad_translation
+                    * match_homography * inverse_pad_translation;
+                aligned_rgb = warp_like(
+                    frames[static_cast<std::size_t>(index)].rgb_f,
+                    canvas_homography,
+                    cv::Size(options_.canvas_width, options_.canvas_height),
+                    cv::INTER_LINEAR);
+                aligned_support = warp_like(
+                    frames[static_cast<std::size_t>(index)].support,
+                    canvas_homography,
+                    cv::Size(options_.canvas_width, options_.canvas_height),
+                    cv::INTER_NEAREST);
+                cv::threshold(aligned_support, aligned_support, 127.0, 255.0, cv::THRESH_BINARY);
+                aligned_support.convertTo(aligned_support, CV_8UC1);
+            }
+            prepared_input.group_warped_rgb_f.push_back(std::move(aligned_rgb));
+            prepared_input.group_valid_warp.push_back(std::move(aligned_support));
+        }
+        prepared_input.group_fused_rgb_f =
+            prepared_input.group_warped_rgb_f[static_cast<std::size_t>(anchor_index)].clone();
+        prepared_input.group_union_valid = cv::Mat::zeros(
+            options_.canvas_height, options_.canvas_width, CV_8UC1);
+        for (const cv::Mat& support : prepared_input.group_valid_warp) {
+            cv::bitwise_or(prepared_input.group_union_valid, support, prepared_input.group_union_valid);
+        }
+    } else {
+        const FrameImage frame = load_frame(raw.path);
+        prepared_input.path = frame.path;
+        prepared_input.rgb_u8 = frame.rgb_u8;
+        prepared_input.rgb_f = frame.rgb_f;
+        prepared_input.match_rgb_u8 = frame.match_rgb_u8;
+        prepared_input.match_rgb_f = frame.match_rgb_f;
+        prepared_input.support = frame.support;
+    }
+    prepared_input.read_ms = read_timer.ms();
+    prepared_input.image_names.push_back(prepared_input.path.filename().string());
+    return prepared_input;
 }
 
 }  // namespace omnivggt::observer

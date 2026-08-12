@@ -105,10 +105,29 @@ struct CandidateCommit {
     bool has_patch = false;
 };
 
+struct PreparedInput {
+    RawFrame raw;
+    FrameSeq frame_seq = 0;
+    double read_ms = 0.0;
+    std::vector<std::string> image_names;
+    std::filesystem::path path;
+    cv::Mat rgb_u8;
+    cv::Mat rgb_f;
+    cv::Mat match_rgb_u8;
+    cv::Mat match_rgb_f;
+    cv::Mat support;
+    bool has_group = false;
+    std::vector<cv::Mat> group_warped_rgb_f;
+    std::vector<cv::Mat> group_valid_warp;
+    cv::Mat group_fused_rgb_f;
+    cv::Mat group_union_valid;
+};
+
 class InferenceEngine {
 public:
     explicit InferenceEngine(InferenceOptions options);
 
+    CandidateCommit process_prepared(const PreparedInput& prepared, const CanvasState& state);
     CandidateCommit process(const RawFrame& raw, const CanvasState& state);
 
 private:
@@ -235,6 +254,30 @@ private:
         const PreparedGroup* group,
         double read_ms);
     CandidateCommit process_group(const RawFrame& raw, const CanvasState& state);
+};
+
+class FramePreprocessor {
+public:
+    explicit FramePreprocessor(InferenceOptions options);
+
+    PreparedInput prepare(const RawFrame& raw) const;
+
+private:
+    InferenceOptions options_;
+
+    struct FrameImage {
+        std::filesystem::path path;
+        cv::Mat rgb_u8;
+        cv::Mat rgb_f;
+        cv::Mat match_rgb_u8;
+        cv::Mat match_rgb_f;
+        cv::Mat support;
+    };
+
+    FrameImage load_frame(const std::filesystem::path& path) const;
+    cv::Mat estimate_pair_homography(const FrameImage& source, const FrameImage& target) const;
+    static cv::Mat gray_u8(const cv::Mat& rgb_u8);
+    static cv::Mat warp_like(const cv::Mat& source, const cv::Mat& homography, cv::Size size, int interpolation);
 };
 
 }  // namespace omnivggt::observer
