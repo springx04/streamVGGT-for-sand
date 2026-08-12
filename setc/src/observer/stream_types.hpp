@@ -87,6 +87,7 @@ struct CandidatePatch {
     std::vector<std::uint32_t> anchor_rgba;
     std::vector<SlotUpdate> updates;
     std::vector<std::uint32_t> observed_slots;
+    std::vector<std::uint32_t> cleared_support_slots;
 };
 
 struct PointCloudDelta {

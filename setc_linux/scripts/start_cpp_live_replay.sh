@@ -18,6 +18,12 @@ SERVER="${SERVER:-${BIN_DIR}/omnivggt_stream_server}"
 VIEWER="${VIEWER:-${BIN_DIR}/omnivggt_live_viewer}"
 MODEL="${MODEL:-${PACKAGE_DIR}/models/omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt}"
 PAIR_MODEL="${PAIR_MODEL:-${PACKAGE_DIR}/models/omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt}"
+GROUP_MODEL="${GROUP_MODEL:-${PACKAGE_DIR}/models/omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt}"
+INPUT_GROUP_SIZE="${INPUT_GROUP_SIZE:-3}"
+INPUT_GROUP_STRIDE="${INPUT_GROUP_STRIDE:-1}"
+GROUP_ANCHOR_INDEX="${GROUP_ANCHOR_INDEX:-1}"
+GROUP_MODEL_WIDTH="${GROUP_MODEL_WIDTH:-406}"
+GROUP_MODEL_HEIGHT="${GROUP_MODEL_HEIGHT:-252}"
 IMAGE_DIR="${IMAGE_DIR:-${PACKAGE_DIR}/data2}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PACKAGE_DIR}/outputs/data2_cpp_linux_live_replay}"
 TARGET_WIDTH="${TARGET_WIDTH:-700}"
@@ -31,7 +37,13 @@ PORT="${PORT:-37651}"
 SERVER_STARTUP_DELAY="${SERVER_STARTUP_DELAY:-7}"
 SERVER_LOG="${SERVER_LOG:-${OUTPUT_DIR}/server.log}"
 
-for required_file in "${SERVER}" "${VIEWER}" "${MODEL}" "${PAIR_MODEL}"; do
+required_files=("${SERVER}" "${VIEWER}")
+if [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
+    required_files+=("${GROUP_MODEL}")
+else
+    required_files+=("${MODEL}" "${PAIR_MODEL}")
+fi
+for required_file in "${required_files[@]}"; do
     if [[ ! -f "${required_file}" ]]; then
         echo "[ERROR] Required file was not found: ${required_file}" >&2
         exit 1
@@ -55,29 +67,46 @@ trap cleanup EXIT INT TERM
 echo "Starting OmniVGGT Linux C++ live replay"
 echo "  dataset: ${IMAGE_DIR}"
 echo "  output:  ${OUTPUT_DIR}"
-echo "  model:   ${MODEL}"
-echo "  pair:    ${PAIR_MODEL}"
+if [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
+    echo "  input:   groups of 3, stride=${INPUT_GROUP_STRIDE}, anchor=${GROUP_ANCHOR_INDEX}"
+    echo "  group:   B=3,S=1 ${GROUP_MODEL_WIDTH}x${GROUP_MODEL_HEIGHT} single-layer fusion"
+else
+    echo "  model:   ${MODEL}"
+    echo "  pair:    ${PAIR_MODEL}"
+fi
 echo "  viewer:  ${VIEWER}"
 echo "  log:     ${SERVER_LOG}"
 
-"${SERVER}" \
-    --model "${MODEL}" \
-    --model-pair "${PAIR_MODEL}" \
-    --pair-letterbox \
-    --image-dir "${IMAGE_DIR}" \
-    --output-dir "${OUTPUT_DIR}" \
-    --target-size "${TARGET_SIZE}" \
-    --target-width "${TARGET_WIDTH}" \
-    --canvas-width "${CANVAS_WIDTH}" \
-    --canvas-height "${CANVAS_HEIGHT}" \
-    --first-model-width "${FIRST_MODEL_WIDTH}" \
-    --first-model-height "${FIRST_MODEL_HEIGHT}" \
-    --device cuda \
-    --dtype bf16 \
-    --min_conf 0.0 \
-    --queue-capacity "${QUEUE_CAPACITY}" \
-    --port "${PORT}" \
-    --no-save-debug >"${SERVER_LOG}" 2>&1 &
+server_args=(
+    --image-dir "${IMAGE_DIR}"
+    --output-dir "${OUTPUT_DIR}"
+    --target-size "${TARGET_SIZE}"
+    --target-width "${TARGET_WIDTH}"
+    --canvas-width "${CANVAS_WIDTH}"
+    --canvas-height "${CANVAS_HEIGHT}"
+    --first-model-width "${FIRST_MODEL_WIDTH}"
+    --first-model-height "${FIRST_MODEL_HEIGHT}"
+    --device cuda
+    --dtype bf16
+    --min_conf 0.0
+    --queue-capacity "${QUEUE_CAPACITY}"
+    --port "${PORT}"
+    --no-save-debug
+)
+if [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
+    server_args+=(
+        --model-group3 "${GROUP_MODEL}"
+        --input-group-size 3
+        --input-group-stride "${INPUT_GROUP_STRIDE}"
+        --group-anchor-index "${GROUP_ANCHOR_INDEX}"
+        --group-model-width "${GROUP_MODEL_WIDTH}"
+        --group-model-height "${GROUP_MODEL_HEIGHT}"
+    )
+else
+    server_args+=(--model "${MODEL}" --model-pair "${PAIR_MODEL}" --pair-letterbox)
+fi
+
+"${SERVER}" "${server_args[@]}" >"${SERVER_LOG}" 2>&1 &
 server_pid=$!
 
 sleep "${SERVER_STARTUP_DELAY}"

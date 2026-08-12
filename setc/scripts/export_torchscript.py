@@ -160,6 +160,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=repo_root / "setc" / "artifacts" / "omnivggt_s2_518x518.pt",
     )
     parser.add_argument("--num-images", type=int, default=2)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Independent batch size B. Use 3 with --num-images 1 for grouped C++ inference.",
+    )
     parser.add_argument("--height", type=int, default=518)
     parser.add_argument("--width", type=int, default=518)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
@@ -206,6 +212,8 @@ def main() -> None:
 
     if args.num_images <= 0:
         raise ValueError("--num-images must be positive")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
     if args.height <= 0 or args.width <= 0:
         raise ValueError("--height and --width must be positive")
     if args.height % 14 != 0 or args.width % 14 != 0:
@@ -252,7 +260,7 @@ def main() -> None:
         camera_indices=camera_indices,
     ).eval()
 
-    shape = (1, args.num_images, 3, args.height, args.width)
+    shape = (args.batch_size, args.num_images, 3, args.height, args.width)
     images = torch.zeros(shape, device=device, dtype=dtype)
     # Match the live Python backend: images/depth/mask use the selected model
     # dtype, while camera tensors stay FP32 even when the model runs in BF16.
@@ -260,10 +268,10 @@ def main() -> None:
     # live Python stream supplies identity extrinsics/intrinsics, and the C++
     # runtime does the same; tracing with all-zero cameras silently bakes a
     # different camera branch into the artifact.
-    extrinsics = torch.eye(4, device=device, dtype=torch.float32)[:3].reshape(1, 1, 3, 4).repeat(1, args.num_images, 1, 1)
-    intrinsics = torch.eye(3, device=device, dtype=torch.float32).reshape(1, 1, 3, 3).repeat(1, args.num_images, 1, 1)
-    depth = torch.zeros((1, args.num_images, args.height, args.width, 1), device=device, dtype=dtype)
-    mask = torch.zeros((1, args.num_images, args.height, args.width), device=device, dtype=dtype)
+    extrinsics = torch.eye(4, device=device, dtype=torch.float32)[:3].reshape(1, 1, 3, 4).repeat(args.batch_size, args.num_images, 1, 1)
+    intrinsics = torch.eye(3, device=device, dtype=torch.float32).reshape(1, 1, 3, 3).repeat(args.batch_size, args.num_images, 1, 1)
+    depth = torch.zeros((args.batch_size, args.num_images, args.height, args.width, 1), device=device, dtype=dtype)
+    mask = torch.zeros((args.batch_size, args.num_images, args.height, args.width), device=device, dtype=dtype)
 
     print(
         "Tracing fixed signature: "
@@ -306,7 +314,8 @@ def main() -> None:
         "checkpoint": str(checkpoint),
         "artifact": str(args.output.resolve()),
         "num_images": args.num_images,
-        "input_shape": [1, args.num_images, 3, args.height, args.width],
+        "batch_size": args.batch_size,
+        "input_shape": [args.batch_size, args.num_images, 3, args.height, args.width],
         "height": args.height,
         "width": args.width,
         "dtype": args.dtype,

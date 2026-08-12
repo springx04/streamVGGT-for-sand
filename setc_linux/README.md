@@ -23,7 +23,8 @@ setc_linux/
 ├── data2/                                    # 使用者自行放入 PNG/JPG 图片
 ├── models/                                   # 使用者自行放入 .pt 和可选 checkpoint
 │   ├── omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt
-│   └── omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt
+│   ├── omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt
+│   └── omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt
 ├── outputs/                                  # 运行时自动生成
 └── build_live_observer/                      # 编译时自动生成
 ```
@@ -32,6 +33,7 @@ setc_linux/
 
 - `models/omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt`
 - `models/omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt`
+- 三图默认还需要 `models/omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt`
 
 默认输入目录是 `data2/`，默认输出目录是 `outputs/data2_cpp_linux_live_replay/`。模型和数据也可以完全放在目录外：
 
@@ -143,6 +145,18 @@ python3 scripts/export_torchscript.py \
   --observer-depth-only --no-freeze
 ```
 
+三图 B=3,S=1 模型：
+
+```bash
+python3 scripts/export_torchscript.py \
+  --model-source /path/to/OmniVGGT-Python \
+  --checkpoint models/OmniVGGT.safetensors \
+  --output models/omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt \
+  --batch-size 3 --num-images 1 --height 252 --width 406 \
+  --dtype bfloat16 --autocast-dtype bfloat16 \
+  --observer-depth-only --no-freeze
+```
+
 动态 pair bucket 可使用：
 
 ```bash
@@ -160,7 +174,20 @@ python3 scripts/export_pair_bucket_family.py \
 bash scripts/start_cpp_live_replay.sh
 ```
 
-默认配置与 Windows C++ 流程保持一致：700x700、700x434 首帧、CUDA BF16、队列容量 1024、端口 37651。服务器日志写入输出目录的 `server.log`。关闭 viewer 后，启动脚本只会清理它自己启动的 server PID，不会按进程名结束其他任务。
+默认配置与 Windows C++ 流程保持一致：三图滑窗 `123`、`234`、…，组内锚点为中图，
+ 一次 `B=3,S=1` CUDA BF16 forward；几何以锚图 support 为所有权掩码，侧图只在锚图
+ 范围内补充可信深度，组模式不复用单图 RGB bridge，避免旋转组边缘的长方形色缝，导出只填充封闭内部孔洞。组模型输入 `406x252`，700x700 对齐画布、队列
+容量 1024、端口 37651。服务器日志写入输出目录的 `server.log`。关闭 viewer 后，
+启动脚本只会清理它自己启动的 server PID，不会按进程名结束其他任务。
+
+若要兼容原有单图/双图路径，可设置：
+
+```bash
+INPUT_GROUP_SIZE=1 bash scripts/start_cpp_live_replay.sh
+```
+
+三图运行目录中的 `input_groups.csv` 记录每个滑窗，`metrics.csv` 中的
+`forward_calls=1`、`forward_batch_size=3`、`forward_sequence_size=1` 是速度和形状验收字段。
 
 如果 LibTorch 或 CUDA 动态库不在系统搜索路径，启动脚本会自动把 `${LIBTORCH}/lib` 和 `${CUDA_HOME}/lib64`（如果存在）加入 `LD_LIBRARY_PATH`：
 

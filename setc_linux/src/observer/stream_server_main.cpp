@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -23,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -38,7 +40,7 @@ void on_signal(int) { g_stop_requested.store(true); }
 struct ServerArgs {
     InferenceOptions inference;
     fs::path image_dir;
-    fs::path output_dir = "observer_output";
+    fs::path output_dir = "setc/observer_output";
     fs::path run_dir;
     std::uint64_t num_images = 0;
     std::uint16_t port = 37651;
@@ -47,6 +49,9 @@ struct ServerArgs {
     int poll_ms = 50;
     bool once = false;
     bool resume = false;
+    std::size_t input_group_size = 1U;
+    std::size_t input_group_stride = 1U;
+    std::size_t group_anchor_index = 1U;
 };
 
 std::string require_value(int& index, const int argc, char** argv, const std::string& key) {
@@ -64,6 +69,11 @@ void usage() {
         << "  --model-pair model.pt  Two-frame TorchScript graph for later frames.\n"
         << "  --model-pair-dir DIR  Dynamic two-frame bucket artifacts (WxH in filename).\n"
         << "  --pair-letterbox      Use one pair graph with aspect-preserving edge padding.\n"
+        << "  --model-group3 model.pt  Independent B=3,S=1 three-image graph.\n"
+        << "  --input-group-size N  Logical input group size (1 or 3), default 1.\n"
+        << "  --input-group-stride N Sliding group stride, default 1.\n"
+        << "  --group-anchor-index N Anchor within a three-image group, default 1.\n"
+        << "  --group-model-width W --group-model-height H  B=3,S=1 graph dimensions.\n"
         << "  --output_dir DIR       Parent directory for independent run history.\n"
         << "  --run_dir DIR          Explicit run directory; use --resume to reopen it.\n"
         << "  --num_images N         Process at most N images (0 means watch continuously).\n"
@@ -94,6 +104,8 @@ ServerArgs parse_args(const int argc, char** argv) {
         const std::string key = argv[i];
         if (key == "--model") {
             args.inference.model = require_value(i, argc, argv, key);
+        } else if (key == "--model-group3" || key == "--model_group3") {
+            args.inference.group_model = require_value(i, argc, argv, key);
         } else if (key == "--model-pair" || key == "--model_pair") {
             args.inference.pair_model = require_value(i, argc, argv, key);
         } else if (key == "--model-pair-dir" || key == "--model_pair_dir") {
@@ -108,6 +120,16 @@ ServerArgs parse_args(const int argc, char** argv) {
             args.run_dir = require_value(i, argc, argv, key);
         } else if (key == "--num_images") {
             args.num_images = std::stoull(require_value(i, argc, argv, key));
+        } else if (key == "--input-group-size" || key == "--input_group_size") {
+            args.input_group_size = static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, key)));
+        } else if (key == "--input-group-stride" || key == "--input_group_stride") {
+            args.input_group_stride = static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, key)));
+        } else if (key == "--group-anchor-index" || key == "--group_anchor_index") {
+            args.group_anchor_index = static_cast<std::size_t>(std::stoull(require_value(i, argc, argv, key)));
+        } else if (key == "--group-model-width" || key == "--group_model_width") {
+            args.inference.group_width = std::stoi(require_value(i, argc, argv, key));
+        } else if (key == "--group-model-height" || key == "--group_model_height") {
+            args.inference.group_height = std::stoi(require_value(i, argc, argv, key));
         } else if (key == "--port") {
             args.port = static_cast<std::uint16_t>(std::stoul(require_value(i, argc, argv, key)));
         } else if (key == "--queue_capacity" || key == "--queue-capacity") {
@@ -157,9 +179,37 @@ ServerArgs parse_args(const int argc, char** argv) {
             throw std::runtime_error("unknown argument: " + key);
         }
     }
-    if (args.inference.model.empty() || args.image_dir.empty()) {
+    if (args.image_dir.empty()) {
         usage();
-        throw std::runtime_error("--model and --image_dir are required");
+        throw std::runtime_error("--image_dir is required");
+    }
+    if (args.input_group_size != 1U && args.input_group_size != 3U) {
+        throw std::runtime_error("--input-group-size must be 1 or 3");
+    }
+    if (args.input_group_stride == 0U || args.input_group_stride > args.input_group_size) {
+        throw std::runtime_error("--input-group-stride must be in [1, input-group-size]");
+    }
+    if (args.input_group_size == 3U) {
+        if (args.inference.group_model.empty()) {
+            throw std::runtime_error("--model-group3 is required when --input-group-size=3");
+        }
+        if (!fs::is_regular_file(args.inference.group_model)) {
+            throw std::runtime_error("--model-group3 is not a regular file: "
+                + args.inference.group_model);
+        }
+        if (args.group_anchor_index >= args.input_group_size) {
+            throw std::runtime_error("--group-anchor-index must be 0, 1 or 2");
+        }
+        if (args.inference.group_width <= 0 || args.inference.group_height <= 0
+            || args.inference.group_width % 14 != 0 || args.inference.group_height % 14 != 0) {
+            throw std::runtime_error("group model dimensions must be positive multiples of 14");
+        }
+        args.inference.group_mode = true;
+    } else if (args.inference.model.empty()) {
+        throw std::runtime_error("--model is required when --input-group-size=1");
+    } else {
+        args.group_anchor_index = 0U;
+        args.inference.group_mode = false;
     }
     if (!fs::is_directory(args.image_dir)) {
         throw std::runtime_error("--image_dir is not a directory: " + args.image_dir.string());
@@ -220,6 +270,14 @@ class StreamRuntime {
 public:
     StreamRuntime(const ServerArgs& args, const fs::path& run_dir)
         : args_(args), run_dir_(run_dir) {
+        group_manifest_.open(run_dir_ / "input_groups.csv", std::ios::out | std::ios::app);
+        if (!group_manifest_) {
+            throw std::runtime_error("failed to open input_groups.csv under " + run_dir_.string());
+        }
+        if (group_manifest_.tellp() == std::streampos(0)) {
+            group_manifest_ << "frame_seq,group_key,source_seq_0,image_0,source_seq_1,image_1,"
+                "source_seq_2,image_2,anchor_index,status\n";
+        }
         if (args.resume) {
             store_ = VersionStore::open_existing(run_dir_);
             if (store_.width() != args.inference.canvas_width || store_.height() != args.inference.canvas_height) {
@@ -234,7 +292,9 @@ public:
                 "frame_seq,image,total_ms,read_ms,align2d_ms,diff_ms,model_ms,depth_align_ms,patch_ms,"
                 "changed_ratio,changed_point_count,valid_point_count,homography_inliers,homography_error_px,"
                 "roi_width,roi_height,model_input_width,model_input_height,"
-                "photometric_changed_ratio,support_changed_ratio,skipped_model,fallback");
+                "photometric_changed_ratio,support_changed_ratio,skipped_model,fallback,"
+                "group_size,group_stride,group_anchor_index,forward_calls,forward_batch_size,"
+                "forward_sequence_size,group_fused_sources,group_rejected_sources,group_max_depth_residual");
         }
     }
 
@@ -272,6 +332,49 @@ public:
         return names;
     }
 
+    std::unordered_set<std::string> completed_group_keys() {
+        std::lock_guard<std::mutex> lock(group_manifest_mutex_);
+        group_manifest_.flush();
+        std::ifstream input(run_dir_ / "input_groups.csv");
+        std::unordered_map<std::string, std::string> latest_status;
+        std::string line;
+        if (!std::getline(input, line)) {
+            return {};
+        }
+        while (std::getline(input, line)) {
+            std::size_t cursor = 0;
+            std::string ignored_frame;
+            std::string group_key;
+            if (!read_csv_field(line, cursor, ignored_frame)
+                || !read_csv_field(line, cursor, group_key)) {
+                continue;
+            }
+            const std::size_t status_separator = line.rfind(',');
+            if (status_separator == std::string::npos
+                || status_separator + 1U >= line.size()) {
+                continue;
+            }
+            latest_status[group_key] = line.substr(status_separator + 1U);
+        }
+        std::unordered_set<std::string> completed;
+        for (const auto& [group_key, status] : latest_status) {
+            if (status == "Committed" || status == "NoChange") {
+                completed.insert(group_key);
+            }
+        }
+        return completed;
+    }
+
+    bool has_group_manifest_entries() {
+        std::lock_guard<std::mutex> lock(group_manifest_mutex_);
+        group_manifest_.flush();
+        std::ifstream input(run_dir_ / "input_groups.csv");
+        std::string line;
+        return static_cast<bool>(std::getline(input, line))
+            && static_cast<bool>(std::getline(input, line))
+            && !line.empty();
+    }
+
     ReplayBundle replay(const FrameSeq frame_seq) const {
         std::lock_guard<std::mutex> lock(history_mutex_);
         return store_.build_replay(frame_seq);
@@ -283,6 +386,7 @@ public:
     }
 
     void note_received(const RawFrame& raw) {
+        append_group_manifest(raw, "Received");
         const CommitVersion version = current_version();
         live_head_frame_.store(std::max(live_head_frame_.load(), raw.frame_seq));
         FrameRecord record;
@@ -296,6 +400,7 @@ public:
     }
 
     void record_coalesced(const RawFrame& raw) {
+        append_group_manifest(raw, "Coalesced");
         FrameRecord record;
         record.frame_seq = raw.frame_seq;
         record.base_version = current_version();
@@ -312,6 +417,7 @@ public:
     }
 
     void record_failed(const RawFrame& raw, const std::string& message) {
+        append_group_manifest(raw, "Failed");
         FrameRecord record;
         record.frame_seq = raw.frame_seq;
         record.base_version = current_version();
@@ -330,6 +436,8 @@ public:
 
     void commit(CandidateCommit candidate) {
         if (!candidate.has_patch) {
+            append_group_status(candidate.frame.frame_seq,
+                candidate.frame.status == FrameStatus::NoChange ? "NoChange" : "Committed");
             commit_no_change(candidate);
             return;
         }
@@ -346,7 +454,7 @@ public:
                 committed_state = state_;
             }
         } catch (const std::exception& error) {
-            RawFrame raw{candidate.frame.frame_seq, candidate.frame.image_name};
+            RawFrame raw = pending_group_or_default(candidate.frame.frame_seq, candidate.frame.image_name);
             record_failed(raw, error.what());
             return;
         }
@@ -355,6 +463,7 @@ public:
             candidate.frame.status = FrameStatus::NoChange;
             candidate.frame.base_version = delta.from_version;
             candidate.frame.commit_version = delta.from_version;
+            append_group_status(candidate.frame.frame_seq, "NoChange");
             commit_no_change(candidate);
             return;
         }
@@ -364,6 +473,7 @@ public:
         candidate.frame.commit_version = delta.to_version;
         candidate.frame.changed_point_count = static_cast<std::uint32_t>(delta.changes.size());
         candidate.frame.valid_point_count = delta.valid_point_count;
+        append_group_status(candidate.frame.frame_seq, "Committed");
         std::uint64_t delta_offset = 0;
         {
             std::lock_guard<std::mutex> lock(history_mutex_);
@@ -414,6 +524,93 @@ public:
     }
 
 private:
+    static std::string csv_escape(const std::string& value) {
+        std::string escaped = value;
+        std::size_t position = 0;
+        while ((position = escaped.find('"', position)) != std::string::npos) {
+            escaped.insert(position, 1, '"');
+            position += 2;
+        }
+        return "\"" + escaped + "\"";
+    }
+
+    static bool read_csv_field(
+        const std::string& line,
+        std::size_t& cursor,
+        std::string& value) {
+        if (cursor >= line.size()) {
+            return false;
+        }
+        if (line[cursor] != '"') {
+            const std::size_t end = line.find(',', cursor);
+            value = line.substr(cursor, end == std::string::npos ? end : end - cursor);
+            cursor = end == std::string::npos ? line.size() : end + 1U;
+            return true;
+        }
+        ++cursor;
+        value.clear();
+        while (cursor < line.size()) {
+            if (line[cursor] == '"') {
+                if (cursor + 1U < line.size() && line[cursor + 1U] == '"') {
+                    value.push_back('"');
+                    cursor += 2U;
+                    continue;
+                }
+                ++cursor;
+                if (cursor < line.size() && line[cursor] == ',') {
+                    ++cursor;
+                }
+                return true;
+            }
+            value.push_back(line[cursor++]);
+        }
+        return false;
+    }
+
+    void append_group_manifest(const RawFrame& raw, const char* status) {
+        if (raw.group_paths.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(group_manifest_mutex_);
+        group_manifest_ << raw.frame_seq << ',' << csv_escape(raw.group_key);
+        for (std::size_t index = 0; index < 3U; ++index) {
+            const std::uint64_t source_seq = index < raw.group_source_seqs.size()
+                ? raw.group_source_seqs[index] : static_cast<std::uint64_t>(index);
+            group_manifest_ << ',' << source_seq << ','
+                << csv_escape(index < raw.group_paths.size()
+                    ? raw.group_paths[index].filename().string() : std::string());
+        }
+        group_manifest_ << ',' << raw.group_anchor_index << ',' << status << '\n';
+        group_manifest_.flush();
+        if (std::string(status) == "Received") {
+            pending_groups_[raw.frame_seq] = raw;
+        } else {
+            pending_groups_.erase(raw.frame_seq);
+        }
+    }
+
+    RawFrame pending_group_or_default(const FrameSeq frame_seq, const std::string& image_name) {
+        std::lock_guard<std::mutex> lock(group_manifest_mutex_);
+        const auto found = pending_groups_.find(frame_seq);
+        if (found != pending_groups_.end()) {
+            return found->second;
+        }
+        return RawFrame{frame_seq, image_name};
+    }
+
+    void append_group_status(const FrameSeq frame_seq, const char* status) {
+        RawFrame raw;
+        {
+            std::lock_guard<std::mutex> lock(group_manifest_mutex_);
+            const auto found = pending_groups_.find(frame_seq);
+            if (found == pending_groups_.end()) {
+                return;
+            }
+            raw = found->second;
+        }
+        append_group_manifest(raw, status);
+    }
+
     void commit_no_change(CandidateCommit& candidate) {
         const CommitVersion version = current_version();
         candidate.frame.base_version = version;
@@ -456,6 +653,9 @@ private:
     std::atomic<FrameSeq> live_head_frame_{0};
     std::unordered_set<FrameSeq> handled_frames_;
     std::vector<std::shared_ptr<ClientSession>> clients_;
+    mutable std::mutex group_manifest_mutex_;
+    std::ofstream group_manifest_;
+    std::unordered_map<FrameSeq, RawFrame> pending_groups_;
 };
 
 class ClientSession : public std::enable_shared_from_this<ClientSession> {
@@ -696,6 +896,11 @@ int main(int argc, char** argv) {
             if (!fs::is_directory(run_dir)) {
                 throw std::runtime_error("cannot resume missing run directory: " + run_dir.string());
             }
+            if (args.input_group_size == 3U
+                && !fs::is_regular_file(run_dir / "input_groups.csv")) {
+                throw std::runtime_error(
+                    "cannot resume three-image run without input_groups.csv: " + run_dir.string());
+            }
         } else if (fs::exists(run_dir)) {
             throw std::runtime_error("run directory already exists; pass --resume to recover it: " + run_dir.string());
         }
@@ -703,7 +908,13 @@ int main(int argc, char** argv) {
         fs::create_directories(run_dir);
         ServerArgs configured_args = args;
         configured_args.inference.debug_dir = run_dir / "debug";
+        configured_args.inference.group_stride = static_cast<int>(args.input_group_stride);
         StreamRuntime runtime(configured_args, run_dir);
+        if (args.resume && args.input_group_size == 3U
+            && !runtime.has_group_manifest_entries()) {
+            throw std::runtime_error(
+                "cannot resume a three-image run from an empty group manifest: " + run_dir.string());
+        }
         SocketRuntime socket_runtime;
         TcpListener listener;
         listener.listen_on(args.port);
@@ -722,10 +933,15 @@ int main(int argc, char** argv) {
         source_options.queue_capacity = args.queue_capacity;
         source_options.poll_ms = args.poll_ms;
         source_options.max_frames = args.num_images;
+        source_options.group_size = args.input_group_size;
+        source_options.group_stride = args.input_group_stride;
+        source_options.group_anchor_index = args.group_anchor_index;
         source_options.once = args.once;
         source_options.start_frame_seq = args.resume ? runtime.next_frame_sequence() : 0U;
-        if (args.resume) {
+        if (args.resume && args.input_group_size == 1U) {
             source_options.skip_image_names = runtime.completed_image_names();
+        } else if (args.resume && args.input_group_size == 3U) {
+            source_options.skip_group_keys = runtime.completed_group_keys();
         }
         DirectoryFrameSource source(source_options);
 

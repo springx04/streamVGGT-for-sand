@@ -248,6 +248,15 @@ PointCloudDelta commit_patch(CanvasState& state, const CandidatePatch& patch) {
             state.support[slot_id] = after;
         }
     }
+    for (const std::uint32_t slot_id : patch.cleared_support_slots) {
+        ensure_slot(state, slot_id);
+        const std::uint8_t before = state.support[slot_id];
+        const std::uint8_t after = 0U;
+        if (before != after) {
+            delta.support_changes.push_back(SupportDelta{slot_id, before, after});
+            state.support[slot_id] = after;
+        }
+    }
     (void)observed;
 
     if (delta.changes.empty() && delta.support_changes.empty() && !delta.initializes_anchor) {
