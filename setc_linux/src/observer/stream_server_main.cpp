@@ -190,26 +190,35 @@ ServerArgs parse_args(const int argc, char** argv) {
         throw std::runtime_error("--input-group-stride must be in [1, input-group-size]");
     }
     if (args.input_group_size == 3U) {
-        if (args.inference.group_model.empty()) {
-            throw std::runtime_error("--model-group3 is required when --input-group-size=3");
-        }
-        if (!fs::is_regular_file(args.inference.group_model)) {
-            throw std::runtime_error("--model-group3 is not a regular file: "
-                + args.inference.group_model);
-        }
         if (args.group_anchor_index >= args.input_group_size) {
             throw std::runtime_error("--group-anchor-index must be 0, 1 or 2");
         }
-        if (args.inference.group_width <= 0 || args.inference.group_height <= 0
+        if (args.inference.group_model.empty()) {
+            if (args.inference.model.empty()) {
+                throw std::runtime_error("--model is required for three-image observation mode");
+            }
+            if (!args.inference.pair_model.empty() && !fs::is_regular_file(args.inference.pair_model)) {
+                throw std::runtime_error("--model-pair is not a regular file: "
+                    + args.inference.pair_model);
+            }
+            args.inference.group_mode = false;
+            args.inference.group_observation_mode = true;
+        } else if (!fs::is_regular_file(args.inference.group_model)) {
+            throw std::runtime_error("--model-group3 is not a regular file: "
+                + args.inference.group_model);
+        } else if (args.inference.group_width <= 0 || args.inference.group_height <= 0
             || args.inference.group_width % 14 != 0 || args.inference.group_height % 14 != 0) {
             throw std::runtime_error("group model dimensions must be positive multiples of 14");
+        } else {
+            args.inference.group_mode = true;
+            args.inference.group_observation_mode = false;
         }
-        args.inference.group_mode = true;
     } else if (args.inference.model.empty()) {
         throw std::runtime_error("--model is required when --input-group-size=1");
     } else {
         args.group_anchor_index = 0U;
         args.inference.group_mode = false;
+        args.inference.group_observation_mode = false;
     }
     if (!fs::is_directory(args.image_dir)) {
         throw std::runtime_error("--image_dir is not a directory: " + args.image_dir.string());
@@ -926,6 +935,7 @@ int main(int argc, char** argv) {
         std::signal(SIGTERM, on_signal);
 
         BoundedQueue<RawFrame> frame_queue(args.queue_capacity);
+        BoundedQueue<PreparedInput> prepared_queue(args.queue_capacity);
         BoundedQueue<CandidateCommit> commit_queue(args.queue_capacity + 2U);
 
         DirectorySourceOptions source_options;
@@ -960,6 +970,31 @@ int main(int argc, char** argv) {
             }
         });
 
+        std::thread prepare_thread([&] {
+            try {
+                FramePreprocessor preprocessor(configured_args.inference);
+                while (true) {
+                    const std::optional<RawFrame> raw = frame_queue.pop();
+                    if (!raw.has_value()) {
+                        break;
+                    }
+                    try {
+                        PreparedInput prepared = preprocessor.prepare(*raw);
+                        if (!prepared_queue.push_wait(std::move(prepared))) {
+                            break;
+                        }
+                    } catch (const std::exception& error) {
+                        runtime.record_failed(*raw, error.what());
+                    }
+                }
+            } catch (const std::exception& error) {
+                std::cerr << "preprocess worker: " << error.what() << "\n";
+                stop_requested.store(true);
+                frame_queue.close();
+            }
+            prepared_queue.close();
+        });
+
         std::thread inference_thread([&] {
             try {
                 // LibTorch and the CUDA context are owned by this worker only.
@@ -968,26 +1003,27 @@ int main(int argc, char** argv) {
                 // In --once/--num_images mode the queue may be closed while it
                 // still contains the final frame.
                 while (true) {
-                    const std::optional<RawFrame> raw = frame_queue.pop();
-                    if (!raw.has_value()) {
+                    const std::optional<PreparedInput> prepared = prepared_queue.pop();
+                    if (!prepared.has_value()) {
                         break;
                     }
                     try {
                         const CanvasState state = runtime.snapshot();
-                        CandidateCommit candidate = engine.process(*raw, state);
+                        CandidateCommit candidate = engine.process_prepared(*prepared, state);
                         const FrameSeq frame_seq = candidate.frame.frame_seq;
                         if (!commit_queue.push_wait(std::move(candidate))) {
                             break;
                         }
                         runtime.wait_until_frame_handled(frame_seq);
                     } catch (const std::exception& error) {
-                        runtime.record_failed(*raw, error.what());
+                        runtime.record_failed(prepared->raw, error.what());
                     }
                 }
             } catch (const std::exception& error) {
                 std::cerr << "inference worker: " << error.what() << "\n";
                 stop_requested.store(true);
                 frame_queue.close();
+                prepared_queue.close();
             }
             commit_queue.close();
         });
@@ -1007,6 +1043,7 @@ int main(int argc, char** argv) {
 
         if (args.once) {
             source_thread.join();
+            prepare_thread.join();
             inference_thread.join();
             commit_thread.join();
         } else {
@@ -1015,8 +1052,10 @@ int main(int argc, char** argv) {
             }
             stop_requested.store(true);
             frame_queue.close();
+            prepared_queue.close();
             commit_queue.close();
             source_thread.join();
+            prepare_thread.join();
             inference_thread.join();
             commit_thread.join();
         }
