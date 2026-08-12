@@ -3010,6 +3010,8 @@ CandidateCommit InferenceEngine::process_impl(
         cv::Mat group_support_change;
         cv::bitwise_not(canvas_support, group_support_change);
         cv::bitwise_and(anchor_valid, group_support_change, group_support_change);
+        group_support_change = dilate_mask(group_support_change, options_.dilate_ksize);
+        cv::bitwise_and(group_support_change, anchor_valid, group_support_change);
         if (state.initialized) {
             cv::bitwise_or(support_change, group_support_change, support_change);
         } else {
@@ -3560,14 +3562,15 @@ CandidateCommit InferenceEngine::process_impl(
     cv::Mat color_bridge_mask = cv::Mat::zeros(update_mask.size(), CV_8UC1);
     cv::Mat color_bridge_mix = cv::Mat::zeros(update_mask.size(), CV_32FC1);
     cv::Mat canvas_rgb;
-    if (prepared_group == nullptr && state.initialized && cv::countNonZero(support_change) > 0
+    if (state.initialized && cv::countNonZero(support_change) > 0
         && cv::countNonZero(anchor_ring) > 0) {
         canvas_rgb = !live_rgb_float_.empty()
             && live_rgb_float_.size() == cv::Size(state.width, state.height)
             ? live_rgb_float_
             : state_rgb_float(state);
+        const int bridge_extent = prepared_group != nullptr ? 7 : 65;
         const cv::Mat bridge_kernel = cv::getStructuringElement(
-            cv::MORPH_ELLIPSE, cv::Size(65, 65));
+            cv::MORPH_ELLIPSE, cv::Size(bridge_extent, bridge_extent));
         cv::Mat expanded_support;
         cv::dilate(support_change, expanded_support, bridge_kernel);
         cv::bitwise_and(expanded_support, canvas_valid, expanded_support);
@@ -3584,8 +3587,9 @@ CandidateCommit InferenceEngine::process_impl(
         for (int y = 0; y < color_bridge_mask.rows; ++y) {
             for (int x = 0; x < color_bridge_mask.cols; ++x) {
                 if (color_bridge_mask.at<std::uint8_t>(y, x) != 0U) {
+                    const float mix_radius = prepared_group != nullptr ? 3.0f : 8.0f;
                     color_bridge_mix.at<float>(y, x) = std::clamp(
-                        distance_to_ring.at<float>(y, x) / 8.0f, 0.0f, 1.0f);
+                        distance_to_ring.at<float>(y, x) / mix_radius, 0.0f, 1.0f);
                 }
             }
         }
@@ -3634,7 +3638,7 @@ CandidateCommit InferenceEngine::process_impl(
     // exposure/view.  It must not use the single-view hard old-overlap blend:
     // that blend turns a narrow rotated support edge into a long rectangle.
     cv::Mat fused_rgb;
-    fused_rgb = state.initialized && prepared_group == nullptr
+    fused_rgb = state.initialized
         ? anchor_texture_transfer(
             warped_rgb_f,
             canvas_rgb,
@@ -4112,6 +4116,9 @@ CandidateCommit InferenceEngine::process_impl(
     const cv::Mat continuity_mask = [&]() {
         cv::Mat mask;
         cv::bitwise_and(update_mask, support_change, mask);
+        if (prepared_group != nullptr && !group_gap_fill.empty()) {
+            cv::bitwise_or(mask, group_gap_fill, mask);
+        }
         return mask;
     }();
     if (state.initialized && cv::countNonZero(continuity_mask) > 0) {
