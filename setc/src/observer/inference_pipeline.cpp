@@ -4401,7 +4401,7 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
     prepared_input.raw = raw;
     prepared_input.frame_seq = raw.frame_seq;
     Timer read_timer;
-    if (options_.group_mode && raw.group_paths.size() == 3U) {
+    if (raw.group_paths.size() == 3U) {
         std::vector<FrameImage> frames;
         frames.reserve(3U);
         for (const auto& path : raw.group_paths) {
@@ -4415,7 +4415,6 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
         prepared_input.match_rgb_u8 = anchor.match_rgb_u8;
         prepared_input.match_rgb_f = anchor.match_rgb_f;
         prepared_input.support = anchor.support;
-        prepared_input.has_group = true;
         prepared_input.group_warped_rgb_f.reserve(3U);
         prepared_input.group_valid_warp.reserve(3U);
         const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
@@ -4457,12 +4456,30 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
             prepared_input.group_warped_rgb_f.push_back(std::move(aligned_rgb));
             prepared_input.group_valid_warp.push_back(std::move(aligned_support));
         }
-        prepared_input.group_fused_rgb_f =
-            prepared_input.group_warped_rgb_f[static_cast<std::size_t>(anchor_index)].clone();
         prepared_input.group_union_valid = cv::Mat::zeros(
             options_.canvas_height, options_.canvas_width, CV_8UC1);
         for (const cv::Mat& support : prepared_input.group_valid_warp) {
             cv::bitwise_or(prepared_input.group_union_valid, support, prepared_input.group_union_valid);
+        }
+        if (options_.group_mode) {
+            prepared_input.has_group = true;
+            prepared_input.group_fused_rgb_f =
+                prepared_input.group_warped_rgb_f[static_cast<std::size_t>(anchor_index)].clone();
+        } else {
+            prepared_input.has_observation_group = true;
+            // Observation-mode three-image windows must not blend side-view
+            // RGB in image space.  A single 2D homography cannot align
+            // silhouettes and non-planar edge folds from neighbouring views;
+            // feeding that blended RGB to the standard S=2 stream model makes
+            // the model reconstruct the parallax smear as a real bent surface.
+            // Keep the current observation identical to the selected anchor
+            // frame so the downstream change mask, depth alignment and seam
+            // repair remain bit-for-bit comparable to the single-image stream.
+            // Side frames are retained in group_warped_rgb_f/group_valid_warp
+            // for diagnostics and for a future canvas/model-space fusion path.
+            prepared_input.support = anchor.support.clone();
+            prepared_input.rgb_f = anchor.rgb_f.clone();
+            prepared_input.rgb_f.convertTo(prepared_input.rgb_u8, CV_8UC3, 255.0);
         }
     } else {
         const FrameImage frame = load_frame(raw.path);

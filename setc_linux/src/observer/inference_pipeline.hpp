@@ -23,6 +23,7 @@ struct InferenceOptions {
     int group_height = 252;
     int group_stride = 1;
     bool group_mode = false;
+    bool group_observation_mode = false;
     // Python uses one image for the anchor frame and a two-image
     // anchor/current window for every subsequent frame.  Keep both exported
     // TorchScript signatures available instead of silently reusing the
@@ -121,6 +122,7 @@ struct PreparedInput {
     std::vector<cv::Mat> group_valid_warp;
     cv::Mat group_fused_rgb_f;
     cv::Mat group_union_valid;
+    bool has_observation_group = false;
 };
 
 class InferenceEngine {
