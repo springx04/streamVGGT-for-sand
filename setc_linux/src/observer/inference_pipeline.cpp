@@ -2199,25 +2199,13 @@ InferenceEngine::Prediction InferenceEngine::fuse_group_predictions(
             ++metrics.group_rejected_sources;
             continue;
         }
-        ++metrics.group_fused_sources;
-        for (int y = 0; y < fused.depth.rows; ++y) {
-            for (int x = 0; x < fused.depth.cols; ++x) {
-                if (anchor_valid.at<std::uint8_t>(y, x) != 0U) {
-                    // The anchor owns every overlap pixel.  This is the key
-                    // single-layer rule: side predictions can only fill a
-                    // genuinely invalid anchor pixel after calibration.
-                    continue;
-                }
-                const float side = source.depth.at<float>(y, x);
-                const float confidence = source.confidence.at<float>(y, x);
-                if (std::isfinite(side) && side > 1e-6f
-                    && std::isfinite(confidence)
-                    && confidence >= static_cast<float>(options_.min_conf)) {
-                    fused.depth.at<float>(y, x) = static_cast<float>(scale * side + bias);
-                    fused.confidence.at<float>(y, x) = confidence * 0.75f;
-                }
-            }
-        }
+        // Keep B=3,S=1 as a single forward for throughput, but do not let
+        // side-view predictions write geometry.  Their edge pixels are in a
+        // different local depth frame; filling anchor-invalid silhouettes with
+        // those depths creates the vertical point-cloud sheets that the
+        // single-image stream never produces.  The aligned anchor image is the
+        // sole geometry owner; side views are only used for rejection metrics.
+        ++metrics.group_rejected_sources;
     }
     return fused;
 }
@@ -3470,6 +3458,54 @@ CandidateCommit InferenceEngine::process_impl(
         }());
     result.metrics.depth_align_ms = depth_timer.ms();
 
+    if (prepared_group != nullptr && state.initialized && cv::countNonZero(quality_valid) >= 512) {
+        cv::Mat median_input = aligned_depth.clone();
+        const cv::Mat inverse_quality = [&]() {
+            cv::Mat inverse;
+            cv::bitwise_not(quality_valid, inverse);
+            return inverse;
+        }();
+        median_input.setTo(0.0f, inverse_quality);
+        cv::Mat local_median;
+        cv::medianBlur(median_input, local_median, 5);
+        cv::Mat residual = aligned_depth - local_median;
+        std::vector<float> residual_values;
+        residual_values.reserve(static_cast<std::size_t>(cv::countNonZero(quality_valid)));
+        for (int y = 0; y < quality_valid.rows; ++y) {
+            for (int x = 0; x < quality_valid.cols; ++x) {
+                if (quality_valid.at<std::uint8_t>(y, x) != 0U
+                    && std::isfinite(residual.at<float>(y, x))) {
+                    residual_values.push_back(residual.at<float>(y, x));
+                }
+            }
+        }
+        if (residual_values.size() >= 512U) {
+            const float center = median_value(residual_values);
+            std::vector<float> deviations;
+            deviations.reserve(residual_values.size());
+            for (const float value : residual_values) {
+                deviations.push_back(std::abs(value - center));
+            }
+            const float limit = std::max(
+                0.006f,
+                4.0f * 1.4826f * std::max(median_value(deviations), 1e-6f));
+            cv::Mat neighborhood;
+            cv::Mat quality_f;
+            quality_valid.convertTo(quality_f, CV_32FC1, 1.0 / 255.0);
+            cv::blur(quality_f, neighborhood, cv::Size(5, 5), cv::Point(-1, -1), cv::BORDER_REPLICATE);
+            for (int y = 0; y < quality_valid.rows; ++y) {
+                for (int x = 0; x < quality_valid.cols; ++x) {
+                    if (quality_valid.at<std::uint8_t>(y, x) != 0U
+                        && neighborhood.at<float>(y, x) > 0.6f
+                        && std::abs(residual.at<float>(y, x) - center) > limit) {
+                        quality_valid.at<std::uint8_t>(y, x) = 0U;
+                        model_valid.at<std::uint8_t>(y, x) = 0U;
+                    }
+                }
+            }
+        }
+    }
+
     Timer patch_timer;
     CandidatePatch patch;
     patch.frame_seq = raw.frame_seq;
@@ -3516,38 +3552,6 @@ CandidateCommit InferenceEngine::process_impl(
     // depth/color is an explicit geometry repair and must be committed.
     if (!group_gap_fill.empty()) {
         cv::bitwise_or(update_mask, group_gap_fill, update_mask);
-    }
-
-    cv::Mat group_stale_clear = cv::Mat::zeros(update_mask.size(), CV_8UC1);
-    if (prepared_group != nullptr && state.initialized && result.metrics.fallback.empty()) {
-        cv::Mat current_footprint;
-        cv::bitwise_or(valid_warp, group_gap_fill, current_footprint);
-        const cv::Mat halo_kernel = cv::getStructuringElement(
-            cv::MORPH_ELLIPSE, cv::Size(7, 7));
-        cv::dilate(current_footprint, current_footprint, halo_kernel);
-        cv::Mat outside_current;
-        cv::bitwise_not(current_footprint, outside_current);
-        cv::bitwise_and(canvas_valid, outside_current, group_stale_clear);
-        group_stale_clear = filter_components(group_stale_clear, 256);
-    }
-
-    // In grouped mode the anchor is the only geometry owner for the current
-    // foreground.  Refresh its reliable model pixels on every forward so a
-    // previous sliding window cannot leave a second depth/colour layer inside
-    // the current object silhouette.  Keep the narrow repaired strip and the
-    // anchor ring protected; those regions already use canvas-calibrated
-    // geometry for continuity.
-    cv::Mat group_refresh_mask = cv::Mat::zeros(update_mask.size(), CV_8UC1);
-    if (prepared_group != nullptr) {
-        group_refresh_mask = quality_valid.clone();
-        cv::bitwise_and(group_refresh_mask, not_anchor, group_refresh_mask);
-        if (!group_gap_protected_.empty()) {
-            cv::Mat not_group_gap_protected;
-            cv::bitwise_not(group_gap_protected_, not_group_gap_protected);
-            cv::bitwise_and(
-                group_refresh_mask, not_group_gap_protected, group_refresh_mask);
-        }
-        cv::bitwise_or(update_mask, group_refresh_mask, update_mask);
     }
 
     // RGB-only bridge: keep the current aligned source authoritative through
@@ -3641,21 +3645,6 @@ CandidateCommit InferenceEngine::process_impl(
             anchor_ring,
             prepared_group == nullptr)
         : warped_rgb_f.clone();
-
-    // The grouped anchor RGB is already foreground-masked by valid_warp.  Use
-    // it for every existing foreground slot so stale exposure/texture layers
-    // cannot survive when the depth refresh above does not change a pixel.
-    cv::Mat group_color_refresh = cv::Mat::zeros(update_mask.size(), CV_8UC1);
-    if (prepared_group != nullptr && state.initialized) {
-        cv::bitwise_and(valid_warp, canvas_valid, group_color_refresh);
-        if (!group_stale_clear.empty()) {
-            cv::Mat not_stale;
-            cv::bitwise_not(group_stale_clear, not_stale);
-            cv::bitwise_and(group_color_refresh, not_stale, group_color_refresh);
-        }
-        cv::bitwise_or(color_bridge_mask, group_color_refresh, color_bridge_mask);
-        color_bridge_mix.setTo(1.0f, group_color_refresh);
-    }
 
     if (state.initialized && cv::countNonZero(color_bridge_mask) > 0) {
         for (int y = 0; y < color_bridge_mask.rows; ++y) {
@@ -4162,19 +4151,6 @@ CandidateCommit InferenceEngine::process_impl(
         for (int x = 0; x < state.width; ++x) {
             if (valid_warp.at<std::uint8_t>(y, x) != 0U) {
                 patch.observed_slots.push_back(static_cast<std::uint32_t>(y * state.width + x));
-            }
-            const bool stale_clear = group_stale_clear.at<std::uint8_t>(y, x) != 0U;
-            if (stale_clear) {
-                SlotValue after;
-                after.depth = 0.0f;
-                after.confidence = 0.0f;
-                after.rgba = 0U;
-                after.last_update_frame = static_cast<std::uint32_t>(raw.frame_seq);
-                after.valid = 0U;
-                const std::uint32_t slot_id = static_cast<std::uint32_t>(y * state.width + x);
-                patch.updates.push_back(SlotUpdate{slot_id, after});
-                patch.cleared_support_slots.push_back(slot_id);
-                continue;
             }
             const bool geometry_update = update_mask.at<std::uint8_t>(y, x) != 0U;
             const bool color_bridge = color_bridge_mask.at<std::uint8_t>(y, x) != 0U;
