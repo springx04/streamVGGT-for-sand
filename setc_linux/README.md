@@ -52,17 +52,18 @@ bash scripts/start_cpp_live_replay.sh
 C++ 编译和运行需要在 Linux 机器上准备：
 
 - CMake 3.18 或更高版本、支持 C++17 的编译器和 pthread；
-- 与 TorchScript 模型版本匹配的 Linux LibTorch。当前配置按 LibTorch/PyTorch 2.7.0 + CUDA 12.8 设计；
+- 与 TorchScript 模型版本匹配的 Linux LibTorch。当前模型按 LibTorch/PyTorch 2.7.0 + cu128 导出；你的 NVIDIA 595.84 驱动报告 CUDA 13.2，向后兼容运行 cu128，不需要安装 `nvcc`；
 - OpenCV 开发包，至少包含 `core`、`imgcodecs`、`imgproc`、`features2d`、`calib3d`；live viewer 还需要 `highgui`；
-- NVIDIA 驱动和 CUDA 运行环境。C++ observer 当前只支持 `--device cuda`；
+- NVIDIA 驱动和 CUDA 运行环境。C++ observer 当前只支持 `--device cuda`；本项目没有 `.cu` 自定义 kernel，因此不要求 `nvcc`；
 - 只有在重新导出 TorchScript 模型时，才需要 Python、CUDA 版 PyTorch、`safetensors` 和外部 OmniVGGT Python 模型源码。
 
 本目录的脚本不会安装依赖。编译时设置 LibTorch：
 
 ```bash
 export LIBTORCH=/opt/libtorch/2.7.0-cu128
-# 如果 OpenCV 不在系统默认路径，再设置：
+# Ubuntu 24.04 + apt OpenCV 4.6 通常会被自动找到；自定义安装时再设置：
 # export OpenCV_DIR=/opt/opencv/lib/cmake/opencv4
+# 构建脚本默认使用 PATH 中的 g++（当前设备为 g++ 13.3）。
 ```
 
 如果自定义 OpenCV 的动态库不在系统搜索路径，还可以补充：
@@ -196,7 +197,8 @@ INPUT_GROUP_SIZE=1 bash scripts/start_cpp_live_replay.sh
 
 ```bash
 export LIBTORCH=/opt/libtorch/2.7.0-cu128
-export CUDA_HOME=/usr/local/cuda
+# CUDA_HOME 仅在你有 CUDA toolkit/runtime 目录时设置；没有 nvcc 也可以运行：
+# export CUDA_HOME=/usr/local/cuda
 bash scripts/start_cpp_live_replay.sh
 ```
 

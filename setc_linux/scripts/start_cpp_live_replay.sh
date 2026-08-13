@@ -13,6 +13,11 @@ fi
 if [[ -n "${CUDA_HOME:-}" && -d "${CUDA_HOME:-}/lib64" ]]; then
     export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
+# Ubuntu packages OpenCV 4.x under the multiarch library directory.  Keep
+# this optional: custom OpenCV builds can still be supplied through LD_LIBRARY_PATH.
+if [[ -d "/usr/lib/x86_64-linux-gnu" ]]; then
+    export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
 
 SERVER="${SERVER:-${BIN_DIR}/omnivggt_stream_server}"
 VIEWER="${VIEWER:-${BIN_DIR}/omnivggt_live_viewer}"
