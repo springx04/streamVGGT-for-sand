@@ -29,11 +29,11 @@ setc_linux/
 └── build_live_observer/                      # 编译时自动生成
 ```
 
-默认运行所需的两个模型文件是：
+默认运行所需的模型文件是：
 
 - `models/omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt`
 - `models/omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt`
-- 三图默认还需要 `models/omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt`
+- 三图默认还需要 `models/omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt`（仅在 `USE_GROUP_MODEL=1` 时使用；正常三图观测融合仍使用前两个模型）
 
 默认输入目录是 `data2/`，默认输出目录是 `outputs/data2_cpp_linux_live_replay/`。模型和数据也可以完全放在目录外：
 
@@ -185,6 +185,9 @@ bash scripts/start_cpp_live_replay.sh
 ```bash
 INPUT_GROUP_SIZE=1 bash scripts/start_cpp_live_replay.sh
 ```
+
+直接启动 `omnivggt_stream_server` 时同样默认使用三图滑窗；只有显式传入
+`--input-group-size 1` 才会切换回单图/双图路径。
 
 三图运行目录中的 `input_groups.csv` 记录每个滑窗，`metrics.csv` 中的
 `forward_calls=1`、`forward_batch_size=3`、`forward_sequence_size=1` 是速度和形状验收字段。

@@ -735,6 +735,7 @@ void interpolate_group_gap_depth_to_canvas(
                 }
                 --before;
             }
+
             int after = after_start;
             bool have_after = false;
             bool after_from_canvas = false;

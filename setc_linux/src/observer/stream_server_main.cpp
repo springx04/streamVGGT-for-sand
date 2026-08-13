@@ -49,7 +49,10 @@ struct ServerArgs {
     int poll_ms = 50;
     bool once = false;
     bool resume = false;
-    std::size_t input_group_size = 1U;
+    // The production Linux observer consumes the same three-image sliding
+    // windows as the one-click launcher (123, 234, ...).  Keep the legacy
+    // single-image path available through an explicit --input-group-size 1.
+    std::size_t input_group_size = 3U;
     std::size_t input_group_stride = 1U;
     std::size_t group_anchor_index = 1U;
 };
@@ -70,7 +73,7 @@ void usage() {
         << "  --model-pair-dir DIR  Dynamic two-frame bucket artifacts (WxH in filename).\n"
         << "  --pair-letterbox      Use one pair graph with aspect-preserving edge padding.\n"
         << "  --model-group3 model.pt  Independent B=3,S=1 three-image graph.\n"
-        << "  --input-group-size N  Logical input group size (1 or 3), default 1.\n"
+        << "  --input-group-size N  Logical input group size (1 or 3), default 3.\n"
         << "  --input-group-stride N Sliding group stride, default 1.\n"
         << "  --group-anchor-index N Anchor within a three-image group, default 1.\n"
         << "  --group-model-width W --group-model-height H  B=3,S=1 graph dimensions.\n"
