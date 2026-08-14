@@ -5,8 +5,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <functional>
+#include <memory>
+#include <opencv2/core.hpp>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,6 +29,31 @@ struct RawFrame {
     std::vector<std::uint64_t> group_source_seqs;
     int group_anchor_index = 0;
     std::string group_key;
+    std::vector<std::shared_ptr<const cv::Mat>> group_images;
+};
+
+class LiveFrameSource {
+public:
+    using GroupHandler = std::function<bool(RawFrame)>;
+
+    LiveFrameSource(
+        std::size_t group_size,
+        std::size_t group_stride,
+        std::size_t anchor_index,
+        GroupHandler on_group);
+
+    bool submit_frame(std::uint64_t source_seq, const cv::Mat& image);
+    void close();
+
+private:
+    const std::size_t group_size_;
+    const std::size_t group_stride_;
+    const std::size_t anchor_index_;
+    GroupHandler on_group_;
+    std::mutex mutex_;
+    bool closed_ = false;
+    FrameSeq next_group_seq_ = 0;
+    std::vector<std::pair<std::uint64_t, std::shared_ptr<const cv::Mat>>> frames_;
 };
 
 struct DirectorySourceOptions {

@@ -15,8 +15,12 @@ int main(int argc, char** argv) {
             return 2;
         }
         const VersionStore store = VersionStore::open_existing(fs::path(argv[2]));
-        CanvasState state = store.load_snapshot_for_version(0).state;
+        const CommitVersion baseline_version = store.latest_snapshot_version();
+        CanvasState state = store.load_snapshot_for_version(baseline_version).state;
         for (const DeltaIndexEntry& index : store.delta_index()) {
+            if (index.version <= baseline_version) {
+                continue;
+            }
             const PointCloudDelta delta = store.read_delta(index.version);
             if (delta.from_version != state.version) {
                 throw std::runtime_error("delta chain starts at unexpected version " + std::to_string(index.version));
