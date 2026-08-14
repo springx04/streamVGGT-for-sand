@@ -85,6 +85,7 @@ if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
     add_library(omnivggt_observer_history
         src/observer/stream_types.cpp
         src/observer/version_store.cpp
+        src/observer/history_compactor.cpp
         src/observer/protocol.cpp
         src/observer/tcp_transport.cpp
     )
@@ -101,6 +102,7 @@ if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
 
     add_library(omnivggt_observer_inference
         src/observer/frame_source.cpp
+        src/observer/live_frame_source.cpp
         src/observer/inference_pipeline.cpp
     )
     target_include_directories(omnivggt_observer_inference

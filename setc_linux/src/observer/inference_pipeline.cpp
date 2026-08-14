@@ -4254,9 +4254,14 @@ FramePreprocessor::FramePreprocessor(InferenceOptions options)
 
 FramePreprocessor::FrameImage FramePreprocessor::load_frame(
     const std::filesystem::path& path) const {
+    return load_frame(path, read_rgb(path));
+}
+
+FramePreprocessor::FrameImage FramePreprocessor::load_frame(
+    const std::filesystem::path& path,
+    const cv::Mat& original) const {
     FrameImage frame;
     frame.path = path;
-    const cv::Mat original = read_rgb(path);
     const double scale_x = static_cast<double>(options_.width) / static_cast<double>(original.cols);
     const int resized_height = std::max(
         1, static_cast<int>(std::round(static_cast<double>(original.rows) * scale_x)));
@@ -4401,11 +4406,11 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
     prepared_input.raw = raw;
     prepared_input.frame_seq = raw.frame_seq;
     Timer read_timer;
-    if (raw.group_paths.size() == 3U) {
+    if (!raw.group_images.empty()) {
         std::vector<FrameImage> frames;
-        frames.reserve(3U);
-        for (const auto& path : raw.group_paths) {
-            frames.push_back(load_frame(path));
+        frames.reserve(raw.group_images.size());
+        for (std::size_t index = 0; index < raw.group_images.size(); ++index) {
+            frames.push_back(load_frame(raw.group_paths[index], *raw.group_images[index]));
         }
         const int anchor_index = std::clamp(raw.group_anchor_index, 0, 2);
         const FrameImage& anchor = frames[static_cast<std::size_t>(anchor_index)];

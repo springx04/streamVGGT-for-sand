@@ -1,6 +1,8 @@
 #include "bounded_queue.hpp"
 #include "frame_source.hpp"
+#include "history_compactor.hpp"
 #include "inference_pipeline.hpp"
+#include "inflight_gate.hpp"
 #include "protocol.hpp"
 #include "tcp_transport.hpp"
 #include "version_store.hpp"
@@ -45,6 +47,7 @@ struct ServerArgs {
     std::uint64_t num_images = 0;
     std::uint16_t port = 37651;
     std::uint32_t snapshot_interval = 60;
+    std::size_t history_keep_groups = 0U;
     std::size_t queue_capacity = 3;
     int poll_ms = 50;
     bool once = false;
@@ -87,6 +90,7 @@ void usage() {
         << "  --queue-capacity N     Hyphenated alias; use a large value for offline replay.\n"
         << "  --poll_ms N            Directory polling interval, default 50.\n"
         << "  --snapshot_interval N  Snapshot every N committed versions, default 60.\n"
+        << "  --history-keep-groups N  Keep approximately the newest N logical groups.\n"
         << "  --height H --width W   Fixed model/canvas dimensions, default 518x518.\n"
         << "  --target-size H --target-width W  Python-launcher compatible aliases.\n"
         << "  --canvas-width W --canvas-height H  Padded aligned-canvas dimensions.\n"
@@ -141,6 +145,9 @@ ServerArgs parse_args(const int argc, char** argv) {
             args.poll_ms = std::stoi(require_value(i, argc, argv, key));
         } else if (key == "--snapshot_interval") {
             args.snapshot_interval = static_cast<std::uint32_t>(std::stoul(require_value(i, argc, argv, key)));
+        } else if (key == "--history-keep-groups") {
+            args.history_keep_groups = static_cast<std::size_t>(
+                std::stoull(require_value(i, argc, argv, key)));
         } else if (key == "--height" || key == "--target-size") {
             args.inference.height = std::stoi(require_value(i, argc, argv, key));
         } else if (key == "--width" || key == "--target-width") {
@@ -494,6 +501,9 @@ public:
             store_.append_metrics(candidate.metrics.csv_line());
             if (store_.should_snapshot(delta)) {
                 store_.write_snapshot(committed_state);
+                if (args_.history_keep_groups != 0U) {
+                    HistoryCompactor::compact(store_, args_.history_keep_groups);
+                }
             }
         }
         live_head_frame_.store(std::max(live_head_frame_.load(), candidate.frame.frame_seq));
@@ -595,7 +605,9 @@ private:
         group_manifest_ << ',' << raw.group_anchor_index << ',' << status << '\n';
         group_manifest_.flush();
         if (std::string(status) == "Received") {
-            pending_groups_[raw.frame_seq] = raw;
+            RawFrame metadata = raw;
+            metadata.group_images.clear();
+            pending_groups_[raw.frame_seq] = std::move(metadata);
         } else {
             pending_groups_.erase(raw.frame_seq);
         }
@@ -940,6 +952,7 @@ int main(int argc, char** argv) {
         BoundedQueue<RawFrame> frame_queue(args.queue_capacity);
         BoundedQueue<PreparedInput> prepared_queue(args.queue_capacity);
         BoundedQueue<CandidateCommit> commit_queue(args.queue_capacity + 2U);
+        InFlightGate inflight_gate;
 
         DirectorySourceOptions source_options;
         source_options.directory = args.image_dir;
@@ -981,13 +994,16 @@ int main(int argc, char** argv) {
                     if (!raw.has_value()) {
                         break;
                     }
+                    inflight_gate.acquire();
                     try {
                         PreparedInput prepared = preprocessor.prepare(*raw);
                         if (!prepared_queue.push_wait(std::move(prepared))) {
+                            inflight_gate.release();
                             break;
                         }
                     } catch (const std::exception& error) {
                         runtime.record_failed(*raw, error.what());
+                        inflight_gate.release();
                     }
                 }
             } catch (const std::exception& error) {
@@ -1015,11 +1031,14 @@ int main(int argc, char** argv) {
                         CandidateCommit candidate = engine.process_prepared(*prepared, state);
                         const FrameSeq frame_seq = candidate.frame.frame_seq;
                         if (!commit_queue.push_wait(std::move(candidate))) {
+                            inflight_gate.release();
                             break;
                         }
                         runtime.wait_until_frame_handled(frame_seq);
+                        inflight_gate.release();
                     } catch (const std::exception& error) {
                         runtime.record_failed(prepared->raw, error.what());
+                        inflight_gate.release();
                     }
                 }
             } catch (const std::exception& error) {

@@ -277,6 +277,7 @@ private:
     };
 
     FrameImage load_frame(const std::filesystem::path& path) const;
+    FrameImage load_frame(const std::filesystem::path& path, const cv::Mat& rgb) const;
     cv::Mat estimate_pair_homography(const FrameImage& source, const FrameImage& target) const;
     static cv::Mat gray_u8(const cv::Mat& rgb_u8);
     static cv::Mat warp_like(const cv::Mat& source, const cv::Mat& homography, cv::Size size, int interpolation);
