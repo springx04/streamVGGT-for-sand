@@ -53,7 +53,10 @@ struct ServerArgs {
     bool once = false;
     bool resume = false;
     std::size_t input_group_size = 3U;
-    std::size_t input_group_stride = 1U;
+    // The current replay input is three cameras captured for one logical
+    // frame.  Keep the group non-overlapping by default; callers can still
+    // pass --input-group-stride 1 for the legacy temporal sliding windows.
+    std::size_t input_group_stride = 3U;
     std::size_t group_anchor_index = 1U;
 };
 
@@ -74,7 +77,7 @@ void usage() {
         << "  --pair-letterbox      Use one pair graph with aspect-preserving edge padding.\n"
         << "  --model-group3 model.pt  Independent B=3,S=1 three-image graph.\n"
         << "  --input-group-size N  Logical input group size (1 or 3), default 3.\n"
-        << "  --input-group-stride N Sliding group stride, default 1.\n"
+        << "  --input-group-stride N Group stride, default 3 (use 1 for legacy sliding windows).\n"
         << "  --group-anchor-index N Anchor within a three-image group, default 1.\n"
         << "  --group-model-width W --group-model-height H  B=3,S=1 graph dimensions.\n"
         << "  --output_dir DIR       Parent directory for independent run history.\n"
@@ -192,6 +195,11 @@ ServerArgs parse_args(const int argc, char** argv) {
     }
     if (args.input_group_size != 1U && args.input_group_size != 3U) {
         throw std::runtime_error("--input-group-size must be 1 or 3");
+    }
+    if (args.input_group_size == 1U) {
+        // The legacy S1/S2 path has no multi-image window, so its only
+        // meaningful stride is one even when the new group default is used.
+        args.input_group_stride = 1U;
     }
     if (args.input_group_stride == 0U || args.input_group_stride > args.input_group_size) {
         throw std::runtime_error("--input-group-stride must be in [1, input-group-size]");

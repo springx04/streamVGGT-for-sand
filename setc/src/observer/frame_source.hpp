@@ -21,9 +21,9 @@ namespace omnivggt::observer {
 struct RawFrame {
     FrameSeq frame_seq = 0;
     std::filesystem::path path;
-    // A logical input can contain a sliding window of source images.  The
-    // legacy single-image path keeps this vector empty (or size one when it
-    // is produced by the grouped source); consumers should use group_paths
+    // A logical input contains one group of source images.  The source may
+    // make these groups non-overlapping (the current three-camera replay) or
+    // sliding (the legacy temporal replay); consumers should use group_paths
     // when present and path as the canonical/anchor image.
     std::vector<std::filesystem::path> group_paths;
     std::vector<std::uint64_t> group_source_seqs;

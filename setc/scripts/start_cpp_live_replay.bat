@@ -2,8 +2,9 @@
 setlocal
 
 rem One-click C++ equivalent of stream_omnivggt\start_python_live_replay.bat.
-rem Keep the input/output/device/dtype controls in sync with the Python
-rem launcher; the optional observer remains outside the normal project run.
+rem Keep the device/dtype controls aligned with the Python launcher; the C++
+rem replay dataset is intentionally data1 because each logical frame has
+rem three camera views.
 
 set "REPO=%~dp0..\.."
 for %%I in ("%REPO%") do set "REPO=%%~fI"
@@ -19,15 +20,16 @@ rem Use the depth-only pair graph.  The fixed graph is loaded once; each
 rem Python-sized ROI is kept aspect-preserving inside its 700x700 border.
 set "PAIR_MODEL=%REPO%\setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt"
 set "GROUP_MODEL=%REPO%\setc\artifacts\omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt"
-rem The default is the requested 123/234 sliding window. Set INPUT_GROUP_SIZE=1
-rem before launching to keep the legacy S1/S2 observer command.
+rem The default is one non-overlapping three-camera group per logical frame.
+rem Set INPUT_GROUP_STRIDE=1 to replay the legacy 123/234 sliding windows.
+rem Set INPUT_GROUP_SIZE=1 before launching to keep the legacy S1/S2 observer command.
 if not defined INPUT_GROUP_SIZE set "INPUT_GROUP_SIZE=3"
-if not defined INPUT_GROUP_STRIDE set "INPUT_GROUP_STRIDE=1"
+if not defined INPUT_GROUP_STRIDE set "INPUT_GROUP_STRIDE=3"
 if not defined GROUP_ANCHOR_INDEX set "GROUP_ANCHOR_INDEX=1"
 set "GROUP_MODEL_WIDTH=406"
 set "GROUP_MODEL_HEIGHT=252"
-set "IMAGE_DIR=%REPO%\data2"
-set "OUTPUT_DIR=%REPO%\stream_omnivggt_outputs\data2_python_live_replay"
+set "IMAGE_DIR=%REPO%\data1"
+set "OUTPUT_DIR=%REPO%\stream_omnivggt_outputs\data1_cpp_live_replay"
 set "TARGET_WIDTH=700"
 set "TARGET_SIZE=700"
 set "CANVAS_WIDTH=770"
@@ -83,7 +85,7 @@ if "%INPUT_GROUP_SIZE%"=="3" if defined USE_GROUP_MODEL if not exist "%GROUP_MOD
   exit /b 1
 )
 if not exist "%IMAGE_DIR%" (
-  echo [ERROR] data2 directory not found: %IMAGE_DIR%
+  echo [ERROR] data1 directory not found: %IMAGE_DIR%
   pause
   exit /b 1
 )

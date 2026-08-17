@@ -1,5 +1,7 @@
 #include "frame_source.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -12,8 +14,8 @@ LiveFrameSource::LiveFrameSource(
     const std::size_t anchor_index,
     GroupHandler on_group)
     : group_size_(group_size), group_stride_(group_stride), anchor_index_(anchor_index), on_group_(std::move(on_group)) {
-    if (group_size_ != 3U || group_stride_ != 1U || anchor_index_ != 1U) {
-        throw std::invalid_argument("live input requires group_size=3, stride=1, anchor=1");
+    if (group_size_ != 3U || group_stride_ == 0U || group_stride_ > group_size_ || anchor_index_ != 1U) {
+        throw std::invalid_argument("live input requires group_size=3, stride in [1,3], anchor=1");
     }
 }
 
@@ -41,7 +43,9 @@ bool LiveFrameSource::submit_frame(const std::uint64_t source_seq, const cv::Mat
     for (const std::uint64_t sequence : group.group_source_seqs) {
         group.group_paths.emplace_back("camera_" + std::to_string(sequence));
     }
-    frames_.erase(frames_.begin());
+    frames_.erase(
+        frames_.begin(),
+        frames_.begin() + static_cast<std::ptrdiff_t>(std::min(group_stride_, group_size_)));
     return on_group_(std::move(group));
 }
 

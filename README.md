@@ -5,9 +5,11 @@ This repository currently has two production workflows for live replay on Window
 1. Python main workflow (one-click): `stream_omnivggt\start_python_live_replay.bat`
 2. C++ main workflow (one-click): `setc\scripts\start_cpp_live_replay.bat`
 
-Both workflows use the `data2` image directory by default and write outputs to:
+The Python workflow uses `data2` by default. The C++ workflow uses the
+three-camera `data1` replay by default. Their default output directories are:
 
 - `stream_omnivggt_outputs\data2_python_live_replay`
+- `stream_omnivggt_outputs\data1_cpp_live_replay`
 
 ## 1) Python Main Workflow
 
@@ -97,16 +99,20 @@ cmd /c setc\scripts\start_cpp_live_replay.bat
 
 The launcher starts `omnivggt_stream_server.exe` in background, then launches `omnivggt_live_viewer.exe`.
 
-By default it consumes three-image sliding groups (`123`, `234`, …) and performs
-one CUDA forward with `B=3,S=1`. The middle image is the group anchor; the C++
+By default it consumes non-overlapping three-camera groups from each logical
+frame (`1-1`, `1-2`, `1-3`, then `2-1`, `2-2`, `2-3`, …) and performs one CUDA
+forward with `B=3,S=1`. The middle image is the group anchor; the C++
 fusion keeps the anchor support as the geometry ownership mask, uses the two
 side predictions only for calibrated holes inside that support, and rejects
  the non-convex side-only strips that otherwise create visible gaps. Group mode
  keeps the anchor RGB source-faithful and does not reuse the single-view RGB
  bridge, because that bridge can create a long rectangular seam on a rotated
  group edge. Export and viewer point clouds close only enclosed support holes
- (never the outer black aperture). The run directory records the exact windows in
+ (never the outer black aperture). The run directory records the exact groups in
 `input_groups.csv` and the batching contract in `metrics.csv`.
+
+For legacy temporal data such as `data2`, set `INPUT_GROUP_STRIDE=1` to restore
+sliding groups (`123`, `234`, …).
 
 To run the legacy single-image/pair path, set `INPUT_GROUP_SIZE=1` before launching:
 
@@ -117,7 +123,8 @@ cmd /c setc\scripts\start_cpp_live_replay.bat
 
 ## Notes
 
-- Python and C++ launchers are aligned to the same replay target (`data2`, `700x700`, `cuda`, `bf16`).
+- The Python launcher defaults to `data2`; the C++ launcher defaults to `data1`.
+  Both use `700x700`, `cuda`, and `bf16` runtime settings.
 - The three-image path is deliberately `B=3,S=1`, not native `S=3`; this avoids
   the three-height/three-color-layer artifact of native multi-image output.
 - Group `model_ms` measures one batched forward, while `total_ms` also includes
