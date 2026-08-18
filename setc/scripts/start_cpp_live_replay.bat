@@ -63,21 +63,21 @@ if not exist "%VIEWER%" (
   pause
   exit /b 1
 )
-if not exist "%MODEL%" (
+if "%INPUT_GROUP_SIZE%"=="1" if not exist "%MODEL%" (
   echo [ERROR] Observer depth TorchScript model not found:
   echo         %MODEL%
   echo Export it with setc\scripts\export_torchscript.py using --no-freeze.
   pause
   exit /b 1
 )
-if not exist "%PAIR_MODEL%" (
+if "%INPUT_GROUP_SIZE%"=="1" if not exist "%PAIR_MODEL%" (
   echo [ERROR] Observer two-frame depth TorchScript model not found:
   echo         %PAIR_MODEL%
   echo Export it with --num-images 2 and --no-freeze.
   pause
   exit /b 1
 )
-if "%INPUT_GROUP_SIZE%"=="3" if defined USE_GROUP_MODEL if not exist "%GROUP_MODEL%" (
+if "%INPUT_GROUP_SIZE%"=="3" if not exist "%GROUP_MODEL%" (
   echo [ERROR] Three-image B=3,S=1 model not found:
   echo         %GROUP_MODEL%
   echo Export it with --batch-size 3 --num-images 1 --height 252 --width 406.
@@ -98,11 +98,7 @@ echo Queue:   %QUEUE_CAPACITY%  (lossless offline replay)
 echo Canvas:  %CANVAS_WIDTH%x%CANVAS_HEIGHT%  first_model=%FIRST_MODEL_WIDTH%x%FIRST_MODEL_HEIGHT%
 if "%INPUT_GROUP_SIZE%"=="3" (
   echo Input:   groups of 3, stride=%INPUT_GROUP_STRIDE%, anchor=%GROUP_ANCHOR_INDEX%
-  if defined USE_GROUP_MODEL (
-    echo Group:   B=3,S=1 %GROUP_MODEL_WIDTH%x%GROUP_MODEL_HEIGHT% experimental group geometry
-  ) else (
-    echo Group:   three-image observation fusion, then standard S=2 stream update
-  )
+  echo Group:   B=3,S=1 %GROUP_MODEL_WIDTH%x%GROUP_MODEL_HEIGHT%, one forward per logical frame
 ) else (
   echo Pair:    fixed 700x700 observer graph, aspect-preserving ROI letterbox
   echo          (loaded and warmed once; avoids per-ROI TorchScript reloads)
@@ -111,22 +107,10 @@ echo Viewer:  %VIEWER%
 echo Close the viewer with q or Esc. The server stays independent until stopped.
 echo.
 
-if "%INPUT_GROUP_SIZE%"=="3" if defined USE_GROUP_MODEL (
+if "%INPUT_GROUP_SIZE%"=="3" (
   start "OmniVGGT C++ Stream Server" /b "%SERVER%" ^
   --model-group3 "%GROUP_MODEL%" --input-group-size 3 --input-group-stride %INPUT_GROUP_STRIDE% --group-anchor-index %GROUP_ANCHOR_INDEX% ^
   --group-model-width %GROUP_MODEL_WIDTH% --group-model-height %GROUP_MODEL_HEIGHT% ^
-  --image-dir "%IMAGE_DIR%" ^
-  --output-dir "%OUTPUT_DIR%" ^
-  --target-size %TARGET_SIZE% --target-width %TARGET_WIDTH% ^
-  --canvas-width %CANVAS_WIDTH% --canvas-height %CANVAS_HEIGHT% ^
-  --first-model-width %FIRST_MODEL_WIDTH% --first-model-height %FIRST_MODEL_HEIGHT% ^
-  --device cuda --dtype bf16 --min_conf 0.0 ^
-  --queue-capacity %QUEUE_CAPACITY% ^
-  --port %PORT% --no-save-debug
-) else if "%INPUT_GROUP_SIZE%"=="3" (
-  start "OmniVGGT C++ Stream Server" /b "%SERVER%" ^
-  --model "%MODEL%" --model-pair "%PAIR_MODEL%" --pair-letterbox ^
-  --input-group-size 3 --input-group-stride %INPUT_GROUP_STRIDE% --group-anchor-index %GROUP_ANCHOR_INDEX% ^
   --image-dir "%IMAGE_DIR%" ^
   --output-dir "%OUTPUT_DIR%" ^
   --target-size %TARGET_SIZE% --target-width %TARGET_WIDTH% ^

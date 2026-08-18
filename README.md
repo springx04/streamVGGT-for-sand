@@ -74,8 +74,9 @@ Expected binaries:
 
 ### 2.3 Build required TorchScript artifacts (if missing)
 
-If these files already exist, skip this section. The default C++ launcher now uses
-the three-image batched observer artifact:
+If these files already exist, skip this section. The default C++ launcher uses
+the three-image batched observer artifact; the S1/S2 artifacts are retained for
+the optional legacy `INPUT_GROUP_SIZE=1` path:
 
 - `setc\artifacts\omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt`
 - `setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt`

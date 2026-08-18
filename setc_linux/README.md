@@ -29,17 +29,14 @@ setc_linux/
 └── build_live_observer/                      # 编译时自动生成
 ```
 
-默认运行所需的模型文件是：
-
-- `models/omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt`
-- `models/omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt`
-- 三图默认还需要 `models/omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt`（仅在 `USE_GROUP_MODEL=1` 时使用；正常三图观测融合仍使用前两个模型）
+默认三图运行只需要
+`models/omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt`；仅在设置
+`INPUT_GROUP_SIZE=1` 使用旧单图/双图路径时，才需要前两个 S1/S2 模型。
 
 默认输入目录是 `data1/`，默认输出目录是 `outputs/data1_cpp_linux_live_replay/`。模型和数据也可以完全放在目录外：
 
 ```bash
-MODEL=/data/models/first.pt \
-PAIR_MODEL=/data/models/pair.pt \
+GROUP_MODEL=/data/models/group_b3s1.pt \
 IMAGE_DIR=/data/scene_images \
 OUTPUT_DIR=/data/omnivggt_output \
 bash scripts/start_cpp_live_replay.sh

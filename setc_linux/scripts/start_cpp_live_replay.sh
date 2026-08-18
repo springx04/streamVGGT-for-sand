@@ -43,7 +43,7 @@ SERVER_STARTUP_DELAY="${SERVER_STARTUP_DELAY:-7}"
 SERVER_LOG="${SERVER_LOG:-${OUTPUT_DIR}/server.log}"
 
 required_files=("${SERVER}" "${VIEWER}")
-if [[ "${INPUT_GROUP_SIZE}" == "3" && -n "${USE_GROUP_MODEL:-}" ]]; then
+if [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
     required_files+=("${GROUP_MODEL}")
 else
     required_files+=("${MODEL}" "${PAIR_MODEL}")
@@ -74,11 +74,7 @@ echo "  dataset: ${IMAGE_DIR}"
 echo "  output:  ${OUTPUT_DIR}"
 if [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
     echo "  input:   groups of 3, stride=${INPUT_GROUP_STRIDE}, anchor=${GROUP_ANCHOR_INDEX}"
-    if [[ -n "${USE_GROUP_MODEL:-}" ]]; then
-        echo "  group:   B=3,S=1 ${GROUP_MODEL_WIDTH}x${GROUP_MODEL_HEIGHT} experimental group geometry"
-    else
-        echo "  group:   three-image observation fusion, then standard S=2 stream update"
-    fi
+    echo "  group:   B=3,S=1 ${GROUP_MODEL_WIDTH}x${GROUP_MODEL_HEIGHT}, one forward per logical frame"
 else
     echo "  model:   ${MODEL}"
     echo "  pair:    ${PAIR_MODEL}"
@@ -102,7 +98,7 @@ server_args=(
     --port "${PORT}"
     --no-save-debug
 )
-if [[ "${INPUT_GROUP_SIZE}" == "3" && -n "${USE_GROUP_MODEL:-}" ]]; then
+if [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
     server_args+=(
         --model-group3 "${GROUP_MODEL}"
         --input-group-size 3
@@ -110,15 +106,6 @@ if [[ "${INPUT_GROUP_SIZE}" == "3" && -n "${USE_GROUP_MODEL:-}" ]]; then
         --group-anchor-index "${GROUP_ANCHOR_INDEX}"
         --group-model-width "${GROUP_MODEL_WIDTH}"
         --group-model-height "${GROUP_MODEL_HEIGHT}"
-    )
-elif [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
-    server_args+=(
-        --model "${MODEL}"
-        --model-pair "${PAIR_MODEL}"
-        --pair-letterbox
-        --input-group-size 3
-        --input-group-stride "${INPUT_GROUP_STRIDE}"
-        --group-anchor-index "${GROUP_ANCHOR_INDEX}"
     )
 else
     server_args+=(--model "${MODEL}" --model-pair "${PAIR_MODEL}" --pair-letterbox)

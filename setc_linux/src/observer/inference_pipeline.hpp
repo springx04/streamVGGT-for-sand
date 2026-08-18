@@ -254,6 +254,7 @@ private:
         const CanvasState& state,
         const FrameImage& frame,
         const PreparedGroup* group,
+        bool observation_group,
         double read_ms);
     CandidateCommit process_group(const RawFrame& raw, const CanvasState& state);
 };

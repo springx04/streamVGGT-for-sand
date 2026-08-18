@@ -2796,9 +2796,15 @@ CandidateCommit InferenceEngine::process_prepared(
         group.valid_warp = prepared.group_valid_warp;
         group.fused_rgb_f = prepared.group_fused_rgb_f;
         group.union_valid = prepared.group_union_valid;
-        return process_impl(prepared.raw, state, frame, &group, prepared.read_ms);
+        return process_impl(prepared.raw, state, frame, &group, false, prepared.read_ms);
     }
-    return process_impl(prepared.raw, state, frame, nullptr, prepared.read_ms);
+    return process_impl(
+        prepared.raw,
+        state,
+        frame,
+        nullptr,
+        prepared.has_observation_group && options_.group_stride >= 3,
+        prepared.read_ms);
 }
 
 CandidateCommit InferenceEngine::process_impl(
@@ -2806,6 +2812,7 @@ CandidateCommit InferenceEngine::process_impl(
     const CanvasState& state,
     const FrameImage& frame,
     const PreparedGroup* prepared_group,
+    const bool observation_group,
     const double read_ms) {
     Timer total_timer;
     CandidateCommit result;
@@ -2817,14 +2824,15 @@ CandidateCommit InferenceEngine::process_impl(
     result.metrics.image = result.frame.image_name;
 
     result.metrics.read_ms = read_ms;
-    result.metrics.group_size = prepared_group == nullptr ? 1 : 3;
-    result.metrics.group_stride = prepared_group == nullptr ? 1 : options_.group_stride;
+    const bool logical_group = prepared_group != nullptr || observation_group;
+    result.metrics.group_size = logical_group ? 3 : 1;
+    result.metrics.group_stride = logical_group ? options_.group_stride : 1;
     if (prepared_group != nullptr
         && (!state.initialized
             || group_gap_protected_.size() != cv::Size(state.width, state.height))) {
         group_gap_protected_ = cv::Mat::zeros(state.height, state.width, CV_8UC1);
     }
-    result.metrics.group_anchor_index = prepared_group == nullptr ? 0 : raw.group_anchor_index;
+    result.metrics.group_anchor_index = logical_group ? raw.group_anchor_index : 0;
     result.metrics.forward_batch_size = prepared_group == nullptr ? 1 : 3;
     result.metrics.forward_sequence_size = 1;
     if (!state.initialized) {
@@ -3189,6 +3197,39 @@ CandidateCommit InferenceEngine::process_impl(
         model_to_canvas.at<float>(0, 2) = static_cast<float>(pad_left);
         model_to_canvas.at<float>(1, 2) = static_cast<float>(pad_top);
         model_support = cv::Mat::ones(first_height, first_width, CV_32FC1);
+    } else if (observation_group) {
+        // A non-overlapping three-image input group is one static logical
+        // frame, not the next item in the model's temporal S=2 sequence.
+        // Reusing the anchor/current pair graph here makes the pair model
+        // explain the camera-view change as a second depth layer.  Keep the
+        // fast single-image graph, but project its current anchor result
+        // through the accepted current-to-canvas homography.
+        const int first_width = options_.first_model_width;
+        const int first_height = options_.first_model_height;
+        cv::Mat current_model;
+        cv::resize(
+            frame.match_rgb_f,
+            current_model,
+            cv::Size(first_width, first_height),
+            0.0,
+            0.0,
+            cv::INTER_AREA);
+        model_inputs.push_back(std::move(current_model));
+        result.metrics.roi_width = first_width;
+        result.metrics.roi_height = first_height;
+        result.metrics.model_input_width = first_width;
+        result.metrics.model_input_height = first_height;
+        const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
+        const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
+        cv::Mat source_to_frame = cv::Mat::eye(3, 3, CV_32FC1);
+        source_to_frame.at<float>(0, 0) = static_cast<float>(frame.match_rgb_f.cols)
+            / static_cast<float>(first_width);
+        source_to_frame.at<float>(1, 1) = static_cast<float>(frame.match_rgb_f.rows)
+            / static_cast<float>(first_height);
+        source_to_frame.at<float>(0, 2) = static_cast<float>(pad_left);
+        source_to_frame.at<float>(1, 2) = static_cast<float>(pad_top);
+        model_to_canvas = homography * source_to_frame;
+        model_support = cv::Mat::ones(first_height, first_width, CV_32FC1);
     } else {
         const cv::Mat canvas_rgb = !anchor_rgb_float_.empty()
             && anchor_rgb_float_.size() == cv::Size(state.width, state.height)
@@ -3281,7 +3322,7 @@ CandidateCommit InferenceEngine::process_impl(
     }
 
     Timer model_timer;
-    const int output_frame_index = state.initialized ? 1 : 0;
+    const int output_frame_index = state.initialized && !observation_group ? 1 : 0;
     Prediction prediction;
     if (prepared_group != nullptr) {
         const std::vector<Prediction> predictions = run_group_model(model_inputs);
@@ -3300,7 +3341,7 @@ CandidateCommit InferenceEngine::process_impl(
         result.metrics.forward_sequence_size = static_cast<int>(model_inputs.size());
     }
     result.metrics.model_ms = model_timer.ms();
-    if (!state.initialized) {
+    if (!state.initialized && !observation_group) {
         release_single_model_after_first_frame();
     }
 
@@ -3555,6 +3596,26 @@ CandidateCommit InferenceEngine::process_impl(
     // depth/color is an explicit geometry repair and must be committed.
     if (!group_gap_fill.empty()) {
         cv::bitwise_or(update_mask, group_gap_fill, update_mask);
+    }
+
+    // A non-overlapping three-camera group is one logical frame.  Its
+    // foreground may move to a new canvas footprint between groups; keeping
+    // the previous group's unsupported foreground forever turns that motion
+    // into a second arm/ghost.  Do this replacement only for the data1-style
+    // stride-3 path.  Sliding groups (stride 1) retain the legacy incremental
+    // canvas semantics and must not clear their legitimate overlap.
+    cv::Mat group_stale_clear = cv::Mat::zeros(update_mask.size(), CV_8UC1);
+    const bool replace_group_footprint = logical_group && options_.group_stride >= 3;
+    if (replace_group_footprint && state.initialized && result.metrics.fallback.empty()) {
+        cv::Mat current_footprint;
+        cv::bitwise_or(valid_warp, group_gap_fill, current_footprint);
+        const cv::Mat halo_kernel = cv::getStructuringElement(
+            cv::MORPH_ELLIPSE, cv::Size(7, 7));
+        cv::dilate(current_footprint, current_footprint, halo_kernel);
+        cv::Mat outside_current;
+        cv::bitwise_not(current_footprint, outside_current);
+        cv::bitwise_and(canvas_valid, outside_current, group_stale_clear);
+        group_stale_clear = filter_components(group_stale_clear, 256);
     }
 
     // RGB-only bridge: keep the current aligned source authoritative through
@@ -4160,6 +4221,18 @@ CandidateCommit InferenceEngine::process_impl(
             if (valid_warp.at<std::uint8_t>(y, x) != 0U) {
                 patch.observed_slots.push_back(static_cast<std::uint32_t>(y * state.width + x));
             }
+            if (group_stale_clear.at<std::uint8_t>(y, x) != 0U) {
+                SlotValue after;
+                after.depth = 0.0f;
+                after.confidence = 0.0f;
+                after.rgba = 0U;
+                after.last_update_frame = static_cast<std::uint32_t>(raw.frame_seq);
+                after.valid = 0U;
+                const std::uint32_t slot_id = static_cast<std::uint32_t>(y * state.width + x);
+                patch.updates.push_back(SlotUpdate{slot_id, after});
+                patch.cleared_support_slots.push_back(slot_id);
+                continue;
+            }
             const bool geometry_update = update_mask.at<std::uint8_t>(y, x) != 0U;
             const bool color_bridge = color_bridge_mask.at<std::uint8_t>(y, x) != 0U;
             if (!geometry_update && !color_bridge) {
@@ -4406,11 +4479,18 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
     prepared_input.raw = raw;
     prepared_input.frame_seq = raw.frame_seq;
     Timer read_timer;
-    if (!raw.group_images.empty()) {
+    if (raw.group_paths.size() == 3U) {
         std::vector<FrameImage> frames;
-        frames.reserve(raw.group_images.size());
-        for (std::size_t index = 0; index < raw.group_images.size(); ++index) {
-            frames.push_back(load_frame(raw.group_paths[index], *raw.group_images[index]));
+        frames.reserve(raw.group_paths.size());
+        for (std::size_t index = 0; index < raw.group_paths.size(); ++index) {
+            // LiveFrameSource already provides decoded images.  Directory
+            // replay provides only the three paths, so load those paths here
+            // instead of silently falling back to the anchor image alone.
+            if (index < raw.group_images.size() && raw.group_images[index]) {
+                frames.push_back(load_frame(raw.group_paths[index], *raw.group_images[index]));
+            } else {
+                frames.push_back(load_frame(raw.group_paths[index]));
+            }
         }
         const int anchor_index = std::clamp(raw.group_anchor_index, 0, 2);
         const FrameImage& anchor = frames[static_cast<std::size_t>(anchor_index)];
