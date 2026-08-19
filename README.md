@@ -104,10 +104,13 @@ By default it consumes non-overlapping three-camera groups from each logical
 frame (`1-1`, `1-2`, `1-3`, then `2-1`, `2-2`, `2-3`, …) and performs one CUDA
 forward with `B=1,S=3`. The three cameras are one model sequence, so their
 `world_points` share a coordinate frame. The low-texture lower surface is
-robustly fitted and compressed into its own XY atlas, with the anchor camera
-owning overlaps and side cameras filling only uncovered support. Raised objects
-use separate slots and anchor-view geometry, so they cannot overwrite the plane
-or create duplicate robot arms. Each logical frame replaces the prior atlas.
+robustly fitted and compressed into its own XY atlas. Each camera is rasterized
+independently, then overlapping floor cells use confidence- and boundary-distance
+feathering instead of hard camera ownership. Robust per-channel exposure offsets
+are estimated from real overlap cells before blending, and unreliable model-edge
+samples are discarded; the path does not extrapolate unobserved floor support.
+Raised objects use separate slots and anchor-view geometry, so they cannot
+overwrite the plane or create duplicate robot arms. Each logical frame replaces the prior atlas.
 Group images preserve their original aspect ratio and are center-cropped to the
 fixed model shape instead of being stretched. The planar atlas uses dense 3x3
 cell coverage plus largest-component/small-hole regularization; high suspended

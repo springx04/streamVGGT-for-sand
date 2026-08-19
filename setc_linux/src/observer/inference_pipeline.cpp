@@ -2898,7 +2898,7 @@ CandidateCommit InferenceEngine::process_world_group(
             throw std::runtime_error("joint three-camera prediction has no world points");
         }
         const cv::Mat& color = group.model_rgb_f[view];
-        constexpr int model_border = 8;
+        constexpr int model_border = 16;
         for (int y = 0; y < prediction.world_points.rows; ++y) {
             for (int x = 0; x < prediction.world_points.cols; ++x) {
                 if (x < model_border || y < model_border
@@ -3004,7 +3004,17 @@ CandidateCommit InferenceEngine::process_world_group(
     std::vector<float> atlas_depth(slot_count, 0.0f);
     std::vector<std::uint32_t> atlas_rgba(slot_count, 0U);
     std::vector<std::uint8_t> atlas_valid(slot_count, 0U);
-    std::vector<std::uint8_t> atlas_view(slot_count, 0xffU);
+    std::array<std::vector<float>, 3> view_confidence;
+    std::array<std::vector<float>, 3> view_depth;
+    std::array<std::vector<cv::Vec3f>, 3> view_color;
+    std::array<std::vector<std::uint8_t>, 3> view_valid;
+    for (std::size_t view = 0; view < 3U; ++view) {
+        view_confidence[view].assign(
+            slot_count, -std::numeric_limits<float>::infinity());
+        view_depth[view].assign(slot_count, 0.0f);
+        view_color[view].assign(slot_count, cv::Vec3f(0.0f, 0.0f, 0.0f));
+        view_valid[view].assign(slot_count, 0U);
+    }
     std::vector<const WorldSample*> raised_anchor_samples;
     raised_anchor_samples.reserve(candidates.size() / 8U);
     const std::uint8_t anchor_view = static_cast<std::uint8_t>(
@@ -3033,13 +3043,6 @@ CandidateCommit InferenceEngine::process_world_group(
             std::lround(nx * canvas_scale + state.width * 0.5f));
         const int center_y_px = static_cast<int>(
             std::lround(-ny * canvas_scale + state.height * 0.5f));
-        const std::uint32_t rgba = pack_rgba(
-            static_cast<std::uint8_t>(std::clamp(
-                static_cast<int>(std::lround(sample.color[0] * 255.0f)), 0, 255)),
-            static_cast<std::uint8_t>(std::clamp(
-                static_cast<int>(std::lround(sample.color[1] * 255.0f)), 0, 255)),
-            static_cast<std::uint8_t>(std::clamp(
-                static_cast<int>(std::lround(sample.color[2] * 255.0f)), 0, 255)));
         // A 406x252 prediction cannot densely cover a 770x630 atlas with
         // one cell per sample. Splat only the fitted lower surface into a
         // 3x3 footprint; raised geometry remains unsplatted and independent.
@@ -3054,22 +3057,125 @@ CandidateCommit InferenceEngine::process_world_group(
                     continue;
                 }
                 const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
-                // The anchor camera owns overlap pixels. Side cameras extend
-                // support only where the anchor has no sample.
-                if (atlas_valid[slot] != 0U
-                    && (atlas_view[slot] == anchor_view
-                        || (sample.view != anchor_view
-                            && sample.confidence <= best_confidence[slot]))) {
+                const std::size_t view = static_cast<std::size_t>(sample.view);
+                // Select one representative per camera and cell first. The
+                // three camera layers are feathered below; choosing an owner
+                // here used to turn every projected camera boundary into a
+                // visible straight seam.
+                if (view_valid[view][slot] != 0U
+                    && sample.confidence <= view_confidence[view][slot]) {
                     continue;
                 }
-                best_confidence[slot] = sample.confidence;
-                atlas_x[slot] = (static_cast<float>(x) - state.width * 0.5f) / canvas_scale;
-                atlas_y[slot] = -(static_cast<float>(y) - state.height * 0.5f) / canvas_scale;
-                atlas_depth[slot] = residual / world_scale;
-                atlas_rgba[slot] = rgba;
-                atlas_valid[slot] = 1U;
-                atlas_view[slot] = sample.view;
+                view_confidence[view][slot] = sample.confidence;
+                view_depth[view][slot] = residual / world_scale;
+                view_color[view][slot] = sample.color;
+                view_valid[view][slot] = 1U;
             }
+        }
+    }
+
+    // Feather the three projected floor layers in their overlap. Distance to
+    // each layer's support boundary suppresses crop-edge samples gradually,
+    // while the confidence term resolves genuine local quality differences.
+    // A single-view cell keeps full weight, so this does not shrink coverage.
+    std::array<cv::Mat, 3> view_edge_distance;
+    for (std::size_t view = 0; view < 3U; ++view) {
+        cv::Mat support(state.height, state.width, CV_8UC1, view_valid[view].data());
+        cv::Mat support_u8;
+        support.convertTo(support_u8, CV_8UC1, 255.0);
+        cv::distanceTransform(support_u8, view_edge_distance[view], cv::DIST_L2, 3);
+    }
+    std::array<cv::Vec3f, 3> view_color_bias{
+        cv::Vec3f(0.0f, 0.0f, 0.0f),
+        cv::Vec3f(0.0f, 0.0f, 0.0f),
+        cv::Vec3f(0.0f, 0.0f, 0.0f)};
+    for (std::size_t view = 0; view < 3U; ++view) {
+        if (view == static_cast<std::size_t>(anchor_view)) {
+            continue;
+        }
+        std::array<std::vector<float>, 3> channel_differences;
+        for (std::size_t slot = 0; slot < slot_count; ++slot) {
+            if (view_valid[view][slot] == 0U
+                || view_valid[static_cast<std::size_t>(anchor_view)][slot] == 0U) {
+                continue;
+            }
+            const cv::Vec3f side = view_color[view][slot];
+            const cv::Vec3f anchor =
+                view_color[static_cast<std::size_t>(anchor_view)][slot];
+            for (int channel = 0; channel < 3; ++channel) {
+                if (side[channel] > 0.03f && side[channel] < 0.97f
+                    && anchor[channel] > 0.03f && anchor[channel] < 0.97f) {
+                    channel_differences[static_cast<std::size_t>(channel)].push_back(
+                        anchor[channel] - side[channel]);
+                }
+            }
+        }
+        for (int channel = 0; channel < 3; ++channel) {
+            const auto& differences = channel_differences[static_cast<std::size_t>(channel)];
+            if (differences.size() >= 128U) {
+                view_color_bias[view][channel] = std::clamp(
+                    median_value(differences), -0.18f, 0.18f);
+            }
+        }
+    }
+    const float confidence_span = std::max(
+        confidence_values.back() - confidence_threshold, 1e-6f);
+    constexpr float feather_radius = 32.0f;
+    for (int y = 0; y < state.height; ++y) {
+        for (int x = 0; x < state.width; ++x) {
+            const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
+            int contributor_count = 0;
+            for (std::size_t view = 0; view < 3U; ++view) {
+                contributor_count += view_valid[view][slot] != 0U ? 1 : 0;
+            }
+            if (contributor_count == 0) {
+                continue;
+            }
+            float weight_sum = 0.0f;
+            float depth_sum = 0.0f;
+            float confidence_sum = 0.0f;
+            cv::Vec3f color_sum(0.0f, 0.0f, 0.0f);
+            for (std::size_t view = 0; view < 3U; ++view) {
+                if (view_valid[view][slot] == 0U) {
+                    continue;
+                }
+                float weight = 1.0f;
+                if (contributor_count > 1) {
+                    const float edge_weight = std::clamp(
+                        view_edge_distance[view].at<float>(y, x) / feather_radius,
+                        0.05f,
+                        1.0f);
+                    const float confidence_weight = 0.2f + 0.8f * std::clamp(
+                        (view_confidence[view][slot] - confidence_threshold)
+                            / confidence_span,
+                        0.0f,
+                        1.0f);
+                    weight = edge_weight * confidence_weight;
+                    if (view == static_cast<std::size_t>(anchor_view)) {
+                        weight *= 1.1f;
+                    }
+                }
+                weight_sum += weight;
+                depth_sum += weight * view_depth[view][slot];
+                confidence_sum += weight * view_confidence[view][slot];
+                color_sum += weight * (view_color[view][slot] + view_color_bias[view]);
+            }
+            if (weight_sum <= 1e-6f) {
+                continue;
+            }
+            best_confidence[slot] = confidence_sum / weight_sum;
+            atlas_x[slot] = (static_cast<float>(x) - state.width * 0.5f) / canvas_scale;
+            atlas_y[slot] = -(static_cast<float>(y) - state.height * 0.5f) / canvas_scale;
+            atlas_depth[slot] = depth_sum / weight_sum;
+            const cv::Vec3f color = color_sum / weight_sum;
+            atlas_rgba[slot] = pack_rgba(
+                static_cast<std::uint8_t>(std::clamp(
+                    static_cast<int>(std::lround(color[0] * 255.0f)), 0, 255)),
+                static_cast<std::uint8_t>(std::clamp(
+                    static_cast<int>(std::lround(color[1] * 255.0f)), 0, 255)),
+                static_cast<std::uint8_t>(std::clamp(
+                    static_cast<int>(std::lround(color[2] * 255.0f)), 0, 255)));
+            atlas_valid[slot] = 1U;
         }
     }
 
@@ -3166,7 +3272,6 @@ CandidateCommit InferenceEngine::process_world_group(
         atlas_depth[slot] = atlas_depth[source];
         atlas_rgba[slot] = atlas_rgba[source];
         atlas_valid[slot] = 1U;
-        atlas_view[slot] = atlas_view[source];
     }
 
     // Reject isolated non-planar predictions in anchor-image space. Real
