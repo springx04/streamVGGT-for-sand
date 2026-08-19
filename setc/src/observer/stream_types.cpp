@@ -120,6 +120,8 @@ std::size_t CanvasState::slot_count() const noexcept {
 bool CanvasState::shape_valid() const noexcept {
     const std::size_t n = slot_count();
     return n > 0U
+        && x.size() == n
+        && y.size() == n
         && depth.size() == n
         && confidence.size() == n
         && rgba.size() == n
@@ -136,6 +138,8 @@ void CanvasState::reset(const int new_width, const int new_height) {
     width = new_width;
     height = new_height;
     const std::size_t n = slot_count();
+    x.assign(n, 0.0f);
+    y.assign(n, 0.0f);
     depth.assign(n, 0.0f);
     confidence.assign(n, 0.0f);
     rgba.assign(n, 0U);
@@ -172,7 +176,9 @@ std::array<std::uint8_t, 4> unpack_rgba(const std::uint32_t rgba) noexcept {
 SlotValue slot_value_at(const CanvasState& state, const std::uint32_t slot_id) {
     ensure_slot(state, slot_id);
     const std::size_t i = slot_id;
-    return SlotValue{state.depth[i], state.confidence[i], state.rgba[i], state.last_update_frame[i], state.valid[i]};
+    return SlotValue{
+        state.depth[i], state.confidence[i], state.rgba[i],
+        state.last_update_frame[i], state.valid[i], state.x[i], state.y[i]};
 }
 
 void set_slot_value(CanvasState& state, const std::uint32_t slot_id, const SlotValue& value) {
@@ -183,6 +189,8 @@ void set_slot_value(CanvasState& state, const std::uint32_t slot_id, const SlotV
     state.rgba[i] = value.rgba;
     state.last_update_frame[i] = value.last_update_frame;
     state.valid[i] = value.valid;
+    state.x[i] = value.x;
+    state.y[i] = value.y;
 }
 
 bool slot_value_equal(const SlotValue& lhs, const SlotValue& rhs) noexcept {
@@ -190,7 +198,9 @@ bool slot_value_equal(const SlotValue& lhs, const SlotValue& rhs) noexcept {
         && float_bits(lhs.confidence) == float_bits(rhs.confidence)
         && lhs.rgba == rhs.rgba
         && lhs.last_update_frame == rhs.last_update_frame
-        && lhs.valid == rhs.valid;
+        && lhs.valid == rhs.valid
+        && float_bits(lhs.x) == float_bits(rhs.x)
+        && float_bits(lhs.y) == float_bits(rhs.y);
 }
 
 PointCloudDelta commit_patch(CanvasState& state, const CandidatePatch& patch) {
@@ -343,6 +353,8 @@ std::uint64_t hash_state(const CanvasState& state) noexcept {
     std::uint64_t hash = 1469598103934665603ULL;
     hash_bytes(hash, &state.width, sizeof(state.width));
     hash_bytes(hash, &state.height, sizeof(state.height));
+    hash_bytes(hash, state.x.data(), state.x.size() * sizeof(float));
+    hash_bytes(hash, state.y.data(), state.y.size() * sizeof(float));
     hash_bytes(hash, state.depth.data(), state.depth.size() * sizeof(float));
     hash_bytes(hash, state.confidence.data(), state.confidence.size() * sizeof(float));
     hash_bytes(hash, state.rgba.data(), state.rgba.size() * sizeof(std::uint32_t));
@@ -383,6 +395,8 @@ void write_slot_value(BinaryWriter& writer, const SlotValue& value) {
     writer.u32(value.rgba);
     writer.u32(value.last_update_frame);
     writer.u8(value.valid);
+    writer.f32(value.x);
+    writer.f32(value.y);
 }
 
 SlotValue read_slot_value(BinaryReader& reader) {
@@ -392,6 +406,8 @@ SlotValue read_slot_value(BinaryReader& reader) {
     value.rgba = reader.u32();
     value.last_update_frame = reader.u32();
     value.valid = reader.u8();
+    value.x = reader.f32();
+    value.y = reader.f32();
     return value;
 }
 
@@ -494,7 +510,7 @@ PointCloudDelta read_delta(BinaryReader& reader) {
 void write_snapshot(BinaryWriter& writer, const Snapshot& snapshot) {
     const CanvasState& state = snapshot.state;
     writer.u32(0x4e53564fU);  // OVSN
-    writer.u16(1U);
+    writer.u16(2U);
     writer.u16(0U);
     writer.u32(static_cast<std::uint32_t>(state.width));
     writer.u32(static_cast<std::uint32_t>(state.height));
@@ -504,6 +520,8 @@ void write_snapshot(BinaryWriter& writer, const Snapshot& snapshot) {
     writer.u8(0U);
     writer.u16(0U);
     write_anchor_camera(writer, state.anchor_camera);
+    write_float_vector(writer, state.x);
+    write_float_vector(writer, state.y);
     write_float_vector(writer, state.depth);
     write_float_vector(writer, state.confidence);
     write_u32_vector(writer, state.rgba);
@@ -519,7 +537,7 @@ Snapshot read_snapshot(BinaryReader& reader) {
         throw std::runtime_error("invalid snapshot magic");
     }
     const std::uint16_t schema = reader.u16();
-    if (schema != 1U) {
+    if (schema != 2U) {
         throw std::runtime_error("unsupported snapshot schema");
     }
     (void)reader.u16();
@@ -532,6 +550,8 @@ Snapshot read_snapshot(BinaryReader& reader) {
     (void)reader.u8();
     (void)reader.u16();
     state.anchor_camera = read_anchor_camera(reader);
+    state.x = read_float_vector(reader);
+    state.y = read_float_vector(reader);
     state.depth = read_float_vector(reader);
     state.confidence = read_float_vector(reader);
     state.rgba = read_u32_vector(reader);

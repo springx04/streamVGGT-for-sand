@@ -164,7 +164,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=1,
-        help="Independent batch size B. Use 3 with --num-images 1 for grouped C++ inference.",
+        help="Batch size B. Grouped C++ inference uses B=1 with --num-images 3.",
     )
     parser.add_argument("--height", type=int, default=518)
     parser.add_argument("--width", type=int, default=518)

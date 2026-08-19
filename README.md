@@ -80,7 +80,7 @@ the optional legacy `INPUT_GROUP_SIZE=1` path:
 
 - `setc\artifacts\omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt`
 - `setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt`
-- `setc\artifacts\omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt`
+- `setc\artifacts\omnivggt_full_b1s3_406x252_bf16_unfrozen_torch270.pt`
 
 Export commands (from repository root):
 
@@ -89,7 +89,7 @@ setc\venv_torch270_cu128\Scripts\python.exe setc\scripts\export_torchscript.py -
 
 setc\venv_torch270_cu128\Scripts\python.exe setc\scripts\export_torchscript.py --output setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt --num-images 2 --height 700 --width 700 --dtype bfloat16 --autocast-dtype bfloat16 --observer-depth-only --no-freeze
 
-setc\venv_torch270_cu128\Scripts\python.exe setc\scripts\export_torchscript.py --output setc\artifacts\omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt --batch-size 3 --num-images 1 --height 252 --width 406 --dtype bfloat16 --autocast-dtype bfloat16 --observer-depth-only --no-freeze
+setc\venv_torch270_cu128\Scripts\python.exe setc\scripts\export_torchscript.py --output setc\artifacts\omnivggt_full_b1s3_406x252_bf16_unfrozen_torch270.pt --batch-size 1 --num-images 3 --height 252 --width 406 --dtype bfloat16 --autocast-dtype bfloat16 --no-freeze
 ```
 
 ### 2.4 One-click start
@@ -102,14 +102,13 @@ The launcher starts `omnivggt_stream_server.exe` in background, then launches `o
 
 By default it consumes non-overlapping three-camera groups from each logical
 frame (`1-1`, `1-2`, `1-3`, then `2-1`, `2-2`, `2-3`, …) and performs one CUDA
-forward with `B=3,S=1`. The middle image is the group anchor; the C++
-fusion keeps the anchor support as the geometry ownership mask, uses the two
-side predictions only for calibrated holes inside that support, and rejects
- the non-convex side-only strips that otherwise create visible gaps. Group mode
- keeps the anchor RGB source-faithful and does not reuse the single-view RGB
- bridge, because that bridge can create a long rectangular seam on a rotated
- group edge. Export and viewer point clouds close only enclosed support holes
- (never the outer black aperture). The run directory records the exact groups in
+forward with `B=1,S=3`. The three cameras are one model sequence, so their
+`world_points` share a coordinate frame. The low-texture lower surface is
+robustly fitted and compressed into its own XY atlas, with the anchor camera
+owning overlaps and side cameras filling only uncovered support. Raised objects
+use separate slots and anchor-view geometry, so they cannot overwrite the plane
+or create duplicate robot arms. Each logical frame replaces the prior atlas.
+The run directory records the exact groups in
 `input_groups.csv` and the batching contract in `metrics.csv`.
 
 For legacy temporal data such as `data2`, set `INPUT_GROUP_STRIDE=1` to restore
@@ -126,8 +125,8 @@ cmd /c setc\scripts\start_cpp_live_replay.bat
 
 - The Python launcher defaults to `data2`; the C++ launcher defaults to `data1`.
   Both use `700x700`, `cuda`, and `bf16` runtime settings.
-- The three-image path is deliberately `B=3,S=1`, not native `S=3`; this avoids
-  the three-height/three-color-layer artifact of native multi-image output.
+- The three-image path is `B=1,S=3`: one forward per logical frame with genuine
+  cross-view attention and shared world coordinates.
 - Group `model_ms` measures one batched forward, while `total_ms` also includes
   image loading, homography, fusion and Canvas patch work. Compare single-image
   timings with the documented dynamic/fixed ROI baseline rather than treating a

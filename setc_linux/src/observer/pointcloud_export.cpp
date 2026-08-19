@@ -199,6 +199,37 @@ std::vector<ExportPoint> export_clean_canvas_points(
         return {};
     }
 
+    if (state.anchor_camera.depth_scale < 0.0f) {
+        // Joint B=1,S=3 inference has already produced a shared world frame
+        // and rasterized its XY coordinates into the canvas.  Preserve that
+        // geometry directly: the legacy path below smooths an aligned depth
+        // image and removes its fitted plane, which would destroy a real
+        // three-camera scene.
+        std::vector<ExportPoint> points;
+        points.reserve(static_cast<std::size_t>(cv::countNonZero(valid)));
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                if (valid.at<std::uint8_t>(y, x) == 0U) {
+                    continue;
+                }
+                const cv::Vec3f color = rgb.at<cv::Vec3f>(y, x);
+                const std::size_t index = static_cast<std::size_t>(y) * width + x;
+                points.push_back(ExportPoint{
+                    state.x[index],
+                    state.y[index],
+                    depth.at<float>(y, x),
+                    static_cast<std::uint8_t>(std::clamp(
+                        static_cast<int>(std::lround(color[0] * 255.0f)), 0, 255)),
+                    static_cast<std::uint8_t>(std::clamp(
+                        static_cast<int>(std::lround(color[1] * 255.0f)), 0, 255)),
+                    static_cast<std::uint8_t>(std::clamp(
+                        static_cast<int>(std::lround(color[2] * 255.0f)), 0, 255)),
+                    changed.at<std::uint8_t>(y, x) != 0U});
+            }
+        }
+        return points;
+    }
+
     // The rotating aperture can leave a sizeable internal support gap when a
     // three-image group is committed as one canvas update.  Match the Python
     // geometry-first exporter: close up to 81 pixels, fill only enclosed

@@ -19,7 +19,7 @@ set "MODEL=%REPO%\setc\artifacts\omnivggt_observer_s1_700x434_bf16_unfrozen_torc
 rem Use the depth-only pair graph.  The fixed graph is loaded once; each
 rem Python-sized ROI is kept aspect-preserving inside its 700x700 border.
 set "PAIR_MODEL=%REPO%\setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt"
-set "GROUP_MODEL=%REPO%\setc\artifacts\omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt"
+set "GROUP_MODEL=%REPO%\setc\artifacts\omnivggt_full_b1s3_406x252_bf16_unfrozen_torch270.pt"
 rem The default is one non-overlapping three-camera group per logical frame.
 rem Set INPUT_GROUP_STRIDE=1 to replay the legacy 123/234 sliding windows.
 rem Set INPUT_GROUP_SIZE=1 before launching to keep the legacy S1/S2 observer command.
@@ -78,9 +78,9 @@ if "%INPUT_GROUP_SIZE%"=="1" if not exist "%PAIR_MODEL%" (
   exit /b 1
 )
 if "%INPUT_GROUP_SIZE%"=="3" if not exist "%GROUP_MODEL%" (
-  echo [ERROR] Three-image B=3,S=1 model not found:
+  echo [ERROR] Three-image B=1,S=3 model not found:
   echo         %GROUP_MODEL%
-  echo Export it with --batch-size 3 --num-images 1 --height 252 --width 406.
+  echo Export it with --batch-size 1 --num-images 3 --height 252 --width 406.
   pause
   exit /b 1
 )
@@ -98,7 +98,7 @@ echo Queue:   %QUEUE_CAPACITY%  (lossless offline replay)
 echo Canvas:  %CANVAS_WIDTH%x%CANVAS_HEIGHT%  first_model=%FIRST_MODEL_WIDTH%x%FIRST_MODEL_HEIGHT%
 if "%INPUT_GROUP_SIZE%"=="3" (
   echo Input:   groups of 3, stride=%INPUT_GROUP_STRIDE%, anchor=%GROUP_ANCHOR_INDEX%
-  echo Group:   B=3,S=1 %GROUP_MODEL_WIDTH%x%GROUP_MODEL_HEIGHT%, one forward per logical frame
+  echo Group:   B=1,S=3 %GROUP_MODEL_WIDTH%x%GROUP_MODEL_HEIGHT%, one forward per logical frame
 ) else (
   echo Pair:    fixed 700x700 observer graph, aspect-preserving ROI letterbox
   echo          (loaded and warmed once; avoids per-ROI TorchScript reloads)

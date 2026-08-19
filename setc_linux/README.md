@@ -24,19 +24,19 @@ setc_linux/
 ├── models/                                   # 使用者自行放入 .pt 和可选 checkpoint
 │   ├── omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt
 │   ├── omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt
-│   └── omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt
+│   └── omnivggt_full_b1s3_406x252_bf16_unfrozen_torch270.pt
 ├── outputs/                                  # 运行时自动生成
 └── build_live_observer/                      # 编译时自动生成
 ```
 
 默认三图运行只需要
-`models/omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt`；仅在设置
+`models/omnivggt_full_b1s3_406x252_bf16_unfrozen_torch270.pt`；仅在设置
 `INPUT_GROUP_SIZE=1` 使用旧单图/双图路径时，才需要前两个 S1/S2 模型。
 
 默认输入目录是 `data1/`，默认输出目录是 `outputs/data1_cpp_linux_live_replay/`。模型和数据也可以完全放在目录外：
 
 ```bash
-GROUP_MODEL=/data/models/group_b3s1.pt \
+GROUP_MODEL=/data/models/group_b1s3.pt \
 IMAGE_DIR=/data/scene_images \
 OUTPUT_DIR=/data/omnivggt_output \
 bash scripts/start_cpp_live_replay.sh
@@ -143,16 +143,16 @@ python3 scripts/export_torchscript.py \
   --observer-depth-only --no-freeze
 ```
 
-三图 B=3,S=1 模型：
+三图 B=1,S=3 模型：
 
 ```bash
 python3 scripts/export_torchscript.py \
   --model-source /path/to/OmniVGGT-Python \
   --checkpoint models/OmniVGGT.safetensors \
-  --output models/omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt \
-  --batch-size 3 --num-images 1 --height 252 --width 406 \
+  --output models/omnivggt_full_b1s3_406x252_bf16_unfrozen_torch270.pt \
+  --batch-size 1 --num-images 3 --height 252 --width 406 \
   --dtype bfloat16 --autocast-dtype bfloat16 \
-  --observer-depth-only --no-freeze
+  --no-freeze
 ```
 
 动态 pair bucket 可使用：
@@ -174,8 +174,7 @@ bash scripts/start_cpp_live_replay.sh
 
 默认配置与 Windows C++ 流程保持一致：每个逻辑帧使用一个不重叠的三相机组
 （`1-1`、`1-2`、`1-3`，然后 `2-1`、`2-2`、`2-3`、…），组内锚点为中图，一次
- `B=3,S=1` CUDA BF16 forward；几何以锚图 support 为所有权掩码，侧图只在锚图
- 范围内补充可信深度，组模式不复用单图 RGB bridge，避免旋转组边缘的长方形色缝，导出只填充封闭内部孔洞。组模型输入 `406x252`，700x700 对齐画布、队列
+ `B=1,S=3` CUDA BF16 forward。三相机在模型内共享世界坐标；下方低纹理区域经过稳健曲面拟合后独立做 XY 栅格压缩，锚相机拥有重叠区域，侧相机只扩展空缺。机械臂和其他非平面点使用独立槽位并只保留锚相机观测，避免与底面竞争或产生多机械臂重影。组模型输入 `406x252`，700x700 对齐画布、队列
 容量 1024、端口 37651。服务器日志写入输出目录的 `server.log`。关闭 viewer 后，
 启动脚本只会清理它自己启动的 server PID，不会按进程名结束其他任务。
 
@@ -192,7 +191,7 @@ INPUT_GROUP_SIZE=1 bash scripts/start_cpp_live_replay.sh
 `--input-group-size 1` 才会切换回单图/双图路径。
 
 三图运行目录中的 `input_groups.csv` 记录每个三相机组，`metrics.csv` 中的
-`forward_calls=1`、`forward_batch_size=3`、`forward_sequence_size=1` 是速度和形状验收字段。
+`forward_calls=1`、`forward_batch_size=1`、`forward_sequence_size=3` 是速度和形状验收字段。
 
 如果 LibTorch 或 CUDA 动态库不在系统搜索路径，启动脚本会自动把 `${LIBTORCH}/lib` 和 `${CUDA_HOME}/lib64`（如果存在）加入 `LD_LIBRARY_PATH`：
 

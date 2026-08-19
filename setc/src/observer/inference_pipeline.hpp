@@ -16,8 +16,8 @@ namespace omnivggt::observer {
 
 struct InferenceOptions {
     std::string model;
-    // Independent three-image batch graph.  It must be exported with
-    // [B=3,S=1] and is never used as a native S=3 sequence graph.
+    // Joint three-camera graph exported as [B=1,S=3].  All three views share
+    // one forward pass and one world-coordinate prediction.
     std::string group_model;
     int group_width = 406;
     int group_height = 252;
@@ -118,6 +118,7 @@ struct PreparedInput {
     cv::Mat match_rgb_f;
     cv::Mat support;
     bool has_group = false;
+    std::vector<cv::Mat> group_model_rgb_f;
     std::vector<cv::Mat> group_warped_rgb_f;
     std::vector<cv::Mat> group_valid_warp;
     cv::Mat group_fused_rgb_f;
@@ -156,6 +157,7 @@ private:
     };
 
     struct PreparedGroup {
+        std::vector<cv::Mat> model_rgb_f;
         std::vector<cv::Mat> warped_rgb_f;
         std::vector<cv::Mat> valid_warp;
         cv::Mat fused_rgb_f;
@@ -255,6 +257,11 @@ private:
         const FrameImage& frame,
         const PreparedGroup* group,
         bool observation_group,
+        double read_ms);
+    CandidateCommit process_world_group(
+        const RawFrame& raw,
+        const CanvasState& state,
+        const PreparedGroup& group,
         double read_ms);
     CandidateCommit process_group(const RawFrame& raw, const CanvasState& state);
 };

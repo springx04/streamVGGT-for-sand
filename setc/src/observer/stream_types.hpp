@@ -53,6 +53,8 @@ struct SlotValue {
     std::uint32_t rgba = 0;
     std::uint32_t last_update_frame = 0;
     std::uint8_t valid = 0;
+    float x = 0.0f;
+    float y = 0.0f;
 };
 
 struct SlotDelta {
@@ -109,6 +111,8 @@ struct PointCloudDelta {
 struct CanvasState {
     int width = 0;
     int height = 0;
+    std::vector<float> x;
+    std::vector<float> y;
     std::vector<float> depth;
     std::vector<float> confidence;
     std::vector<std::uint32_t> rgba;
