@@ -108,6 +108,10 @@ robustly fitted and compressed into its own XY atlas, with the anchor camera
 owning overlaps and side cameras filling only uncovered support. Raised objects
 use separate slots and anchor-view geometry, so they cannot overwrite the plane
 or create duplicate robot arms. Each logical frame replaces the prior atlas.
+Group images preserve their original aspect ratio and are center-cropped to the
+fixed model shape instead of being stretched. The planar atlas uses dense 3x3
+cell coverage plus largest-component/small-hole regularization; high suspended
+non-planar outliers are discarded because the lower surface is the priority.
 The run directory records the exact groups in
 `input_groups.csv` and the batching contract in `metrics.csv`.
 

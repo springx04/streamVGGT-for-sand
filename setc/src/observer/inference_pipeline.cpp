@@ -2883,6 +2883,8 @@ CandidateCommit InferenceEngine::process_world_group(
         cv::Vec3f color;
         float confidence = 0.0f;
         std::uint8_t view = 0U;
+        int pixel_x = 0;
+        int pixel_y = 0;
     };
     std::vector<WorldSample> candidates;
     std::vector<float> confidence_values;
@@ -2896,8 +2898,14 @@ CandidateCommit InferenceEngine::process_world_group(
             throw std::runtime_error("joint three-camera prediction has no world points");
         }
         const cv::Mat& color = group.model_rgb_f[view];
+        constexpr int model_border = 8;
         for (int y = 0; y < prediction.world_points.rows; ++y) {
             for (int x = 0; x < prediction.world_points.cols; ++x) {
+                if (x < model_border || y < model_border
+                    || x >= prediction.world_points.cols - model_border
+                    || y >= prediction.world_points.rows - model_border) {
+                    continue;
+                }
                 const cv::Vec3f point = prediction.world_points.at<cv::Vec3f>(y, x);
                 const float confidence = prediction.world_points_confidence.at<float>(y, x);
                 if (!std::isfinite(point[0]) || !std::isfinite(point[1])
@@ -2906,7 +2914,7 @@ CandidateCommit InferenceEngine::process_world_group(
                 }
                 candidates.push_back(WorldSample{
                     point, color.at<cv::Vec3f>(y, x), confidence,
-                    static_cast<std::uint8_t>(view)});
+                    static_cast<std::uint8_t>(view), x, y});
                 confidence_values.push_back(confidence);
             }
         }
@@ -2916,7 +2924,7 @@ CandidateCommit InferenceEngine::process_world_group(
     }
     std::sort(confidence_values.begin(), confidence_values.end());
     const std::size_t confidence_index = static_cast<std::size_t>(
-        0.25 * static_cast<double>(confidence_values.size() - 1U));
+        0.10 * static_cast<double>(confidence_values.size() - 1U));
     const float confidence_threshold = std::max(
         static_cast<float>(options_.min_conf), confidence_values[confidence_index]);
 
@@ -3015,40 +3023,229 @@ CandidateCommit InferenceEngine::process_world_group(
             // camera only. The joint model still uses all three images, but
             // duplicate side-view arms cannot enter the published cloud.
             if (sample.view == anchor_view
-                && std::abs(residual) <= 0.5f * world_scale
+                && std::abs(residual) <= 0.2f * world_scale
                 && std::abs(nx) <= 0.5f && std::abs(ny) <= 0.5f) {
                 raised_anchor_samples.push_back(&sample);
             }
             continue;
         }
-        const int x = static_cast<int>(std::lround(nx * canvas_scale + state.width * 0.5f));
-        const int y = static_cast<int>(std::lround(-ny * canvas_scale + state.height * 0.5f));
-        if (x < 0 || x >= state.width || y < 0 || y >= state.height) {
-            continue;
-        }
-        const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
-        // The anchor camera owns overlap pixels. Side cameras extend the
-        // support only where the anchor has no sample; this prevents the
-        // same floor mark or cable edge from appearing twice in the atlas.
-        if (atlas_valid[slot] != 0U
-            && (atlas_view[slot] == anchor_view
-                || (sample.view != anchor_view
-                    && sample.confidence <= best_confidence[slot]))) {
-            continue;
-        }
-        best_confidence[slot] = sample.confidence;
-        atlas_x[slot] = nx;
-        atlas_y[slot] = ny;
-        atlas_depth[slot] = residual / world_scale;
-        atlas_rgba[slot] = pack_rgba(
+        const int center_x_px = static_cast<int>(
+            std::lround(nx * canvas_scale + state.width * 0.5f));
+        const int center_y_px = static_cast<int>(
+            std::lround(-ny * canvas_scale + state.height * 0.5f));
+        const std::uint32_t rgba = pack_rgba(
             static_cast<std::uint8_t>(std::clamp(
                 static_cast<int>(std::lround(sample.color[0] * 255.0f)), 0, 255)),
             static_cast<std::uint8_t>(std::clamp(
                 static_cast<int>(std::lround(sample.color[1] * 255.0f)), 0, 255)),
             static_cast<std::uint8_t>(std::clamp(
                 static_cast<int>(std::lround(sample.color[2] * 255.0f)), 0, 255)));
+        // A 406x252 prediction cannot densely cover a 770x630 atlas with
+        // one cell per sample. Splat only the fitted lower surface into a
+        // 3x3 footprint; raised geometry remains unsplatted and independent.
+        for (int offset_y = -1; offset_y <= 1; ++offset_y) {
+            const int y = center_y_px + offset_y;
+            if (y < 0 || y >= state.height) {
+                continue;
+            }
+            for (int offset_x = -1; offset_x <= 1; ++offset_x) {
+                const int x = center_x_px + offset_x;
+                if (x < 0 || x >= state.width) {
+                    continue;
+                }
+                const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
+                // The anchor camera owns overlap pixels. Side cameras extend
+                // support only where the anchor has no sample.
+                if (atlas_valid[slot] != 0U
+                    && (atlas_view[slot] == anchor_view
+                        || (sample.view != anchor_view
+                            && sample.confidence <= best_confidence[slot]))) {
+                    continue;
+                }
+                best_confidence[slot] = sample.confidence;
+                atlas_x[slot] = (static_cast<float>(x) - state.width * 0.5f) / canvas_scale;
+                atlas_y[slot] = -(static_cast<float>(y) - state.height * 0.5f) / canvas_scale;
+                atlas_depth[slot] = residual / world_scale;
+                atlas_rgba[slot] = rgba;
+                atlas_valid[slot] = 1U;
+                atlas_view[slot] = sample.view;
+            }
+        }
+    }
+
+    // Regularize only the planar atlas support. Keep its largest connected
+    // component, remove one-cell tendrils, and close small internal holes.
+    // Raised geometry has not been inserted yet and is therefore untouched.
+    cv::Mat plane_mask(state.height, state.width, CV_8UC1, cv::Scalar(0));
+    for (int y = 0; y < state.height; ++y) {
+        for (int x = 0; x < state.width; ++x) {
+            const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
+            if (atlas_valid[slot] != 0U) {
+                plane_mask.at<std::uint8_t>(y, x) = 255U;
+            }
+        }
+    }
+    cv::morphologyEx(
+        plane_mask,
+        plane_mask,
+        cv::MORPH_OPEN,
+        cv::Mat::ones(3, 3, CV_8UC1));
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count = cv::connectedComponentsWithStats(
+        plane_mask, labels, stats, centroids, 8, CV_32S);
+    int largest_component = 0;
+    int largest_area = 0;
+    for (int component = 1; component < component_count; ++component) {
+        const int area = stats.at<int>(component, cv::CC_STAT_AREA);
+        if (area > largest_area) {
+            largest_area = area;
+            largest_component = component;
+        }
+    }
+    cv::Mat main_plane = cv::Mat::zeros(plane_mask.size(), CV_8UC1);
+    if (largest_component > 0) {
+        main_plane.setTo(255U, labels == largest_component);
+        cv::morphologyEx(
+            main_plane,
+            main_plane,
+            cv::MORPH_CLOSE,
+            cv::Mat::ones(7, 7, CV_8UC1));
+    }
+
+    std::vector<std::int32_t> nearest_plane(slot_count, -1);
+    std::deque<int> plane_queue;
+    for (int y = 0; y < state.height; ++y) {
+        for (int x = 0; x < state.width; ++x) {
+            const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
+            const bool retained = main_plane.at<std::uint8_t>(y, x) != 0U;
+            if (!retained) {
+                atlas_valid[slot] = 0U;
+                continue;
+            }
+            if (atlas_valid[slot] != 0U) {
+                nearest_plane[slot] = static_cast<std::int32_t>(slot);
+                plane_queue.push_back(static_cast<int>(slot));
+            }
+        }
+    }
+    constexpr int neighbor_x[4] = {-1, 1, 0, 0};
+    constexpr int neighbor_y[4] = {0, 0, -1, 1};
+    while (!plane_queue.empty()) {
+        const int slot = plane_queue.front();
+        plane_queue.pop_front();
+        const int x = slot % state.width;
+        const int y = slot / state.width;
+        for (int direction = 0; direction < 4; ++direction) {
+            const int nx = x + neighbor_x[direction];
+            const int ny = y + neighbor_y[direction];
+            if (nx < 0 || nx >= state.width || ny < 0 || ny >= state.height
+                || main_plane.at<std::uint8_t>(ny, nx) == 0U) {
+                continue;
+            }
+            const std::size_t neighbor = static_cast<std::size_t>(ny) * state.width + nx;
+            if (nearest_plane[neighbor] >= 0) {
+                continue;
+            }
+            nearest_plane[neighbor] = nearest_plane[static_cast<std::size_t>(slot)];
+            plane_queue.push_back(static_cast<int>(neighbor));
+        }
+    }
+    for (std::size_t slot = 0; slot < slot_count; ++slot) {
+        const std::int32_t source_slot = nearest_plane[slot];
+        if (source_slot < 0 || static_cast<std::size_t>(source_slot) == slot) {
+            continue;
+        }
+        const std::size_t source = static_cast<std::size_t>(source_slot);
+        const int x = static_cast<int>(slot % static_cast<std::size_t>(state.width));
+        const int y = static_cast<int>(slot / static_cast<std::size_t>(state.width));
+        best_confidence[slot] = best_confidence[source];
+        atlas_x[slot] = (static_cast<float>(x) - state.width * 0.5f) / canvas_scale;
+        atlas_y[slot] = -(static_cast<float>(y) - state.height * 0.5f) / canvas_scale;
+        atlas_depth[slot] = atlas_depth[source];
+        atlas_rgba[slot] = atlas_rgba[source];
         atlas_valid[slot] = 1U;
-        atlas_view[slot] = sample.view;
+        atlas_view[slot] = atlas_view[source];
+    }
+
+    // Reject isolated non-planar predictions in anchor-image space. Real
+    // robot/object surfaces form sizeable connected regions; single bright
+    // pixels otherwise become visibly floating 3D points.
+    if (!raised_anchor_samples.empty()) {
+        cv::Mat raised_mask(
+            options_.group_height, options_.group_width, CV_8UC1, cv::Scalar(0));
+        for (const WorldSample* sample : raised_anchor_samples) {
+            raised_mask.at<std::uint8_t>(sample->pixel_y, sample->pixel_x) = 255U;
+        }
+        cv::Mat raised_labels;
+        cv::Mat raised_stats;
+        cv::Mat raised_centroids;
+        const int raised_component_count = cv::connectedComponentsWithStats(
+            raised_mask, raised_labels, raised_stats, raised_centroids, 8, CV_32S);
+        std::vector<std::uint8_t> keep_component(
+            static_cast<std::size_t>(raised_component_count), 0U);
+        for (int component = 1; component < raised_component_count; ++component) {
+            if (raised_stats.at<int>(component, cv::CC_STAT_AREA) >= 24) {
+                keep_component[static_cast<std::size_t>(component)] = 1U;
+            }
+        }
+        raised_anchor_samples.erase(
+            std::remove_if(
+                raised_anchor_samples.begin(),
+                raised_anchor_samples.end(),
+                [&](const WorldSample* sample) {
+                    const int component = raised_labels.at<int>(sample->pixel_y, sample->pixel_x);
+                    return component <= 0
+                        || keep_component[static_cast<std::size_t>(component)] == 0U;
+                }),
+            raised_anchor_samples.end());
+    }
+    if (!raised_anchor_samples.empty()) {
+        cv::Mat raised_world_mask(
+            state.height, state.width, CV_8UC1, cv::Scalar(0));
+        for (const WorldSample* sample : raised_anchor_samples) {
+            const int x = static_cast<int>(std::lround(
+                (sample->point[0] - center_x) / world_scale * canvas_scale
+                + state.width * 0.5f));
+            const int y = static_cast<int>(std::lround(
+                -(sample->point[1] - center_y) / world_scale * canvas_scale
+                + state.height * 0.5f));
+            if (x >= 0 && x < state.width && y >= 0 && y < state.height) {
+                cv::circle(raised_world_mask, cv::Point(x, y), 1, cv::Scalar(255), -1);
+            }
+        }
+        cv::Mat world_labels;
+        cv::Mat world_stats;
+        cv::Mat world_centroids;
+        const int world_component_count = cv::connectedComponentsWithStats(
+            raised_world_mask, world_labels, world_stats, world_centroids, 8, CV_32S);
+        std::vector<std::uint8_t> keep_world_component(
+            static_cast<std::size_t>(world_component_count), 0U);
+        for (int component = 1; component < world_component_count; ++component) {
+            if (world_stats.at<int>(component, cv::CC_STAT_AREA) >= 48) {
+                keep_world_component[static_cast<std::size_t>(component)] = 1U;
+            }
+        }
+        raised_anchor_samples.erase(
+            std::remove_if(
+                raised_anchor_samples.begin(),
+                raised_anchor_samples.end(),
+                [&](const WorldSample* sample) {
+                    const int x = static_cast<int>(std::lround(
+                        (sample->point[0] - center_x) / world_scale * canvas_scale
+                        + state.width * 0.5f));
+                    const int y = static_cast<int>(std::lround(
+                        -(sample->point[1] - center_y) / world_scale * canvas_scale
+                        + state.height * 0.5f));
+                    if (x < 0 || x >= state.width || y < 0 || y >= state.height) {
+                        return true;
+                    }
+                    const int component = world_labels.at<int>(y, x);
+                    return component <= 0
+                        || keep_world_component[static_cast<std::size_t>(component)] == 0U;
+                }),
+            raised_anchor_samples.end());
     }
 
     // Non-planar points occupy unused storage slots and retain their true
@@ -4854,14 +5051,37 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
             return result;
         }();
         for (int index = 0; index < 3; ++index) {
-            cv::Mat model_rgb;
+            // Match omnivggt_edge preprocessing exactly. The source images
+            // are 5:4, while the group graph is 406x252; directly resizing
+            // 700x560 to that shape squashes Y by about 22 percent and causes
+            // incorrect camera poses, duplicated floor edges and large gaps.
+            const cv::Mat& source = frames[static_cast<std::size_t>(index)].match_rgb_f;
+            const double model_scale = static_cast<double>(options_.group_width)
+                / static_cast<double>(source.cols);
+            const int resized_height = round_to_multiple_14(
+                static_cast<double>(source.rows) * model_scale);
+            cv::Mat resized_model;
             cv::resize(
-                frames[static_cast<std::size_t>(index)].match_rgb_f,
-                model_rgb,
-                cv::Size(options_.group_width, options_.group_height),
+                source,
+                resized_model,
+                cv::Size(options_.group_width, resized_height),
                 0.0,
                 0.0,
                 cv::INTER_AREA);
+            cv::Mat model_rgb;
+            if (resized_height > options_.group_height) {
+                const int crop_y = (resized_height - options_.group_height) / 2;
+                model_rgb = resized_model(cv::Rect(
+                    0, crop_y, options_.group_width, options_.group_height)).clone();
+            } else if (resized_height < options_.group_height) {
+                model_rgb = cv::Mat::zeros(
+                    options_.group_height, options_.group_width, CV_32FC3);
+                const int pad_top = (options_.group_height - resized_height) / 2;
+                resized_model.copyTo(model_rgb(cv::Rect(
+                    0, pad_top, options_.group_width, resized_height)));
+            } else {
+                model_rgb = std::move(resized_model);
+            }
             prepared_input.group_model_rgb_f.push_back(std::move(model_rgb));
             cv::Mat aligned_rgb = frames[static_cast<std::size_t>(index)].rgb_f.clone();
             cv::Mat aligned_support = frames[static_cast<std::size_t>(index)].support.clone();
