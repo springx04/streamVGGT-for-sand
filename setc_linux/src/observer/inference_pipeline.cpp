@@ -2898,7 +2898,10 @@ CandidateCommit InferenceEngine::process_world_group(
             throw std::runtime_error("joint three-camera prediction has no world points");
         }
         const cv::Mat& color = group.model_rgb_f[view];
-        constexpr int model_border = 16;
+        // World predictions become unstable near the resized model crop. A
+        // slightly wider guard removes narrow side-camera strips that can be
+        // connected to the real floor and therefore survive component tests.
+        constexpr int model_border = 20;
         for (int y = 0; y < prediction.world_points.rows; ++y) {
             for (int x = 0; x < prediction.world_points.cols; ++x) {
                 if (x < model_border || y < model_border
@@ -3204,23 +3207,70 @@ CandidateCommit InferenceEngine::process_world_group(
     cv::Mat centroids;
     const int component_count = cv::connectedComponentsWithStats(
         plane_mask, labels, stats, centroids, 8, CV_32S);
-    int largest_component = 0;
     int largest_area = 0;
     for (int component = 1; component < component_count; ++component) {
         const int area = stats.at<int>(component, cv::CC_STAT_AREA);
         if (area > largest_area) {
             largest_area = area;
-            largest_component = component;
         }
     }
     cv::Mat main_plane = cv::Mat::zeros(plane_mask.size(), CV_8UC1);
-    if (largest_component > 0) {
-        main_plane.setTo(255U, labels == largest_component);
+    if (largest_area > 0) {
+        const int minimum_plane_component = std::max(
+            512, static_cast<int>(std::lround(0.005 * largest_area)));
+        for (int component = 1; component < component_count; ++component) {
+            const int area = stats.at<int>(component, cv::CC_STAT_AREA);
+            const int width = stats.at<int>(component, cv::CC_STAT_WIDTH);
+            const int height = stats.at<int>(component, cv::CC_STAT_HEIGHT);
+            const bool is_largest = area == largest_area;
+            const bool broad_support = width >= 64 && height >= 64
+                && std::max(width, height) <= 4 * std::min(width, height);
+            if (area >= minimum_plane_component && (is_largest || broad_support)) {
+                main_plane.setTo(255U, labels == component);
+            }
+        }
+        const cv::Mat observed_plane = main_plane.clone();
+
+        // Seal only narrow support cuts before classifying holes. Occlusions
+        // from the robot/device can leave an interior floor region connected
+        // to the exterior through a thin channel, so direct inverse-component
+        // testing would incorrectly preserve that gap.
+        cv::morphologyEx(
+            main_plane,
+            main_plane,
+            cv::MORPH_CLOSE,
+            cv::Mat::ones(15, 15, CV_8UC1));
+
+        // Fill only bounded interior support holes. Components touching the
+        // canvas border are unobserved exterior and must never be extrapolated.
+        cv::Mat inverse_plane;
+        cv::bitwise_not(main_plane, inverse_plane);
+        cv::Mat hole_labels;
+        cv::Mat hole_stats;
+        cv::Mat hole_centroids;
+        const int hole_count = cv::connectedComponentsWithStats(
+            inverse_plane, hole_labels, hole_stats, hole_centroids, 8, CV_32S);
+        for (int component = 1; component < hole_count; ++component) {
+            const int left = hole_stats.at<int>(component, cv::CC_STAT_LEFT);
+            const int top = hole_stats.at<int>(component, cv::CC_STAT_TOP);
+            const int width = hole_stats.at<int>(component, cv::CC_STAT_WIDTH);
+            const int height = hole_stats.at<int>(component, cv::CC_STAT_HEIGHT);
+            const int area = hole_stats.at<int>(component, cv::CC_STAT_AREA);
+            const bool touches_border = left == 0 || top == 0
+                || left + width >= state.width || top + height >= state.height;
+            if (!touches_border && area <= 12000) {
+                main_plane.setTo(255U, hole_labels == component);
+            }
+        }
         cv::morphologyEx(
             main_plane,
             main_plane,
             cv::MORPH_CLOSE,
             cv::Mat::ones(7, 7, CV_8UC1));
+
+        // Mark directly observed support for smooth interpolation after the
+        // nearest-source geometry propagation below.
+        plane_mask = observed_plane;
     }
 
     std::vector<std::int32_t> nearest_plane(slot_count, -1);
@@ -3275,6 +3325,73 @@ CandidateCommit InferenceEngine::process_world_group(
         atlas_depth[slot] = atlas_depth[source];
         atlas_rgba[slot] = atlas_rgba[source];
         atlas_valid[slot] = 1U;
+    }
+
+    // Interpolate only synthesized bounded holes from surrounding measured
+    // floor samples. This preserves real printed/black object texture while
+    // preventing nearest-neighbour color blocks inside repaired support.
+    cv::Mat interpolation_weight(
+        state.height, state.width, CV_32FC1, cv::Scalar(0.0f));
+    cv::Mat interpolation_depth(
+        state.height, state.width, CV_32FC1, cv::Scalar(0.0f));
+    cv::Mat interpolation_confidence(
+        state.height, state.width, CV_32FC1, cv::Scalar(0.0f));
+    cv::Mat interpolation_color(
+        state.height, state.width, CV_32FC3, cv::Scalar(0.0f, 0.0f, 0.0f));
+    for (int y = 0; y < state.height; ++y) {
+        for (int x = 0; x < state.width; ++x) {
+            if (plane_mask.at<std::uint8_t>(y, x) == 0U) {
+                continue;
+            }
+            const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
+            if (atlas_valid[slot] == 0U) {
+                continue;
+            }
+            const auto rgba = unpack_rgba(atlas_rgba[slot]);
+            interpolation_weight.at<float>(y, x) = 1.0f;
+            interpolation_depth.at<float>(y, x) = atlas_depth[slot];
+            interpolation_confidence.at<float>(y, x) = best_confidence[slot];
+            interpolation_color.at<cv::Vec3f>(y, x) = cv::Vec3f(
+                static_cast<float>(rgba[0]),
+                static_cast<float>(rgba[1]),
+                static_cast<float>(rgba[2]));
+        }
+    }
+    cv::Mat smooth_weight;
+    cv::Mat smooth_depth;
+    cv::Mat smooth_confidence;
+    cv::Mat smooth_color;
+    constexpr double hole_sigma = 18.0;
+    cv::GaussianBlur(
+        interpolation_weight, smooth_weight, cv::Size(), hole_sigma, hole_sigma);
+    cv::GaussianBlur(
+        interpolation_depth, smooth_depth, cv::Size(), hole_sigma, hole_sigma);
+    cv::GaussianBlur(
+        interpolation_confidence, smooth_confidence, cv::Size(), hole_sigma, hole_sigma);
+    cv::GaussianBlur(
+        interpolation_color, smooth_color, cv::Size(), hole_sigma, hole_sigma);
+    for (int y = 0; y < state.height; ++y) {
+        for (int x = 0; x < state.width; ++x) {
+            if (main_plane.at<std::uint8_t>(y, x) == 0U
+                || plane_mask.at<std::uint8_t>(y, x) != 0U) {
+                continue;
+            }
+            const float weight = smooth_weight.at<float>(y, x);
+            if (weight <= 1e-6f) {
+                continue;
+            }
+            const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
+            atlas_depth[slot] = smooth_depth.at<float>(y, x) / weight;
+            best_confidence[slot] = smooth_confidence.at<float>(y, x) / weight;
+            const cv::Vec3f color = smooth_color.at<cv::Vec3f>(y, x) / weight;
+            atlas_rgba[slot] = pack_rgba(
+                static_cast<std::uint8_t>(std::clamp(
+                    static_cast<int>(std::lround(color[0])), 0, 255)),
+                static_cast<std::uint8_t>(std::clamp(
+                    static_cast<int>(std::lround(color[1])), 0, 255)),
+                static_cast<std::uint8_t>(std::clamp(
+                    static_cast<int>(std::lround(color[2])), 0, 255)));
+        }
     }
 
     // Reject isolated non-planar predictions in anchor-image space. Real
