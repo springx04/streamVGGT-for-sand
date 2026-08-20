@@ -3239,7 +3239,7 @@ CandidateCommit InferenceEngine::process_world_group(
             main_plane,
             main_plane,
             cv::MORPH_CLOSE,
-            cv::Mat::ones(15, 15, CV_8UC1));
+            cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(31, 31)));
 
         // Fill only bounded interior support holes. Components touching the
         // canvas border are unobserved exterior and must never be extrapolated.
@@ -3266,7 +3266,7 @@ CandidateCommit InferenceEngine::process_world_group(
             main_plane,
             main_plane,
             cv::MORPH_CLOSE,
-            cv::Mat::ones(7, 7, CV_8UC1));
+            cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
 
         // Mark directly observed support for smooth interpolation after the
         // nearest-source geometry propagation below.
