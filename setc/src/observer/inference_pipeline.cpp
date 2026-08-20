@@ -2997,7 +2997,10 @@ CandidateCommit InferenceEngine::process_world_group(
 
     Timer patch_timer;
     const std::size_t slot_count = state.slot_count();
-    const float canvas_scale = static_cast<float>(std::max(state.width, state.height));
+    // Fit the normalized world footprint by the shorter canvas side. Using
+    // the longer side clipped valid Y support on the 770x630 atlas and exposed
+    // that canvas limit as a false horizontal reconstruction edge.
+    const float canvas_scale = static_cast<float>(std::min(state.width, state.height));
     std::vector<float> best_confidence(slot_count, -std::numeric_limits<float>::infinity());
     std::vector<float> atlas_x(slot_count, 0.0f);
     std::vector<float> atlas_y(slot_count, 0.0f);

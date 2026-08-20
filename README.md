@@ -109,6 +109,8 @@ independently, then overlapping floor cells use confidence- and boundary-distanc
 feathering instead of hard camera ownership. Robust per-channel exposure offsets
 are estimated from real overlap cells before blending, and unreliable model-edge
 samples are discarded; the path does not extrapolate unobserved floor support.
+The atlas uses its shorter canvas side for isotropic world scaling, preventing
+the 770x630 canvas from clipping valid Y support into a false horizontal edge.
 Raised objects use separate slots and anchor-view geometry, so they cannot
 overwrite the plane or create duplicate robot arms. Each logical frame replaces the prior atlas.
 Group images preserve their original aspect ratio and are center-cropped to the
