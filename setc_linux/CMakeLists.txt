@@ -37,7 +37,7 @@ if(TORCH_CXX_FLAGS)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 endif()
 
-set(OMNIVGGT_OPENCV_COMPONENTS core imgcodecs imgproc features2d calib3d)
+set(OMNIVGGT_OPENCV_COMPONENTS core imgcodecs imgproc features2d calib3d photo)
 if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
     list(APPEND OMNIVGGT_OPENCV_COMPONENTS highgui)
 endif()
@@ -92,9 +92,17 @@ if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
     target_include_directories(omnivggt_observer_history
         PUBLIC
             ${CMAKE_CURRENT_SOURCE_DIR}/src/observer
+            ${OpenCV_INCLUDE_DIRS}
     )
     target_compile_features(omnivggt_observer_history PUBLIC cxx_std_17)
-    target_link_libraries(omnivggt_observer_history PUBLIC Threads::Threads)
+    # protocol.hpp now exposes SubmitFrameMessage{cv::Mat}, so OpenCV core is a
+    # PUBLIC dependency of the history library (consumed by the viewer, replay
+    # log and validate_history tools in addition to the inference/server targets).
+    target_link_libraries(omnivggt_observer_history
+        PUBLIC
+            Threads::Threads
+            ${OpenCV_LIBS}
+    )
     set_target_properties(omnivggt_observer_history PROPERTIES
         BUILD_RPATH "${OMNIVGGT_RUNTIME_RPATH}"
         INSTALL_RPATH "${OMNIVGGT_RUNTIME_RPATH}"
@@ -104,6 +112,7 @@ if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
         src/observer/frame_source.cpp
         src/observer/live_frame_source.cpp
         src/observer/inference_pipeline.cpp
+        src/observer/group_world_fusion.cpp
     )
     target_include_directories(omnivggt_observer_inference
         PUBLIC
@@ -127,6 +136,7 @@ if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
 
     add_executable(omnivggt_stream_server
         src/observer/stream_server_main.cpp
+        src/observer/pointcloud_export.cpp
     )
     target_link_libraries(omnivggt_stream_server
         PRIVATE

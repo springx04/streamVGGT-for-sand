@@ -1,6 +1,7 @@
 #pragma once
 
 #include "frame_source.hpp"
+#include "group_world_fusion.hpp"
 
 #include <opencv2/core.hpp>
 #include <torch/script.h>
@@ -106,6 +107,21 @@ struct CandidateCommit {
     bool has_patch = false;
 };
 
+// A decoded/normalized camera view retained by the live three-camera
+// observation path. The group model is intentionally not required: each
+// view can be evaluated by the existing S1 graph and merged conservatively
+// into the common Canvas.
+struct PreparedView {
+    std::filesystem::path path;
+    cv::Mat rgb_u8;
+    cv::Mat rgb_f;
+    cv::Mat match_rgb_u8;
+    cv::Mat match_rgb_f;
+    cv::Mat support;
+    cv::Mat canvas_homography;
+    bool pair_alignment_valid = false;
+};
+
 struct PreparedInput {
     RawFrame raw;
     FrameSeq frame_seq = 0;
@@ -124,6 +140,7 @@ struct PreparedInput {
     cv::Mat group_fused_rgb_f;
     cv::Mat group_union_valid;
     bool has_observation_group = false;
+    std::vector<PreparedView> observation_views;
 };
 
 class InferenceEngine {
@@ -141,17 +158,20 @@ private:
         cv::Mat match_rgb_u8;
         cv::Mat match_rgb_f;
         cv::Mat support;
+        cv::Mat forced_homography;
+        bool forced_homography_valid = false;
     };
 
     struct Prediction {
         cv::Mat depth;
         cv::Mat confidence;
-        // Keep the complete OmniVGGT point-head result available even though
-        // the aligned-canvas fusion consumes the depth/confidence maps.  The
-        // Python live replay uses the same depth canvas for its final PLY,
-        // while retaining these arrays prevents a silent depth-only path.
+        // The B=1,S=3 world path consumes these point-head arrays directly;
+        // depth remains available only for legacy metrics/diagnostics.
         cv::Mat world_points;
         cv::Mat world_points_confidence;
+        cv::Vec3f pose_translation = cv::Vec3f(0.0f, 0.0f, 0.0f);
+        cv::Vec4f pose_quaternion = cv::Vec4f(0.0f, 0.0f, 0.0f, 1.0f);
+        bool has_pose = false;
         float fov_h = 1.2f;
         float fov_w = 1.2f;
     };
@@ -169,6 +189,7 @@ private:
     torch::ScalarType dtype_ = torch::kFloat32;
     torch::jit::script::Module module_;
     torch::jit::script::Module group_module_;
+    GroupWorldFusion group_world_fusion_;
     torch::jit::script::Module pair_module_;
     // Dynamic pair artifacts are large (about 2.4 GB each in the BF16
     // observer build). Keep a small GPU LRU so switching between the common
@@ -257,11 +278,23 @@ private:
         const FrameImage& frame,
         const PreparedGroup* group,
         bool observation_group,
-        double read_ms);
+        double read_ms,
+        const cv::Mat* forced_homography = nullptr);
     CandidateCommit process_world_group(
         const RawFrame& raw,
         const CanvasState& state,
         const PreparedGroup& group,
+        double read_ms);
+    CandidateCommit process_observation_group(
+        const RawFrame& raw,
+        const CanvasState& state,
+        const std::vector<FrameImage>& views,
+        double read_ms);
+    CandidateCommit process_pair_observation(
+        const RawFrame& raw,
+        const CanvasState& state,
+        const FrameImage& anchor,
+        const FrameImage& side,
         double read_ms);
     CandidateCommit process_group(const RawFrame& raw, const CanvasState& state);
 };
