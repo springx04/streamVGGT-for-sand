@@ -47,6 +47,7 @@ public:
     std::optional<FrameRecord> find_frame(FrameSeq frame_seq) const;
     FrameRecord frame_at_or_before(FrameSeq frame_seq) const;
     std::vector<DeltaIndexEntry> delta_index() const { return delta_index_; }
+    void compact(std::size_t keep_groups);
 
 private:
     std::filesystem::path run_dir_;

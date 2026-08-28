@@ -16,8 +16,8 @@ namespace omnivggt::observer {
 
 struct InferenceOptions {
     std::string model;
-    // Independent three-image batch graph.  It must be exported with
-    // [B=3,S=1] and is never used as a native S=3 sequence graph.
+    // Joint three-camera graph exported as [B=1,S=3].  All three views share
+    // one forward pass and one world-coordinate prediction.
     std::string group_model;
     int group_width = 406;
     int group_height = 252;
@@ -106,6 +106,21 @@ struct CandidateCommit {
     bool has_patch = false;
 };
 
+// A decoded/normalized camera view retained by the live three-camera
+// observation path. The group model is intentionally not required: each
+// view can be evaluated by the existing S1 graph and merged conservatively
+// into the common Canvas.
+struct PreparedView {
+    std::filesystem::path path;
+    cv::Mat rgb_u8;
+    cv::Mat rgb_f;
+    cv::Mat match_rgb_u8;
+    cv::Mat match_rgb_f;
+    cv::Mat support;
+    cv::Mat canvas_homography;
+    bool pair_alignment_valid = false;
+};
+
 struct PreparedInput {
     RawFrame raw;
     FrameSeq frame_seq = 0;
@@ -118,11 +133,13 @@ struct PreparedInput {
     cv::Mat match_rgb_f;
     cv::Mat support;
     bool has_group = false;
+    std::vector<cv::Mat> group_model_rgb_f;
     std::vector<cv::Mat> group_warped_rgb_f;
     std::vector<cv::Mat> group_valid_warp;
     cv::Mat group_fused_rgb_f;
     cv::Mat group_union_valid;
     bool has_observation_group = false;
+    std::vector<PreparedView> observation_views;
 };
 
 class InferenceEngine {
@@ -140,6 +157,8 @@ private:
         cv::Mat match_rgb_u8;
         cv::Mat match_rgb_f;
         cv::Mat support;
+        cv::Mat forced_homography;
+        bool forced_homography_valid = false;
     };
 
     struct Prediction {
@@ -151,11 +170,15 @@ private:
         // while retaining these arrays prevents a silent depth-only path.
         cv::Mat world_points;
         cv::Mat world_points_confidence;
+        cv::Vec3f pose_translation = cv::Vec3f(0.0f, 0.0f, 0.0f);
+        cv::Vec4f pose_quaternion = cv::Vec4f(0.0f, 0.0f, 0.0f, 1.0f);
+        bool has_pose = false;
         float fov_h = 1.2f;
         float fov_w = 1.2f;
     };
 
     struct PreparedGroup {
+        std::vector<cv::Mat> model_rgb_f;
         std::vector<cv::Mat> warped_rgb_f;
         std::vector<cv::Mat> valid_warp;
         cv::Mat fused_rgb_f;
@@ -254,6 +277,24 @@ private:
         const CanvasState& state,
         const FrameImage& frame,
         const PreparedGroup* group,
+        bool observation_group,
+        double read_ms,
+        const cv::Mat* forced_homography = nullptr);
+    CandidateCommit process_world_group(
+        const RawFrame& raw,
+        const CanvasState& state,
+        const PreparedGroup& group,
+        double read_ms);
+    CandidateCommit process_observation_group(
+        const RawFrame& raw,
+        const CanvasState& state,
+        const std::vector<FrameImage>& views,
+        double read_ms);
+    CandidateCommit process_pair_observation(
+        const RawFrame& raw,
+        const CanvasState& state,
+        const FrameImage& anchor,
+        const FrameImage& side,
         double read_ms);
     CandidateCommit process_group(const RawFrame& raw, const CanvasState& state);
 };
@@ -277,6 +318,7 @@ private:
     };
 
     FrameImage load_frame(const std::filesystem::path& path) const;
+    FrameImage load_frame(const std::filesystem::path& path, const cv::Mat& rgb) const;
     cv::Mat estimate_pair_homography(const FrameImage& source, const FrameImage& target) const;
     static cv::Mat gray_u8(const cv::Mat& rgb_u8);
     static cv::Mat warp_like(const cv::Mat& source, const cv::Mat& homography, cv::Size size, int interpolation);

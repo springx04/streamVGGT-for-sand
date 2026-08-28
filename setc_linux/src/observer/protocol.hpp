@@ -2,6 +2,8 @@
 
 #include "stream_types.hpp"
 
+#include <opencv2/core.hpp>
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -22,6 +24,8 @@ enum class MessageType : std::uint16_t {
 
     Subscribe = 100,
     ReplayRequest = 101,
+    // Client -> server: one in-memory camera frame for the live input path.
+    SubmitFrame = 102,
 };
 
 struct Packet {
@@ -60,6 +64,15 @@ struct ReplayRequestMessage {
     FrameSeq target_frame = 0;
 };
 
+// A single in-memory camera frame pushed by the GUI into the server's
+// LiveFrameSource.  The image is RGB (matches read_rgb / load_frame(path, rgb))
+// and is transported as contiguous pixel bytes so the server never falls back
+// to cv::imread on disk.
+struct SubmitFrameMessage {
+    std::uint64_t source_seq = 0;
+    cv::Mat image;
+};
+
 Packet make_hello(const HelloMessage& message);
 HelloMessage decode_hello(const Packet& packet);
 Packet make_snapshot(const Snapshot& snapshot);
@@ -81,6 +94,8 @@ std::string decode_error(const Packet& packet);
 Packet make_subscribe();
 Packet make_replay_request(const ReplayRequestMessage& message);
 ReplayRequestMessage decode_replay_request(const Packet& packet);
+Packet make_submit_frame(std::uint64_t source_seq, const cv::Mat& image);
+SubmitFrameMessage decode_submit_frame(const Packet& packet);
 
 std::vector<std::uint8_t> encode_packet(const Packet& packet);
 PacketHeader decode_packet_header(const std::vector<std::uint8_t>& header_bytes);

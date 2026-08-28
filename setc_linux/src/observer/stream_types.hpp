@@ -53,6 +53,10 @@ struct SlotValue {
     std::uint32_t rgba = 0;
     std::uint32_t last_update_frame = 0;
     std::uint8_t valid = 0;
+    // World-coordinate X/Y (joint B=1,S=3 mode).  Zero in the legacy
+    // aligned-depth residual path; populated by process_world_group.
+    float x = 0.0f;
+    float y = 0.0f;
 };
 
 struct SlotDelta {

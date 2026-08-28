@@ -1,6 +1,9 @@
 #include "bounded_queue.hpp"
 #include "frame_source.hpp"
+#include "history_compactor.hpp"
 #include "inference_pipeline.hpp"
+#include "inflight_gate.hpp"
+#include "pointcloud_export.hpp"
 #include "protocol.hpp"
 #include "tcp_transport.hpp"
 #include "version_store.hpp"
@@ -45,12 +48,24 @@ struct ServerArgs {
     std::uint64_t num_images = 0;
     std::uint16_t port = 37651;
     std::uint32_t snapshot_interval = 60;
+    std::size_t history_keep_groups = 0U;
     std::size_t queue_capacity = 3;
     int poll_ms = 50;
     bool once = false;
     bool resume = false;
-    std::size_t input_group_size = 1U;
-    std::size_t input_group_stride = 1U;
+    // Live camera input: frames arrive in-memory over the viewer TCP socket as
+    // SubmitFrame packets and are fed to LiveFrameSource::submit_frame.  When
+    // set, --image_dir is not required and DirectoryFrameSource is not started.
+    bool live_input = false;
+    // The production Linux observer consumes the same non-overlapping
+    // three-camera groups as the one-click launcher.  Keep the legacy
+    // sliding windows available through --input-group-stride 1 and the
+    // single-image path through an explicit --input-group-size 1.
+    std::size_t input_group_size = 3U;
+    // The current replay input is three cameras captured for one logical
+    // frame.  Keep the group non-overlapping by default; callers can still
+    // pass --input-group-stride 1 for the legacy temporal sliding windows.
+    std::size_t input_group_stride = 3U;
     std::size_t group_anchor_index = 1U;
 };
 
@@ -69,21 +84,24 @@ void usage() {
         << "  --model-pair model.pt  Two-frame TorchScript graph for later frames.\n"
         << "  --model-pair-dir DIR  Dynamic two-frame bucket artifacts (WxH in filename).\n"
         << "  --pair-letterbox      Use one pair graph with aspect-preserving edge padding.\n"
-        << "  --model-group3 model.pt  Independent B=3,S=1 three-image graph.\n"
-        << "  --input-group-size N  Logical input group size (1 or 3), default 1.\n"
-        << "  --input-group-stride N Sliding group stride, default 1.\n"
+        << "  --model-group3 model.pt  Joint B=1,S=3 three-camera graph.\n"
+        << "  --input-group-size N  Logical input group size (1 or 3), default 3.\n"
+        << "  --input-group-stride N Group stride, default 3 (use 1 for legacy sliding windows).\n"
         << "  --group-anchor-index N Anchor within a three-image group, default 1.\n"
-        << "  --group-model-width W --group-model-height H  B=3,S=1 graph dimensions.\n"
+        << "  --group-model-width W --group-model-height H  B=1,S=3 graph dimensions.\n"
         << "  --output_dir DIR       Parent directory for independent run history.\n"
         << "  --run_dir DIR          Explicit run directory; use --resume to reopen it.\n"
         << "  --num_images N         Process at most N images (0 means watch continuously).\n"
         << "  --once                 Stop after the current directory has been consumed.\n"
         << "  --resume               Recover CanvasState and history from --run_dir.\n"
+        << "  --live_input           In-memory camera input via SubmitFrame packets on the\n"
+        << "                         viewer socket (replaces --image_dir; no cv::imread).\n"
         << "  --port N               Viewer TCP port, default 37651.\n"
         << "  --queue_capacity N     Latest-frame queue capacity, default 3.\n"
         << "  --queue-capacity N     Hyphenated alias; use a large value for offline replay.\n"
         << "  --poll_ms N            Directory polling interval, default 50.\n"
         << "  --snapshot_interval N  Snapshot every N committed versions, default 60.\n"
+        << "  --history-keep-groups N  Keep approximately the newest N logical groups.\n"
         << "  --height H --width W   Fixed model/canvas dimensions, default 518x518.\n"
         << "  --target-size H --target-width W  Python-launcher compatible aliases.\n"
         << "  --canvas-width W --canvas-height H  Padded aligned-canvas dimensions.\n"
@@ -138,6 +156,9 @@ ServerArgs parse_args(const int argc, char** argv) {
             args.poll_ms = std::stoi(require_value(i, argc, argv, key));
         } else if (key == "--snapshot_interval") {
             args.snapshot_interval = static_cast<std::uint32_t>(std::stoul(require_value(i, argc, argv, key)));
+        } else if (key == "--history-keep-groups") {
+            args.history_keep_groups = static_cast<std::size_t>(
+                std::stoull(require_value(i, argc, argv, key)));
         } else if (key == "--height" || key == "--target-size") {
             args.inference.height = std::stoi(require_value(i, argc, argv, key));
         } else if (key == "--width" || key == "--target-width") {
@@ -168,6 +189,8 @@ ServerArgs parse_args(const int argc, char** argv) {
             args.once = true;
         } else if (key == "--resume") {
             args.resume = true;
+        } else if (key == "--live_input" || key == "--live-input") {
+            args.live_input = true;
         } else if (key == "--save_debug") {
             args.inference.save_debug = true;
         } else if (key == "--no-save-debug") {
@@ -179,12 +202,43 @@ ServerArgs parse_args(const int argc, char** argv) {
             throw std::runtime_error("unknown argument: " + key);
         }
     }
-    if (args.image_dir.empty()) {
+    if (args.live_input) {
+        // Live input is three cameras from one logical frame. LiveFrameSource
+        // synchronizes the latest image from each source lane, emits camera
+        // order 0, 1, 2, and keeps camera 1 as the anchor.
+        args.input_group_size = 3U;
+        args.input_group_stride = 3U;
+        args.group_anchor_index = 1U;
+        // The GUI launcher predates --model-group3 and only passes the S1
+        // model path.  Prefer the joint B=1,S=3 graph shipped beside that
+        // model so live reconstruction cannot silently fall back to the
+        // anchor-plus-patches observation path.  An explicit --model-group3
+        // still wins, and installations without the graph keep the legacy
+        // fallback for compatibility.
+        if (args.inference.group_model.empty() && !args.inference.model.empty()) {
+            const fs::path bundled_group_model =
+                fs::path(args.inference.model).parent_path()
+                / "omnivggt_full_b1s3_406x252_bf16_unfrozen_torch270.pt";
+            if (fs::is_regular_file(bundled_group_model)) {
+                args.inference.group_model = bundled_group_model.string();
+                std::cerr << "Live three-camera mode: using joint B1S3 model: "
+                          << args.inference.group_model << '\n';
+            }
+        }
+        if (args.resume) {
+            throw std::runtime_error("--live_input does not support --resume");
+        }
+    } else if (args.image_dir.empty()) {
         usage();
         throw std::runtime_error("--image_dir is required");
     }
     if (args.input_group_size != 1U && args.input_group_size != 3U) {
         throw std::runtime_error("--input-group-size must be 1 or 3");
+    }
+    if (args.input_group_size == 1U) {
+        // The legacy S1/S2 path has no multi-image window, so its only
+        // meaningful stride is one even when the new group default is used.
+        args.input_group_stride = 1U;
     }
     if (args.input_group_stride == 0U || args.input_group_stride > args.input_group_size) {
         throw std::runtime_error("--input-group-stride must be in [1, input-group-size]");
@@ -220,7 +274,7 @@ ServerArgs parse_args(const int argc, char** argv) {
         args.inference.group_mode = false;
         args.inference.group_observation_mode = false;
     }
-    if (!fs::is_directory(args.image_dir)) {
+    if (!args.live_input && !fs::is_directory(args.image_dir)) {
         throw std::runtime_error("--image_dir is not a directory: " + args.image_dir.string());
     }
     if (args.inference.width <= 0 || args.inference.height <= 0
@@ -275,6 +329,37 @@ fs::path make_run_dir(const ServerArgs& args) {
 
 class ClientSession;
 
+PointCloudDelta make_display_delta(
+    const PointCloudDelta& raw_delta,
+    const CanvasState& before_state,
+    const CanvasState& after_state) {
+    CanvasState before_display = visual_canvas_state(before_state);
+    CanvasState after_display = visual_canvas_state(after_state);
+    if (!after_display.shape_valid()
+        || after_display.slot_count() == 0U) {
+        return raw_delta;
+    }
+
+    PointCloudDelta display_delta = raw_delta;
+    display_delta.changes.clear();
+    const bool before_compatible = before_display.shape_valid()
+        && before_display.slot_count() == after_display.slot_count();
+    for (std::uint32_t slot = 0;
+         slot < static_cast<std::uint32_t>(after_display.slot_count());
+         ++slot) {
+        const SlotValue before = before_compatible
+            ? slot_value_at(before_display, slot) : SlotValue{};
+        const SlotValue after = slot_value_at(after_display, slot);
+        if (!slot_value_equal(before, after)) {
+            display_delta.changes.push_back(SlotDelta{slot, before, after});
+        }
+    }
+    display_delta.valid_point_count = static_cast<std::uint32_t>(
+        std::count(after_display.valid.begin(), after_display.valid.end(),
+            static_cast<std::uint8_t>(1U)));
+    return display_delta;
+}
+
 class StreamRuntime {
 public:
     StreamRuntime(const ServerArgs& args, const fs::path& run_dir)
@@ -322,7 +407,9 @@ public:
             run_dir_.filename().string()};
     }
 
-    Snapshot current_snapshot() const { return Snapshot{snapshot()}; }
+    Snapshot current_snapshot() const {
+        return Snapshot{visual_canvas_state(snapshot())};
+    }
 
     FrameSeq next_frame_sequence() const {
         std::lock_guard<std::mutex> lock(history_mutex_);
@@ -386,7 +473,15 @@ public:
 
     ReplayBundle replay(const FrameSeq frame_seq) const {
         std::lock_guard<std::mutex> lock(history_mutex_);
-        return store_.build_replay(frame_seq);
+        ReplayBundle bundle = store_.build_replay(frame_seq);
+        CanvasState raw_state = bundle.snapshot.state;
+        bundle.snapshot.state = visual_canvas_state(raw_state);
+        for (PointCloudDelta& delta : bundle.deltas) {
+            const CanvasState before_state = raw_state;
+            apply_delta_forward(raw_state, delta);
+            delta = make_display_delta(delta, before_state, raw_state);
+        }
+        return bundle;
     }
 
     CommitVersion latest_snapshot_version() const {
@@ -452,6 +547,7 @@ public:
         }
 
         PointCloudDelta delta;
+        CanvasState previous_state;
         CanvasState committed_state;
         try {
             {
@@ -459,6 +555,7 @@ public:
                 if (state_.version != candidate.patch.base_version) {
                     throw std::runtime_error("stale CandidatePatch base_version");
                 }
+                previous_state = state_;
                 delta = commit_patch(state_, candidate.patch);
                 committed_state = state_;
             }
@@ -491,11 +588,16 @@ public:
             store_.append_metrics(candidate.metrics.csv_line());
             if (store_.should_snapshot(delta)) {
                 store_.write_snapshot(committed_state);
+                if (args_.history_keep_groups != 0U) {
+                    HistoryCompactor::compact(store_, args_.history_keep_groups);
+                }
             }
         }
+        const PointCloudDelta display_delta = make_display_delta(
+            delta, previous_state, committed_state);
         live_head_frame_.store(std::max(live_head_frame_.load(), candidate.frame.frame_seq));
         publish(make_frame_status(candidate.frame));
-        publish(make_delta(MessageType::Delta, delta));
+        publish(make_delta(MessageType::Delta, display_delta));
         publish(make_live_head(candidate.frame.frame_seq, candidate.frame.commit_version));
         mark_frame_handled(candidate.frame.frame_seq);
         std::cout << "frame=" << candidate.frame.frame_seq
@@ -511,6 +613,9 @@ public:
 
     void remove_dead_clients();
     void publish(const Packet& packet);
+    // Stop and join every client session.  Must be called before live_source
+    // is destroyed so client reader threads stop calling frame_submit_handler_.
+    void shutdown_clients();
 
     CommitVersion current_version() const {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -592,7 +697,9 @@ private:
         group_manifest_ << ',' << raw.group_anchor_index << ',' << status << '\n';
         group_manifest_.flush();
         if (std::string(status) == "Received") {
-            pending_groups_[raw.frame_seq] = raw;
+            RawFrame metadata = raw;
+            metadata.group_images.clear();
+            pending_groups_[raw.frame_seq] = std::move(metadata);
         } else {
             pending_groups_.erase(raw.frame_seq);
         }
@@ -673,18 +780,21 @@ public:
     using SnapshotProvider = std::function<Snapshot()>;
     using ReplayProvider = std::function<ReplayBundle(FrameSeq)>;
     using ResyncVersionProvider = std::function<CommitVersion()>;
+    using FrameSubmitHandler = std::function<void(std::uint64_t, const cv::Mat&)>;
 
     ClientSession(
         TcpSocket socket,
         HelloProvider hello_provider,
         SnapshotProvider snapshot_provider,
         ReplayProvider replay_provider,
-        ResyncVersionProvider resync_version_provider)
+        ResyncVersionProvider resync_version_provider,
+        FrameSubmitHandler frame_submit_handler = nullptr)
         : socket_(std::move(socket)),
           hello_provider_(std::move(hello_provider)),
           snapshot_provider_(std::move(snapshot_provider)),
           replay_provider_(std::move(replay_provider)),
           resync_version_provider_(std::move(resync_version_provider)),
+          frame_submit_handler_(std::move(frame_submit_handler)),
           live_queue_(256U),
           replay_queue_(64U) {}
 
@@ -779,6 +889,13 @@ private:
                     }
                     latest_generation_.store(request.generation);
                     request_condition_.notify_one();
+                } else if (packet.type == MessageType::SubmitFrame) {
+                    // In-memory camera frame from the GUI; forwarded to
+                    // LiveFrameSource::submit_frame via the handler callback.
+                    if (frame_submit_handler_) {
+                        const SubmitFrameMessage frame = decode_submit_frame(packet);
+                        frame_submit_handler_(frame.source_seq, frame.image);
+                    }
                 }
             }
         } catch (const std::exception&) {
@@ -838,6 +955,7 @@ private:
     SnapshotProvider snapshot_provider_;
     ReplayProvider replay_provider_;
     ResyncVersionProvider resync_version_provider_;
+    FrameSubmitHandler frame_submit_handler_;
     BoundedQueue<Packet> live_queue_;
     BoundedQueue<Packet> replay_queue_;
     std::atomic<bool> stopping_{false};
@@ -859,6 +977,20 @@ void StreamRuntime::remove_dead_clients() {
         clients_.end());
 }
 
+void StreamRuntime::shutdown_clients() {
+    std::vector<std::shared_ptr<ClientSession>> clients;
+    {
+        std::lock_guard<std::mutex> lock(client_mutex_);
+        clients = clients_;
+    }
+    for (const auto& client : clients) {
+        client->request_stop();
+    }
+    for (const auto& client : clients) {
+        client->join();
+    }
+}
+
 void StreamRuntime::publish(const Packet& packet) {
     remove_dead_clients();
     std::vector<std::shared_ptr<ClientSession>> clients;
@@ -874,7 +1006,8 @@ void StreamRuntime::publish(const Packet& packet) {
 void accept_loop(
     TcpListener& listener,
     StreamRuntime& runtime,
-    std::atomic<bool>& stop_requested) {
+    std::atomic<bool>& stop_requested,
+    ClientSession::FrameSubmitHandler frame_submit_handler) {
     while (!stop_requested.load()) {
         try {
             TcpSocket socket = listener.accept_one();
@@ -883,7 +1016,8 @@ void accept_loop(
                 [&runtime] { return runtime.hello(); },
                 [&runtime] { return runtime.current_snapshot(); },
                 [&runtime](const FrameSeq target) { return runtime.replay(target); },
-                [&runtime] { return runtime.latest_snapshot_version(); });
+                [&runtime] { return runtime.latest_snapshot_version(); },
+                frame_submit_handler);
             runtime.add_client(client);
             client->start();
             std::cout << "viewer connected\n";
@@ -934,31 +1068,82 @@ int main(int argc, char** argv) {
         std::signal(SIGINT, on_signal);
         std::signal(SIGTERM, on_signal);
 
-        BoundedQueue<RawFrame> frame_queue(args.queue_capacity);
-        BoundedQueue<PreparedInput> prepared_queue(args.queue_capacity);
+        // Offline replay preserves the configured backlog. Live reconstruction
+        // keeps only one waiting raw group and one waiting prepared group: the
+        // acquisition/preprocess/inference stages remain separate, but inference
+        // cannot trail a changing scene by a queue full of historical groups.
+        const std::size_t live_stage_capacity = args.live_input ? 1U : args.queue_capacity;
+        BoundedQueue<RawFrame> frame_queue(live_stage_capacity);
+        BoundedQueue<PreparedInput> prepared_queue(live_stage_capacity);
         BoundedQueue<CandidateCommit> commit_queue(args.queue_capacity + 2U);
+        InFlightGate inflight_gate;
 
-        DirectorySourceOptions source_options;
-        source_options.directory = args.image_dir;
-        source_options.queue_capacity = args.queue_capacity;
-        source_options.poll_ms = args.poll_ms;
-        source_options.max_frames = args.num_images;
-        source_options.group_size = args.input_group_size;
-        source_options.group_stride = args.input_group_stride;
-        source_options.group_anchor_index = args.group_anchor_index;
-        source_options.once = args.once;
-        source_options.start_frame_seq = args.resume ? runtime.next_frame_sequence() : 0U;
-        if (args.resume && args.input_group_size == 1U) {
-            source_options.skip_image_names = runtime.completed_image_names();
-        } else if (args.resume && args.input_group_size == 3U) {
-            source_options.skip_group_keys = runtime.completed_group_keys();
+        // Live camera input uses LiveFrameSource (in-memory cv::Mat groups) fed
+        // by SubmitFrame packets on the viewer socket.  Directory mode keeps the
+        // existing DirectoryFrameSource and ignores SubmitFrame packets.
+        // live_source and frame_submit_handler are declared after frame_queue so
+        // they are destroyed before it (and before runtime) during stack unwinding.
+        std::unique_ptr<LiveFrameSource> live_source;
+        ClientSession::FrameSubmitHandler frame_submit_handler;
+        if (args.live_input) {
+            live_source = std::make_unique<LiveFrameSource>(
+                args.input_group_size,
+                args.input_group_stride,
+                args.group_anchor_index,
+                [&runtime, &frame_queue](RawFrame group) {
+                    runtime.note_received(group);
+                    // Never block the socket reader on inference throughput.
+                    // Keep the newest complete three-camera group and explicitly
+                    // mark an older waiting group as coalesced.
+                    std::optional<RawFrame> dropped;
+                    const bool accepted =
+                        frame_queue.push_latest(std::move(group), dropped);
+                    if (dropped.has_value()) {
+                        runtime.record_coalesced(*dropped);
+                    }
+                    return accepted;
+                });
+            LiveFrameSource* live_ptr = live_source.get();
+            frame_submit_handler = [live_ptr](std::uint64_t source_seq, const cv::Mat& image) {
+                live_ptr->submit_frame(source_seq, image);
+            };
         }
-        DirectoryFrameSource source(source_options);
 
-        std::thread accept_thread([&] { accept_loop(listener, runtime, stop_requested); });
+        std::unique_ptr<DirectoryFrameSource> source;
+        if (!args.live_input) {
+            DirectorySourceOptions source_options;
+            source_options.directory = args.image_dir;
+            source_options.queue_capacity = args.queue_capacity;
+            source_options.poll_ms = args.poll_ms;
+            source_options.max_frames = args.num_images;
+            source_options.group_size = args.input_group_size;
+            source_options.group_stride = args.input_group_stride;
+            source_options.group_anchor_index = args.group_anchor_index;
+            source_options.once = args.once;
+            source_options.start_frame_seq = args.resume ? runtime.next_frame_sequence() : 0U;
+            if (args.resume && args.input_group_size == 1U) {
+                source_options.skip_image_names = runtime.completed_image_names();
+            } else if (args.resume && args.input_group_size == 3U) {
+                source_options.skip_group_keys = runtime.completed_group_keys();
+            }
+            source = std::make_unique<DirectoryFrameSource>(source_options);
+        }
+
+        std::thread accept_thread([&] {
+            accept_loop(listener, runtime, stop_requested, frame_submit_handler);
+        });
         std::thread source_thread([&] {
+            if (args.live_input) {
+                // Live mode: frames arrive via SubmitFrame packets handled by
+                // ClientSession -> live_source->submit_frame().  This thread just
+                // waits for shutdown so the pipeline threads can be joined.
+                while (!stop_requested.load()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                return;
+            }
             try {
-                source.run(
+                source->run(
                     frame_queue,
                     stop_requested,
                     [&runtime](const RawFrame& raw) { runtime.note_received(raw); },
@@ -974,17 +1159,45 @@ int main(int argc, char** argv) {
             try {
                 FramePreprocessor preprocessor(configured_args.inference);
                 while (true) {
+                    // In live mode reserve pipeline capacity before taking a
+                    // frame. While inference is full, frame_queue therefore
+                    // keeps replacing its one waiting entry with the newest
+                    // complete three-camera group instead of this worker
+                    // holding an old group outside the queue.
+                    if (args.live_input) {
+                        inflight_gate.acquire();
+                    }
                     const std::optional<RawFrame> raw = frame_queue.pop();
                     if (!raw.has_value()) {
+                        if (args.live_input) {
+                            inflight_gate.release();
+                        }
                         break;
+                    }
+                    if (!args.live_input) {
+                        inflight_gate.acquire();
                     }
                     try {
                         PreparedInput prepared = preprocessor.prepare(*raw);
-                        if (!prepared_queue.push_wait(std::move(prepared))) {
+                        if (args.live_input) {
+                            std::optional<PreparedInput> dropped;
+                            const bool accepted = prepared_queue.push_latest(
+                                std::move(prepared), dropped);
+                            if (dropped.has_value()) {
+                                runtime.record_coalesced(dropped->raw);
+                                inflight_gate.release();
+                            }
+                            if (!accepted) {
+                                inflight_gate.release();
+                                break;
+                            }
+                        } else if (!prepared_queue.push_wait(std::move(prepared))) {
+                            inflight_gate.release();
                             break;
                         }
                     } catch (const std::exception& error) {
                         runtime.record_failed(*raw, error.what());
+                        inflight_gate.release();
                     }
                 }
             } catch (const std::exception& error) {
@@ -1012,11 +1225,14 @@ int main(int argc, char** argv) {
                         CandidateCommit candidate = engine.process_prepared(*prepared, state);
                         const FrameSeq frame_seq = candidate.frame.frame_seq;
                         if (!commit_queue.push_wait(std::move(candidate))) {
+                            inflight_gate.release();
                             break;
                         }
                         runtime.wait_until_frame_handled(frame_seq);
+                        inflight_gate.release();
                     } catch (const std::exception& error) {
                         runtime.record_failed(prepared->raw, error.what());
+                        inflight_gate.release();
                     }
                 }
             } catch (const std::exception& error) {
@@ -1072,6 +1288,15 @@ int main(int argc, char** argv) {
         if (accept_thread.joinable()) {
             accept_thread.join();
         }
+        // Stop and join every client session before live_source (and its
+        // frame_submit_handler) is destroyed, because client reader threads call
+        // live_source->submit_frame via the handler.  Closing live_source first
+        // makes any in-flight submit_frame return immediately instead of
+        // blocking on the closed frame_queue.
+        if (args.live_input && live_source) {
+            live_source->close();
+        }
+        runtime.shutdown_clients();
         std::cout << "server stopped; history is in " << run_dir << "\n";
         return 0;
     } catch (const std::exception& error) {

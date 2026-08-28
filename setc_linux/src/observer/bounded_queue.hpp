@@ -22,20 +22,27 @@ public:
     BoundedQueue(const BoundedQueue&) = delete;
     BoundedQueue& operator=(const BoundedQueue&) = delete;
 
-    // Latest-frame priority: if full, remove the oldest waiting item and
-    // return it to the caller so the frame can be recorded as Coalesced.
-    std::optional<T> push_latest(T value) {
+    // Latest-frame priority: if full, remove the oldest waiting item.
+    // The overload with an output parameter also reports whether the new item
+    // was accepted, so live workers can release accounting safely on close.
+    bool push_latest(T value, std::optional<T>& dropped) {
         std::lock_guard<std::mutex> lock(mutex_);
+        dropped.reset();
         if (closed_) {
-            return std::nullopt;
+            return false;
         }
-        std::optional<T> dropped;
         if (queue_.size() >= capacity_) {
             dropped = std::move(queue_.front());
             queue_.pop_front();
         }
         queue_.push_back(std::move(value));
         condition_.notify_one();
+        return true;
+    }
+
+    std::optional<T> push_latest(T value) {
+        std::optional<T> dropped;
+        (void)push_latest(std::move(value), dropped);
         return dropped;
     }
 
