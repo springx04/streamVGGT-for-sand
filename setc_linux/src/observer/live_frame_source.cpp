@@ -13,9 +13,11 @@ namespace {
 
 // HikvisionCameraClient flushes its three cached frames from a QMap every
 // 33 ms tick. The SubmitFrame packets in one flush are adjacent on the TCP
-// sender and are separated by much less than this threshold; 12 ms is the
-// fixed boundary between an intra-flush packet gap and the next flush cycle.
-constexpr std::chrono::milliseconds kBurstBoundaryGap{12};
+// sender, but the receiver timestamps a packet only after its full image has
+// arrived.  On the production camera stream the observed intra-flush gaps are
+// below 20 ms while the next GUI flush remains above it; keep this fixed
+// threshold between those two measured regimes.
+constexpr std::chrono::milliseconds kBurstBoundaryGap{20};
 constexpr std::array<std::size_t, 3> kModelSlotForArrival{1U, 0U, 2U};
 
 }  // namespace
