@@ -13,19 +13,24 @@ fi
 if [[ -n "${CUDA_HOME:-}" && -d "${CUDA_HOME:-}/lib64" ]]; then
     export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
+# Ubuntu packages OpenCV 4.x under the multiarch library directory.  Keep
+# this optional: custom OpenCV builds can still be supplied through LD_LIBRARY_PATH.
+if [[ -d "/usr/lib/x86_64-linux-gnu" ]]; then
+    export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
 
 SERVER="${SERVER:-${BIN_DIR}/omnivggt_stream_server}"
 VIEWER="${VIEWER:-${BIN_DIR}/omnivggt_live_viewer}"
 MODEL="${MODEL:-${PACKAGE_DIR}/models/omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt}"
 PAIR_MODEL="${PAIR_MODEL:-${PACKAGE_DIR}/models/omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt}"
-GROUP_MODEL="${GROUP_MODEL:-${PACKAGE_DIR}/models/omnivggt_observer_b3s1_406x252_bf16_unfrozen_torch270.pt}"
+GROUP_MODEL="${GROUP_MODEL:-${PACKAGE_DIR}/models/omnivggt_full_b1s3_406x252_bf16_unfrozen_torch270.pt}"
 INPUT_GROUP_SIZE="${INPUT_GROUP_SIZE:-3}"
-INPUT_GROUP_STRIDE="${INPUT_GROUP_STRIDE:-1}"
+INPUT_GROUP_STRIDE="${INPUT_GROUP_STRIDE:-3}"
 GROUP_ANCHOR_INDEX="${GROUP_ANCHOR_INDEX:-1}"
 GROUP_MODEL_WIDTH="${GROUP_MODEL_WIDTH:-406}"
 GROUP_MODEL_HEIGHT="${GROUP_MODEL_HEIGHT:-252}"
-IMAGE_DIR="${IMAGE_DIR:-${PACKAGE_DIR}/data2}"
-OUTPUT_DIR="${OUTPUT_DIR:-${PACKAGE_DIR}/outputs/data2_cpp_linux_live_replay}"
+IMAGE_DIR="${IMAGE_DIR:-${PACKAGE_DIR}/data1}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PACKAGE_DIR}/outputs/data1_cpp_linux_live_replay}"
 TARGET_WIDTH="${TARGET_WIDTH:-700}"
 TARGET_SIZE="${TARGET_SIZE:-700}"
 CANVAS_WIDTH="${CANVAS_WIDTH:-770}"
@@ -38,7 +43,7 @@ SERVER_STARTUP_DELAY="${SERVER_STARTUP_DELAY:-7}"
 SERVER_LOG="${SERVER_LOG:-${OUTPUT_DIR}/server.log}"
 
 required_files=("${SERVER}" "${VIEWER}")
-if [[ "${INPUT_GROUP_SIZE}" == "3" && -n "${USE_GROUP_MODEL:-}" ]]; then
+if [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
     required_files+=("${GROUP_MODEL}")
 else
     required_files+=("${MODEL}" "${PAIR_MODEL}")
@@ -57,10 +62,41 @@ mkdir -p "${OUTPUT_DIR}"
 
 server_pid=""
 cleanup() {
-    if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
-        kill "${server_pid}" 2>/dev/null || true
+    if [[ -z "${server_pid}" ]]; then
+        return
+    fi
+
+    if kill -0 "${server_pid}" 2>/dev/null; then
+        echo "Stopping server PID ${server_pid}..."
+        kill -TERM "${server_pid}" 2>/dev/null || true
+
+        # Give the server a short grace period to drain worker threads and
+        # close its listener.  Never let the launcher hang forever on wait.
+        for _ in {1..50}; do
+            if ! kill -0 "${server_pid}" 2>/dev/null; then
+                break
+            fi
+
+            # A zombie has already exited and only needs to be reaped.
+            server_state="$(ps -o stat= -p "${server_pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [[ "${server_state}" == Z* ]]; then
+                break
+            fi
+            sleep 0.1
+        done
+
+        if kill -0 "${server_pid}" 2>/dev/null; then
+            server_state="$(ps -o stat= -p "${server_pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+            if [[ "${server_state}" != Z* ]]; then
+                echo "Server did not stop within 5s; forcing termination." >&2
+                kill -KILL "${server_pid}" 2>/dev/null || true
+            fi
+        fi
+
         wait "${server_pid}" 2>/dev/null || true
     fi
+
+    server_pid=""
 }
 trap cleanup EXIT INT TERM
 
@@ -69,11 +105,7 @@ echo "  dataset: ${IMAGE_DIR}"
 echo "  output:  ${OUTPUT_DIR}"
 if [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
     echo "  input:   groups of 3, stride=${INPUT_GROUP_STRIDE}, anchor=${GROUP_ANCHOR_INDEX}"
-    if [[ -n "${USE_GROUP_MODEL:-}" ]]; then
-        echo "  group:   B=3,S=1 ${GROUP_MODEL_WIDTH}x${GROUP_MODEL_HEIGHT} experimental group geometry"
-    else
-        echo "  group:   three-image observation fusion, then standard S=2 stream update"
-    fi
+    echo "  group:   B=1,S=3 ${GROUP_MODEL_WIDTH}x${GROUP_MODEL_HEIGHT}, one forward per logical frame"
 else
     echo "  model:   ${MODEL}"
     echo "  pair:    ${PAIR_MODEL}"
@@ -97,7 +129,7 @@ server_args=(
     --port "${PORT}"
     --no-save-debug
 )
-if [[ "${INPUT_GROUP_SIZE}" == "3" && -n "${USE_GROUP_MODEL:-}" ]]; then
+if [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
     server_args+=(
         --model-group3 "${GROUP_MODEL}"
         --input-group-size 3
@@ -105,15 +137,6 @@ if [[ "${INPUT_GROUP_SIZE}" == "3" && -n "${USE_GROUP_MODEL:-}" ]]; then
         --group-anchor-index "${GROUP_ANCHOR_INDEX}"
         --group-model-width "${GROUP_MODEL_WIDTH}"
         --group-model-height "${GROUP_MODEL_HEIGHT}"
-    )
-elif [[ "${INPUT_GROUP_SIZE}" == "3" ]]; then
-    server_args+=(
-        --model "${MODEL}"
-        --model-pair "${PAIR_MODEL}"
-        --pair-letterbox
-        --input-group-size 3
-        --input-group-stride "${INPUT_GROUP_STRIDE}"
-        --group-anchor-index "${GROUP_ANCHOR_INDEX}"
     )
 else
     server_args+=(--model "${MODEL}" --model-pair "${PAIR_MODEL}" --pair-letterbox)

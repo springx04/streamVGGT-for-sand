@@ -190,7 +190,9 @@ bool slot_value_equal(const SlotValue& lhs, const SlotValue& rhs) noexcept {
         && float_bits(lhs.confidence) == float_bits(rhs.confidence)
         && lhs.rgba == rhs.rgba
         && lhs.last_update_frame == rhs.last_update_frame
-        && lhs.valid == rhs.valid;
+        && lhs.valid == rhs.valid
+        && float_bits(lhs.x) == float_bits(rhs.x)
+        && float_bits(lhs.y) == float_bits(rhs.y);
 }
 
 PointCloudDelta commit_patch(CanvasState& state, const CandidatePatch& patch) {
@@ -383,6 +385,8 @@ void write_slot_value(BinaryWriter& writer, const SlotValue& value) {
     writer.u32(value.rgba);
     writer.u32(value.last_update_frame);
     writer.u8(value.valid);
+    writer.f32(value.x);
+    writer.f32(value.y);
 }
 
 SlotValue read_slot_value(BinaryReader& reader) {
@@ -392,6 +396,8 @@ SlotValue read_slot_value(BinaryReader& reader) {
     value.rgba = reader.u32();
     value.last_update_frame = reader.u32();
     value.valid = reader.u8();
+    value.x = reader.f32();
+    value.y = reader.f32();
     return value;
 }
 

@@ -159,6 +159,8 @@ void DirectoryFrameSource::run(
             if (options_.once && options_.max_frames != 0U
                 && stable_paths.size() >= options_.group_size
                 && next_group_start + options_.group_size > source_limit) {
+                // The source limit is expressed in images.  A final incomplete
+                // tail is intentionally ignored rather than padded/repeated.
                 stop_requested.store(true);
             }
         }

@@ -1,5 +1,8 @@
 #include "protocol.hpp"
 
+#include <opencv2/core.hpp>
+
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -217,6 +220,57 @@ ReplayRequestMessage decode_replay_request(const Packet& packet) {
     message.target_frame = reader.u64();
     if (reader.remaining() != 0U) {
         throw std::runtime_error("trailing bytes in ReplayRequest packet");
+    }
+    return message;
+}
+
+Packet make_submit_frame(const std::uint64_t source_seq, const cv::Mat& image) {
+    if (image.empty()) {
+        throw std::invalid_argument("submit_frame image is empty");
+    }
+    // Transport only contiguous pixel data so the decoder can reconstruct the
+    // cv::Mat with a single allocation and no padding concerns.
+    cv::Mat contiguous = image.isContinuous() ? image : image.clone();
+    const std::uint32_t rows = static_cast<std::uint32_t>(contiguous.rows);
+    const std::uint32_t cols = static_cast<std::uint32_t>(contiguous.cols);
+    const std::uint32_t type = static_cast<std::uint32_t>(contiguous.type());
+    const std::size_t byte_count =
+        static_cast<std::size_t>(contiguous.total()) * contiguous.elemSize();
+    if (byte_count > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::length_error("submit_frame image is too large to transport");
+    }
+    BinaryWriter writer;
+    writer.u64(source_seq);
+    writer.u32(rows);
+    writer.u32(cols);
+    writer.u32(type);
+    writer.u32(static_cast<std::uint32_t>(byte_count));
+    writer.bytes(contiguous.data, byte_count);
+    return packet_with_data(MessageType::SubmitFrame, writer);
+}
+
+SubmitFrameMessage decode_submit_frame(const Packet& packet) {
+    require_type(packet, MessageType::SubmitFrame);
+    BinaryReader reader(packet.payload);
+    SubmitFrameMessage message;
+    message.source_seq = reader.u64();
+    const int rows = static_cast<int>(reader.u32());
+    const int cols = static_cast<int>(reader.u32());
+    const int type = static_cast<int>(reader.u32());
+    const std::uint32_t byte_count = reader.u32();
+    cv::Mat image(rows, cols, type);
+    if (!image.empty()) {
+        const std::size_t expected =
+            static_cast<std::size_t>(image.total()) * image.elemSize();
+        if (byte_count != expected) {
+            throw std::runtime_error("submit_frame pixel byte count mismatch");
+        }
+        const std::uint8_t* pixel_data = reader.view(byte_count);
+        std::memcpy(image.data, pixel_data, byte_count);
+    }
+    message.image = image;
+    if (reader.remaining() != 0U) {
+        throw std::runtime_error("trailing bytes in SubmitFrame packet");
     }
     return message;
 }

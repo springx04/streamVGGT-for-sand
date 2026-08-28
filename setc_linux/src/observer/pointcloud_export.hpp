@@ -17,6 +17,15 @@ struct ExportPoint {
     bool changed = false;
 };
 
+// Build the bounded plane-residual depth representation used by the live
+// OpenGL viewer.  The returned vector is display-only; it never mutates the
+// authoritative streaming CanvasState.
+std::vector<float> visual_depth_canvas(const CanvasState& state);
+
+// Return a GUI-only CanvasState with a bounded plane-residual depth and
+// conservative nearest-neighbour repair inside the camera support mask.
+CanvasState visual_canvas_state(const CanvasState& state);
+
 // Shared with the interactive viewer and replay PLY writer.  This mirrors
 // Python's export_canvas_pointcloud; it is deliberately export-only and never
 // mutates the authoritative streaming CanvasState.
