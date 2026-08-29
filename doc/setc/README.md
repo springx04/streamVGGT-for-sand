@@ -678,6 +678,124 @@ C++ 后处理：
 - `pose_enc` 解码为 predicted world-to-camera extrinsic 和 intrinsic，保存为 `cameras.txt`。
 - 运行参数、输入图片、输出 tensor shape 保存到 `summary.txt`。
 
+## 海康 MVS 采集与图片/内参伴随输出
+
+仓库新增了一个可选的 MVS 采集组件：`omnivggt_hikvision_capture`。它使用
+`MvCameraControl.h` 完成枚举、打开、取流和像素格式转换，并为每一帧保存：
+
+```text
+capture_output/
+├── images/frame_000000.png
+├── cameras/frame_000000.json
+└── frames.csv
+```
+
+`frame_XXXXXXXX.json` 内含 `frame_id`、设备帧号、主机时间戳、相机 ID、图像尺寸、
+3×3 `intrinsic`、可选五参数 `distortion` 以及内参来源。图片和 JSON 使用相同的
+stem，`frames.csv` 再提供一份可批量遍历的索引。
+
+如果需要嵌入现有实时程序而不是使用命令行，可直接使用同一个 C++ 接口：
+
+```cpp
+omnivggt::hikvision::HikvisionCamera camera(camera_options);
+camera.open();
+camera.start();
+const auto frame = camera.grab();
+if (frame) {
+    // frame->bgr 与 frame->intrinsics 属于同一次采集。
+    cv::Mat K = frame->intrinsics.camera_matrix();
+    omnivggt::hikvision::save_captured_frame(*frame, output_options);
+}
+```
+
+### 内参来源的边界
+
+MVS 工业相机 SDK 的通用接口是按 MVS 客户端里显示的 GenICam 节点类型读取参数：
+整型使用 `MV_CC_GetIntValueEx`，浮点型使用 `MV_CC_GetFloatValue`，字符串使用
+`MV_CC_GetStringValue`。普通 2D 工业相机通常没有一个统一的“读取已标定 K 矩阵”
+接口；`Width`、`Height`、像元尺寸或镜头标称焦距不能替代经过标定的像素焦距和主点。
+
+因此采集器支持两种明确模式：
+
+1. 推荐模式：用 MVS/ OpenCV 完成一次棋盘格或圆点板标定，把
+   `camera_matrix`、可选 `distortion_coefficients` 和 `image_width`/
+   `image_height` 写入 OpenCV YAML/XML，然后用 `--calibration-file` 传入。
+2. 设备节点模式：如果具体相机确实暴露了标定后的 `fx/fy/cx/cy` 节点，则通过
+   `--fx-node`、`--fy-node`、`--cx-node`、`--cy-node` 指定节点名；畸变节点必须
+   一次性指定 `k1/k2/p1/p2/k3` 五个。
+
+节点名称和节点类型应以 MVS 客户端当前连接设备的参数页为准；可参考海康官方的
+[工业相机参数设置获取说明](https://www.hikrobotics.com/cn2/source/vision/video/2021/6/25/20210625082558512.pdf)。
+
+示例标定文件：
+
+```yaml
+%YAML:1.0
+image_width: 2448
+image_height: 2048
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1800.0, 0.0, 1223.5, 0.0, 1802.0, 1019.5, 0.0, 0.0, 1.0 ]
+distortion_coefficients: !!opencv-matrix
+   rows: 1
+   cols: 5
+   dt: d
+   data: [ -0.1, 0.02, 0.0, 0.0, -0.01 ]
+```
+
+### 编译与运行
+
+MVS 依赖默认关闭，不会影响原有目标。安装海康 MVS（包含 Development/Includes
+和 Libraries）后，在仓库根目录执行：
+
+```powershell
+cmake -S setc -B setc/build_hikvision -G "Visual Studio 16 2019" -A x64 `
+  -DLIBTORCH_ROOT="C:/Dev/libtorch/2.7.0-cu128" `
+  -DOpenCV_DIR="C:/Dev/opencv/4.10.0/build" `
+  -DHIKVISION_MVS_ROOT="C:/Program Files (x86)/MVS/Development" `
+  -DOMNIVGGT_ENABLE_HIKVISION_MVS=ON
+cmake --build setc/build_hikvision --config Release --target omnivggt_hikvision_capture
+```
+
+推荐使用已标定文件：
+
+```powershell
+setc/build_hikvision/Release/omnivggt_hikvision_capture.exe `
+  --device-index 0 `
+  --calibration-file camera_calibration.yml `
+  --output-dir hikvision_capture `
+  --frames 100
+```
+
+如果设备型号的 MVS 参数页确认存在标定节点，则改用：
+
+```powershell
+setc/build_hikvision/Release/omnivggt_hikvision_capture.exe `
+  --device-index 0 `
+  --fx-node FX_NODE_FROM_MVS --fy-node FY_NODE_FROM_MVS `
+  --cx-node CX_NODE_FROM_MVS --cy-node CY_NODE_FROM_MVS `
+  --output-dir hikvision_capture
+```
+
+上面四个 `*_FROM_MVS` 只是占位符，不能直接照抄；请替换成你的相机在 MVS 参数页
+中显示的实际节点名。
+
+采集输出可以直接给 Python 流程读取，JSON sidecar 会按图片 stem 自动匹配：
+
+```powershell
+python -m stream_omnivggt.cli.run_stream_demo `
+  --image-dir hikvision_capture/images `
+  --camera-dir hikvision_capture/cameras `
+  --mock-backend
+```
+
+注意：采集器保存的是当前 MVS 输出分辨率下的原始 BGR 图像，改变 ROI、Offset、
+binning、decimation 或后续 resize 后，必须同步变换 K，最稳妥的做法是按最终输出
+分辨率重新标定。MVS DLL 需要在运行时 PATH 中可见；Windows 下通常由 MVS 安装器
+放入 `Common Files/MVS/Runtime`。
+
 ## 常见问题和处理
 
 ### 1. PowerShell 不允许执行 local_env.ps1

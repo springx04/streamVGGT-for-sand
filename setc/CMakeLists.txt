@@ -11,11 +11,86 @@ option(
     "Build the independent C++ streaming server, viewer, and history tools"
     OFF)
 
+option(
+    OMNIVGGT_ENABLE_HIKVISION_MVS
+    "Build the optional Hikvision MVS image plus intrinsic sidecar recorder"
+    OFF)
+
+set(
+    HIKVISION_MVS_ROOT
+    "$ENV{HIKVISION_MVS_ROOT}"
+    CACHE PATH
+    "MVS Development directory or its parent installation directory")
+
 set(OMNIVGGT_OPENCV_COMPONENTS core imgcodecs imgproc features2d calib3d)
 if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
     list(APPEND OMNIVGGT_OPENCV_COMPONENTS highgui)
 endif()
 find_package(OpenCV REQUIRED COMPONENTS ${OMNIVGGT_OPENCV_COMPONENTS})
+
+# MVS is intentionally optional: the normal OmniVGGT targets and the live
+# observer must still configure on machines that do not have a Hikvision SDK.
+if(OMNIVGGT_ENABLE_HIKVISION_MVS)
+    set(HIKVISION_MVS_INCLUDE_HINTS
+        "${HIKVISION_MVS_ROOT}/Includes"
+        "${HIKVISION_MVS_ROOT}/include"
+        "${HIKVISION_MVS_ROOT}/Development/Includes"
+        "C:/Program Files/MVS/Development/Includes"
+        "C:/Program Files (x86)/MVS/Development/Includes"
+        "/opt/MVS/include"
+    )
+    set(HIKVISION_MVS_LIBRARY_HINTS
+        "${HIKVISION_MVS_ROOT}/Libraries/win64"
+        "${HIKVISION_MVS_ROOT}/lib/64"
+        "${HIKVISION_MVS_ROOT}/lib"
+        "${HIKVISION_MVS_ROOT}/Development/Libraries/win64"
+        "C:/Program Files/MVS/Development/Libraries/win64"
+        "C:/Program Files (x86)/MVS/Development/Libraries/win64"
+        "/opt/MVS/lib/64"
+        "/opt/MVS/lib"
+    )
+    find_path(
+        HIKVISION_MVS_INCLUDE_DIR
+        NAMES MvCameraControl.h
+        PATHS ${HIKVISION_MVS_INCLUDE_HINTS})
+    find_library(
+        HIKVISION_MVS_LIBRARY
+        NAMES MvCameraControl
+        PATHS ${HIKVISION_MVS_LIBRARY_HINTS})
+    if(NOT HIKVISION_MVS_INCLUDE_DIR OR NOT HIKVISION_MVS_LIBRARY)
+        message(FATAL_ERROR
+            "Hikvision MVS SDK not found. Set HIKVISION_MVS_ROOT to the MVS "
+            "Development directory, or disable OMNIVGGT_ENABLE_HIKVISION_MVS.")
+    endif()
+
+    add_library(omnivggt_hikvision_mvs
+        src/hikvision_capture.cpp)
+    target_include_directories(omnivggt_hikvision_mvs
+        PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${OpenCV_INCLUDE_DIRS})
+    target_include_directories(omnivggt_hikvision_mvs
+        SYSTEM PRIVATE
+            ${HIKVISION_MVS_INCLUDE_DIR})
+    target_link_libraries(omnivggt_hikvision_mvs
+        PUBLIC
+            ${OpenCV_LIBS}
+            ${HIKVISION_MVS_LIBRARY})
+
+    add_executable(omnivggt_hikvision_capture
+        src/hikvision_capture_main.cpp)
+    target_link_libraries(omnivggt_hikvision_capture
+        PRIVATE omnivggt_hikvision_mvs)
+
+    foreach(hikvision_target IN ITEMS omnivggt_hikvision_mvs omnivggt_hikvision_capture)
+        if(MSVC)
+            target_compile_options(${hikvision_target} PRIVATE /W4 /EHsc /bigobj /utf-8)
+        else()
+            target_compile_options(${hikvision_target} PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        set_property(TARGET ${hikvision_target} PROPERTY CXX_STANDARD 17)
+    endforeach()
+endif()
 
 set(LIBTORCH_ROOT "$ENV{LIBTORCH}" CACHE PATH "Path to an extracted LibTorch directory")
 if(NOT LIBTORCH_ROOT)

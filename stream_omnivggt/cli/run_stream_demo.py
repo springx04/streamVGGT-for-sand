@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import logging
 import time
@@ -98,14 +99,37 @@ def _load_depth(image_path: Path, depth_dir: Path | None) -> np.ndarray | None:
 
 
 def _load_camera(image_path: Path, camera_dir: Path | None) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Load optional camera intrinsics/extrinsics from npz/npy/txt sidecars."""
+    """Load optional camera intrinsics/extrinsics from JSON, npz, npy, or txt sidecars."""
 
     if camera_dir is None:
         return None, None
-    for suffix in (".npz", ".npy", ".txt"):
+    for suffix in (".json", ".npz", ".npy", ".txt"):
         candidate = camera_dir / f"{image_path.stem}{suffix}"
         if not candidate.exists():
             continue
+        if suffix == ".json":
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+            intrinsic_data = data.get("intrinsic", data.get("camera_matrix", data.get("K")))
+            extrinsic_data = data.get("extrinsic_c2w")
+            if isinstance(intrinsic_data, dict):
+                intrinsic_data = intrinsic_data.get("matrix", intrinsic_data.get("data"))
+            if isinstance(extrinsic_data, dict):
+                extrinsic_data = extrinsic_data.get("matrix", extrinsic_data.get("data"))
+            intrinsic = (
+                np.asarray(intrinsic_data, dtype=np.float32)
+                if intrinsic_data is not None else None
+            )
+            extrinsic = (
+                np.asarray(extrinsic_data, dtype=np.float32)
+                if extrinsic_data is not None else None
+            )
+            if intrinsic is not None and intrinsic.shape != (3, 3):
+                raise ValueError(f"Expected JSON intrinsic shape (3, 3), got {intrinsic.shape}: {candidate}")
+            if extrinsic is not None and extrinsic.shape not in {(3, 4), (4, 4)}:
+                raise ValueError(
+                    f"Expected JSON extrinsic shape (3, 4) or (4, 4), got {extrinsic.shape}: {candidate}"
+                )
+            return intrinsic, extrinsic
         if suffix == ".npz":
             data = np.load(candidate)
             intrinsic = np.asarray(data["intrinsic"], dtype=np.float32) if "intrinsic" in data else None
@@ -121,4 +145,3 @@ def _load_camera(image_path: Path, camera_dir: Path | None) -> tuple[np.ndarray 
 
 if __name__ == "__main__":
     app()
-
