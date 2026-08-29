@@ -140,6 +140,8 @@ cmd /c setc\scripts\start_cpp_live_replay.bat
   image loading, homography, fusion and Canvas patch work. Compare single-image
   timings with the documented dynamic/fixed ROI baseline rather than treating a
   fixed `700x700` fallback as the dynamic-ROI result.
-- The C++ launcher always kills old viewer/server processes first, then starts a fresh run on port `37651`.
-- For C++ offline replay fidelity, queue capacity is fixed to `1024` in the launcher.
+- The C++ replay launcher always kills old viewer/server processes first, starts a fresh run on port `37651`, and stops that server when the viewer closes.
+- The C++ replay launcher uses the Linux-parity bounded queue by default (`QUEUE_CAPACITY=3`).
+  Larger queues remain an explicit opt-in for offline experiments.
+- Run `python scripts/check_setc_platform_parity.py` to verify observer-core and launcher-contract parity.
 

@@ -13,34 +13,33 @@ if not defined OpenCV_DIR set "OpenCV_DIR=C:\Dev\opencv\4.10.0\build"
 if not defined CUDA_PATH set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
 set "PATH=%LIBTORCH%\lib;%OpenCV_DIR%\x64\vc16\bin;%OpenCV_DIR%\x64\vc15\bin;%CUDA_PATH%\bin;%PATH%"
 
-set "SERVER=%REPO%\setc\build_live_observer\Release\omnivggt_stream_server.exe"
-set "VIEWER=%REPO%\setc\build_live_observer\Release\omnivggt_live_viewer.exe"
-set "MODEL=%REPO%\setc\artifacts\omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt"
+if not defined SERVER set "SERVER=%REPO%\setc\build_live_observer\Release\omnivggt_stream_server.exe"
+if not defined VIEWER set "VIEWER=%REPO%\setc\build_live_observer\Release\omnivggt_live_viewer.exe"
+if not defined MODEL set "MODEL=%REPO%\setc\artifacts\omnivggt_observer_s1_700x434_bf16_unfrozen_torch270.pt"
 rem Use the depth-only pair graph.  The fixed graph is loaded once; each
 rem Python-sized ROI is kept aspect-preserving inside its 700x700 border.
-set "PAIR_MODEL=%REPO%\setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt"
-set "GROUP_MODEL=%REPO%\setc\artifacts\omnivggt_full_b1s3_406x252_bf16_unfrozen_torch270.pt"
+if not defined PAIR_MODEL set "PAIR_MODEL=%REPO%\setc\artifacts\omnivggt_observer_s2_700x700_bf16_unfrozen_torch270.pt"
+if not defined GROUP_MODEL set "GROUP_MODEL=%REPO%\setc\artifacts\omnivggt_full_b1s3_406x252_bf16_unfrozen_torch270.pt"
 rem The default is one non-overlapping three-camera group per logical frame.
 rem Set INPUT_GROUP_STRIDE=1 to replay the legacy 123/234 sliding windows.
 rem Set INPUT_GROUP_SIZE=1 before launching to keep the legacy S1/S2 observer command.
 if not defined INPUT_GROUP_SIZE set "INPUT_GROUP_SIZE=3"
 if not defined INPUT_GROUP_STRIDE set "INPUT_GROUP_STRIDE=3"
 if not defined GROUP_ANCHOR_INDEX set "GROUP_ANCHOR_INDEX=1"
-set "GROUP_MODEL_WIDTH=406"
-set "GROUP_MODEL_HEIGHT=252"
-set "IMAGE_DIR=%REPO%\data1"
-set "OUTPUT_DIR=%REPO%\stream_omnivggt_outputs\data1_cpp_live_replay"
-set "TARGET_WIDTH=700"
-set "TARGET_SIZE=700"
-set "CANVAS_WIDTH=770"
-set "CANVAS_HEIGHT=630"
-set "FIRST_MODEL_WIDTH=700"
-set "FIRST_MODEL_HEIGHT=434"
-rem Offline replay must retain every frame while the first CUDA model call warms up.
-rem The normal external stream keeps the latest-frame policy; this launcher is
-rem deliberately lossless so its frame history matches Python live replay.
-set "QUEUE_CAPACITY=1024"
-set "PORT=37651"
+if not defined GROUP_MODEL_WIDTH set "GROUP_MODEL_WIDTH=406"
+if not defined GROUP_MODEL_HEIGHT set "GROUP_MODEL_HEIGHT=252"
+if not defined IMAGE_DIR set "IMAGE_DIR=%REPO%\data1"
+if not defined OUTPUT_DIR set "OUTPUT_DIR=%REPO%\stream_omnivggt_outputs\data1_cpp_live_replay"
+if not defined TARGET_WIDTH set "TARGET_WIDTH=700"
+if not defined TARGET_SIZE set "TARGET_SIZE=700"
+if not defined CANVAS_WIDTH set "CANVAS_WIDTH=770"
+if not defined CANVAS_HEIGHT set "CANVAS_HEIGHT=630"
+if not defined FIRST_MODEL_WIDTH set "FIRST_MODEL_WIDTH=700"
+if not defined FIRST_MODEL_HEIGHT set "FIRST_MODEL_HEIGHT=434"
+rem Keep replay on the bounded queue contract used by the Linux runtime.
+rem Default queue capacity = 3; larger queues are explicit offline-experiment opt-in.
+if not defined QUEUE_CAPACITY set "QUEUE_CAPACITY=3"
+if not defined PORT set "PORT=37651"
 
 rem Always start a fresh external observer.  Without this cleanup, a second
 rem click can connect to the old server still listening on the fixed port and
@@ -91,11 +90,17 @@ if not exist "%IMAGE_DIR%" (
 )
 
 echo Starting C++ OmniVGGT live replay...
-echo Dataset: %IMAGE_DIR%
-echo Output:  %OUTPUT_DIR%
-echo Target:  %TARGET_WIDTH%x%TARGET_SIZE%  device=cuda  dtype=bf16  display_max_points=0
-echo Queue:   %QUEUE_CAPACITY%  (lossless offline replay)
-echo Canvas:  %CANVAS_WIDTH%x%CANVAS_HEIGHT%  first_model=%FIRST_MODEL_WIDTH%x%FIRST_MODEL_HEIGHT%
+echo Image dir:        %IMAGE_DIR%
+echo Output dir:       %OUTPUT_DIR%
+echo Input group size: %INPUT_GROUP_SIZE%
+echo Input group stride: %INPUT_GROUP_STRIDE%
+echo Group anchor:     %GROUP_ANCHOR_INDEX%
+echo Queue capacity:   %QUEUE_CAPACITY%  (bounded queue, Linux parity; larger values are explicit offline experiments)
+echo Target size:      %TARGET_WIDTH%x%TARGET_SIZE%
+echo Canvas size:      %CANVAS_WIDTH%x%CANVAS_HEIGHT%
+echo Model size:       group=%GROUP_MODEL_WIDTH%x%GROUP_MODEL_HEIGHT% first=%FIRST_MODEL_WIDTH%x%FIRST_MODEL_HEIGHT%
+echo Port:             %PORT%
+echo Device/dtype:     cuda/bf16  display_max_points=0
 if "%INPUT_GROUP_SIZE%"=="3" (
   echo Input:   groups of 3, stride=%INPUT_GROUP_STRIDE%, anchor=%GROUP_ANCHOR_INDEX%
   echo Group:   B=1,S=3 %GROUP_MODEL_WIDTH%x%GROUP_MODEL_HEIGHT%, one forward per logical frame
@@ -104,7 +109,7 @@ if "%INPUT_GROUP_SIZE%"=="3" (
   echo          (loaded and warmed once; avoids per-ROI TorchScript reloads)
 )
 echo Viewer:  %VIEWER%
-echo Close the viewer with q or Esc. The server stays independent until stopped.
+echo Close the viewer with q or Esc. The launcher then stops its reconstruction server.
 echo.
 
 if "%INPUT_GROUP_SIZE%"=="3" (
@@ -139,5 +144,9 @@ rem is started from an IDE/automation host with redirected stdin.  ping is a
 rem stdin-independent delay and keeps the one-click launcher reliable there.
 ping 127.0.0.1 -n 7 >nul
 "%VIEWER%" --host 127.0.0.1 --port %PORT% --display-max-points 0
+
+rem Keep the launcher lifecycle aligned with Linux: closing the viewer also
+rem terminates the reconstruction server started by this launcher.
+taskkill /F /IM omnivggt_stream_server.exe >nul 2>&1
 
 endlocal
