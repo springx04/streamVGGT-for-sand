@@ -1,14 +1,12 @@
 #pragma once
 
-#include <array>
-
 #include "bounded_queue.hpp"
 #include "stream_types.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <deque>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -30,6 +28,10 @@ struct RawFrame {
     // when present and path as the canonical/anchor image.
     std::vector<std::filesystem::path> group_paths;
     std::vector<std::uint64_t> group_source_seqs;
+    // group_paths/group_source_seqs are kept in arrival order for manifest
+    // and continuity checks. This permutation maps that burst position to
+    // the model sequence slot; it is deliberately independent of seq value.
+    std::array<std::size_t, 3> group_model_slot_for_arrival{0U, 1U, 2U};
     int group_anchor_index = 0;
     std::string group_key;
     std::vector<std::shared_ptr<const cv::Mat>> group_images;
@@ -56,17 +58,16 @@ private:
     std::mutex mutex_;
     bool closed_ = false;
     FrameSeq next_group_seq_ = 0;
-    struct CameraSlot {
+    bool synced_ = false;
+    bool have_previous_ = false;
+    int burst_position_ = 0;
+    std::uint64_t previous_seq_ = 0;
+    std::chrono::steady_clock::time_point previous_arrival_{};
+    struct BurstFrame {
         std::uint64_t source_seq = 0;
         std::shared_ptr<const cv::Mat> image;
-        cv::Mat signature;
-        bool initialized = false;
-        bool dirty = false;
     };
-    std::array<CameraSlot, 3> camera_slots_{};
-
-    static cv::Mat make_camera_signature(const cv::Mat& image);
-    static double signature_distance(const cv::Mat& lhs, const cv::Mat& rhs);
+    std::array<BurstFrame, 3> burst_frames_{};
 };
 
 struct DirectorySourceOptions {

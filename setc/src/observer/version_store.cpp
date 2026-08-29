@@ -311,27 +311,35 @@ void VersionStore::compact(const std::size_t keep_groups) {
     const std::size_t first_kept = frames_.size() - keep_groups;
     const CommitVersion base_version = frames_[first_kept].commit_version == 0U
         ? 0U : frames_[first_kept].commit_version - 1U;
+
     CanvasState base_state = recover_state();
     for (CommitVersion version = latest_version_; version > base_version; --version) {
         apply_delta_backward(base_state, read_delta(version));
     }
     base_state.version = base_version;
     base_state.last_frame = first_kept == 0U ? 0U : frames_[first_kept - 1U].frame_seq;
+
     const std::filesystem::path temp_dir = run_dir_ / "history_compact_tmp";
     std::filesystem::remove_all(temp_dir);
     std::filesystem::create_directories(temp_dir / "snapshots");
     const auto write_temp = [](const std::filesystem::path& path, const std::vector<std::uint8_t>& data) {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        if (!out) throw std::runtime_error("failed to write compacted history file: " + path.string());
+        if (!out) {
+            throw std::runtime_error("failed to write compacted history file: " + path.string());
+        }
         out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
     };
+
     BinaryWriter snapshot_writer;
     ::omnivggt::observer::write_snapshot(snapshot_writer, Snapshot{base_state});
     write_temp(temp_dir / "snapshots" / version_file_name(base_version), snapshot_writer.data());
+
     std::ofstream delta_out(temp_dir / "deltas.bin", std::ios::binary | std::ios::trunc);
     std::ofstream index_out(temp_dir / "deltas.idx", std::ios::binary | std::ios::trunc);
     std::ofstream frame_out(temp_dir / "frame_index.bin", std::ios::binary | std::ios::trunc);
-    if (!delta_out || !index_out || !frame_out) throw std::runtime_error("failed to open compacted history indexes");
+    if (!delta_out || !index_out || !frame_out) {
+        throw std::runtime_error("failed to open compacted history indexes");
+    }
     std::unordered_map<CommitVersion, std::uint64_t> offsets;
     std::uint64_t offset = 0U;
     for (CommitVersion version = base_version + 1U; version <= latest_version_; ++version) {
@@ -340,49 +348,80 @@ void VersionStore::compact(const std::size_t keep_groups) {
         write_delta(payload_writer, delta);
         const auto& payload = payload_writer.data();
         BinaryWriter header;
-        header.u32(kDeltaMagic); header.u16(kSchema); header.u16(0U);
-        header.u64(delta.frame_seq); header.u64(delta.from_version); header.u64(delta.to_version);
+        header.u32(kDeltaMagic);
+        header.u16(kSchema);
+        header.u16(0U);
+        header.u64(delta.frame_seq);
+        header.u64(delta.from_version);
+        header.u64(delta.to_version);
         header.u32(static_cast<std::uint32_t>(delta.changes.size()));
         header.u32(static_cast<std::uint32_t>(payload.size()));
-        header.u32(static_cast<std::uint32_t>(payload.size())); header.u32(crc32(payload));
+        header.u32(static_cast<std::uint32_t>(payload.size()));
+        header.u32(crc32(payload));
         delta_out.write(reinterpret_cast<const char*>(header.data().data()), static_cast<std::streamsize>(header.data().size()));
         delta_out.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
         BinaryWriter index;
-        index.u64(version); index.u64(offset); index.u32(static_cast<std::uint32_t>(header.data().size() + payload.size()));
+        index.u64(version);
+        index.u64(offset);
+        index.u32(static_cast<std::uint32_t>(header.data().size() + payload.size()));
         index_out.write(reinterpret_cast<const char*>(index.data().data()), static_cast<std::streamsize>(index.data().size()));
         offsets[version] = offset;
         offset += header.data().size() + payload.size();
     }
     for (std::size_t index = first_kept; index < frames_.size(); ++index) {
-        BinaryWriter writer;
-        write_frame_record(writer, frames_[index]);
+        BinaryWriter record_writer;
+        write_frame_record(record_writer, frames_[index]);
         const auto delta_offset = offsets.find(frames_[index].commit_version);
-        writer.u64(delta_offset == offsets.end() ? std::numeric_limits<std::uint64_t>::max() : delta_offset->second);
-        frame_out.write(reinterpret_cast<const char*>(writer.data().data()), static_cast<std::streamsize>(writer.data().size()));
+        record_writer.u64(delta_offset == offsets.end()
+            ? std::numeric_limits<std::uint64_t>::max() : delta_offset->second);
+        frame_out.write(reinterpret_cast<const char*>(record_writer.data().data()), static_cast<std::streamsize>(record_writer.data().size()));
     }
-    delta_out.close(); index_out.close(); frame_out.close();
-    std::ifstream metrics_in(run_dir_ / "metrics.csv");
+    delta_out.close();
+    index_out.close();
+    frame_out.close();
+
+    const std::filesystem::path metrics = run_dir_ / "metrics.csv";
+    std::ifstream metrics_in(metrics);
     std::ofstream metrics_out(temp_dir / "metrics.csv", std::ios::trunc);
-    std::string line; std::size_t metric_index = 0U;
+    std::string line;
+    std::size_t metric_index = 0U;
     while (std::getline(metrics_in, line)) {
-        if (metric_index++ == 0U) { metrics_out << line << '\n'; continue; }
+        if (metric_index++ == 0U) {
+            metrics_out << line << '\n';
+            continue;
+        }
         const std::size_t separator = line.find(',');
-        const FrameSeq frame = separator == std::string::npos ? 0U : static_cast<FrameSeq>(std::stoull(line.substr(0, separator)));
-        if (frame >= frames_[first_kept].frame_seq) metrics_out << line << '\n';
+        const FrameSeq frame = separator == std::string::npos
+            ? 0U : static_cast<FrameSeq>(std::stoull(line.substr(0, separator)));
+        if (frame >= frames_[first_kept].frame_seq) {
+            metrics_out << line << '\n';
+        }
     }
     metrics_out.close();
+
     const auto replace = [&](const std::filesystem::path& name) {
-        const auto target = run_dir_ / name; const auto backup = target.string() + ".old";
-        std::error_code error; std::filesystem::remove(backup, error);
+        const std::filesystem::path target = run_dir_ / name;
+        const std::filesystem::path backup = target.string() + ".old";
+        std::error_code error;
+        std::filesystem::remove(backup, error);
         std::filesystem::rename(target, backup, error);
-        if (error) throw std::runtime_error("failed to stage history replacement: " + error.message());
+        if (error) {
+            throw std::runtime_error("failed to stage history replacement: " + error.message());
+        }
         std::filesystem::rename(temp_dir / name, target, error);
-        if (error) throw std::runtime_error("failed to publish history replacement: " + error.message());
+        if (error) {
+            throw std::runtime_error("failed to publish history replacement: " + error.message());
+        }
         std::filesystem::remove(backup, error);
     };
-    replace("deltas.bin"); replace("deltas.idx"); replace("frame_index.bin"); replace("metrics.csv");
+    replace("deltas.bin");
+    replace("deltas.idx");
+    replace("frame_index.bin");
+    replace("metrics.csv");
     for (const auto& entry : std::filesystem::directory_iterator(run_dir_ / "snapshots")) {
-        if (entry.path().extension() == ".bin") std::filesystem::remove(entry.path());
+        if (entry.path().extension() == ".bin") {
+            std::filesystem::remove(entry.path());
+        }
     }
     for (const auto& entry : std::filesystem::directory_iterator(temp_dir / "snapshots")) {
         std::filesystem::rename(entry.path(), run_dir_ / "snapshots" / entry.path().filename());

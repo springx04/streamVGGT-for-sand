@@ -22,7 +22,7 @@ set(
     CACHE PATH
     "MVS Development directory or its parent installation directory")
 
-set(OMNIVGGT_OPENCV_COMPONENTS core imgcodecs imgproc features2d calib3d)
+set(OMNIVGGT_OPENCV_COMPONENTS core imgcodecs imgproc features2d calib3d photo)
 if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
     list(APPEND OMNIVGGT_OPENCV_COMPONENTS highgui)
 endif()
@@ -166,14 +166,20 @@ if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
     target_include_directories(omnivggt_observer_history
         PUBLIC
             ${CMAKE_CURRENT_SOURCE_DIR}/src/observer
+            ${OpenCV_INCLUDE_DIRS}
     )
     target_compile_features(omnivggt_observer_history PUBLIC cxx_std_17)
-    target_link_libraries(omnivggt_observer_history PUBLIC Threads::Threads)
+    target_link_libraries(omnivggt_observer_history
+        PUBLIC
+            Threads::Threads
+            ${OpenCV_LIBS}
+    )
 
     add_library(omnivggt_observer_inference
         src/observer/frame_source.cpp
         src/observer/live_frame_source.cpp
         src/observer/inference_pipeline.cpp
+        src/observer/group_world_fusion.cpp
     )
     target_include_directories(omnivggt_observer_inference
         PUBLIC
@@ -186,6 +192,7 @@ if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
             omnivggt_observer_history
             ${LIBTORCH_LIBS}
             ${OpenCV_LIBS}
+            ${CMAKE_DL_LIBS}
     )
 
     add_executable(omnivggt_stream_server
@@ -196,6 +203,7 @@ if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
             omnivggt_observer_inference
             ${LIBTORCH_LIBS}
             ${OpenCV_LIBS}
+            ${CMAKE_DL_LIBS}
     )
 
     add_executable(omnivggt_live_viewer
@@ -254,5 +262,11 @@ if(OMNIVGGT_ENABLE_LIVE_OBSERVER)
 
     if(WIN32)
         target_link_libraries(omnivggt_observer_history PUBLIC ws2_32)
+    endif()
+
+    include(CTest)
+    if(BUILD_TESTING)
+        add_test(NAME omnivggt_observer_core_smoke
+            COMMAND omnivggt_observer_core_smoke)
     endif()
 endif()

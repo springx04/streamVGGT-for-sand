@@ -52,6 +52,10 @@ struct ServerArgs {
     int poll_ms = 50;
     bool once = false;
     bool resume = false;
+    // The production Linux observer consumes the same non-overlapping
+    // three-camera groups as the one-click launcher.  Keep the legacy
+    // sliding windows available through --input-group-stride 1 and the
+    // single-image path through an explicit --input-group-size 1.
     std::size_t input_group_size = 3U;
     // The current replay input is three cameras captured for one logical
     // frame.  Keep the group non-overlapping by default; callers can still

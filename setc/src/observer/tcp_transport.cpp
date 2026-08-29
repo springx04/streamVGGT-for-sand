@@ -226,6 +226,15 @@ TcpSocket TcpListener::accept_one() const {
 
 void TcpListener::close() noexcept {
     if (valid()) {
+        // Wake a thread that may currently be blocked in accept().  On Linux,
+        // close() from another thread alone is not a reliable way to interrupt
+        // a blocking accept(), while shutdown() makes the listener unusable and
+        // causes the blocked call to return.
+#ifdef _WIN32
+        ::shutdown(handle_, SD_BOTH);
+#else
+        ::shutdown(handle_, SHUT_RDWR);
+#endif
         close_handle(handle_);
         handle_ = TcpSocket::kInvalid;
     }

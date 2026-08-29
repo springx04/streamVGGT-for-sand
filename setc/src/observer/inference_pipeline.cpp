@@ -8,6 +8,7 @@
 #include <ATen/autocast_mode.h>
 #include <c10/core/InferenceMode.h>
 #include <torch/csrc/jit/api/function_impl.h>
+#include <torch/csrc/jit/runtime/graph_executor.h>
 
 #include <algorithm>
 #include <array>
@@ -53,6 +54,59 @@ int floor_to_multiple_14(const double value) {
     return std::max(14, static_cast<int>(std::floor(value / 14.0)) * 14);
 }
 
+cv::Point content_origin(
+    const cv::Mat& support,
+    const int fallback_x,
+    const int fallback_y) {
+    if (!support.empty() && cv::countNonZero(support) > 0) {
+        return cv::boundingRect(support).tl();
+    }
+    return cv::Point(fallback_x, fallback_y);
+}
+
+bool plausible_planar_homography(
+    const cv::Mat& homography,
+    const cv::Size source_size,
+    const cv::Size target_size) {
+    if (homography.empty() || source_size.width <= 1 || source_size.height <= 1
+        || target_size.width <= 1 || target_size.height <= 1
+        || !cv::checkRange(homography)) {
+        return false;
+    }
+    std::vector<cv::Point2f> corners{
+        {0.0f, 0.0f},
+        {static_cast<float>(source_size.width - 1), 0.0f},
+        {static_cast<float>(source_size.width - 1),
+            static_cast<float>(source_size.height - 1)},
+        {0.0f, static_cast<float>(source_size.height - 1)}};
+    std::vector<cv::Point2f> projected;
+    cv::perspectiveTransform(corners, projected, homography);
+    if (projected.size() != 4U) {
+        return false;
+    }
+    cv::Point2f center(0.0f, 0.0f);
+    for (const cv::Point2f& point : projected) {
+        if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
+            return false;
+        }
+        center += point;
+    }
+    center *= 0.25f;
+    const double source_area = static_cast<double>(source_size.area());
+    const double target_area = static_cast<double>(target_size.area());
+    const double projected_area = std::abs(cv::contourArea(projected));
+    if (!cv::isContourConvex(projected)
+        || projected_area < 0.08 * source_area
+        || projected_area > 12.0 * target_area
+        || center.x < -2.0f * target_size.width
+        || center.x > 3.0f * target_size.width
+        || center.y < -2.0f * target_size.height
+        || center.y > 3.0f * target_size.height) {
+        return false;
+    }
+    return true;
+}
+
 constexpr std::size_t kMaxDynamicPairGpuCache = 2U;
 
 // Python's _bucket_roi_size preserves the ROI aspect ratio and only pads the
@@ -78,6 +132,8 @@ std::pair<int, int> bucket_roi_size(
 }
 
 void configure_torchscript_executor(torch::jit::script::Module& module) {
+    // Avoid the minutes-long global graph optimizer pass on the first CUDA forward.
+    torch::jit::setGraphExecutorOptimize(false);
     // LibTorch's default profiling executor can spend minutes specializing
     // this transformer graph on the first call.  Python eager inference does
     // not use that pass, so use the simple executor for every loaded bucket.
@@ -385,6 +441,42 @@ cv::Mat foreground_mask(const cv::Mat& rgb_f) {
         return mask;
     }
     return labels == largest;
+}
+
+cv::Mat bright_nonplanar_mask(const cv::Mat& rgb_u8) {
+    cv::Mat mask(rgb_u8.rows, rgb_u8.cols, CV_8UC1, cv::Scalar(0));
+    if (rgb_u8.empty() || rgb_u8.type() != CV_8UC3) {
+        return mask;
+    }
+    for (int y = 0; y < rgb_u8.rows; ++y) {
+        for (int x = 0; x < rgb_u8.cols; ++x) {
+            const cv::Vec3b color = rgb_u8.at<cv::Vec3b>(y, x);
+            const int minimum = std::min({
+                static_cast<int>(color[0]),
+                static_cast<int>(color[1]),
+                static_cast<int>(color[2])});
+            const int maximum = std::max({
+                static_cast<int>(color[0]),
+                static_cast<int>(color[1]),
+                static_cast<int>(color[2])});
+            // The robot is the large bright, nearly achromatic foreground in
+            // all three real views. Keep coloured green floor reflections:
+            // they are useful planar features and must remain reconstructable.
+            if (minimum >= 142 && maximum - minimum <= 72) {
+                mask.at<std::uint8_t>(y, x) = 255U;
+            }
+        }
+    }
+    cv::morphologyEx(
+        mask,
+        mask,
+        cv::MORPH_CLOSE,
+        cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(11, 11)));
+    cv::dilate(
+        mask,
+        mask,
+        cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(25, 25)));
+    return mask;
 }
 
 cv::Mat anchor_ring_mask(
@@ -1833,8 +1925,8 @@ InferenceEngine::FrameImage InferenceEngine::load_frame(const std::filesystem::p
     frame.rgb_u8 = cv::Mat::zeros(options_.canvas_height, options_.canvas_width, CV_8UC3);
     const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
     const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
-    const int copy_x = pad_left;
-    const int copy_y = pad_top;
+    int copy_x = pad_left;
+    int copy_y = pad_top;
     if (copy_x >= 0 && copy_y >= 0
         && copy_x + frame.match_rgb_u8.cols <= frame.rgb_u8.cols
         && copy_y + frame.match_rgb_u8.rows <= frame.rgb_u8.rows) {
@@ -1859,7 +1951,21 @@ InferenceEngine::FrameImage InferenceEngine::load_frame(const std::filesystem::p
             cv::Rect(source_x, source_y, copy_width, copy_height)).copyTo(
                 frame.rgb_f(cv::Rect(target_x, target_y, copy_width, copy_height)));
     }
-    frame.support = foreground_mask(frame.rgb_f);
+    // Support is the real camera-image rectangle, not an Otsu/connected-
+    // component foreground guess.  Dark table and device surfaces are valid
+    // observations; removing them before the model runs is what made the
+    // first Canvas collapse to a small bright vertical component.  Keep only
+    // the padded-image bounds out of the support mask.
+    frame.support = cv::Mat::zeros(frame.rgb_f.size(), CV_8UC1);
+    const int support_x = copy_x;
+    const int support_y = copy_y;
+    const int support_width = std::min(
+        frame.match_rgb_u8.cols, frame.support.cols - support_x);
+    const int support_height = std::min(
+        frame.match_rgb_u8.rows, frame.support.rows - support_y);
+    if (support_width > 0 && support_height > 0) {
+        frame.support(cv::Rect(support_x, support_y, support_width, support_height)).setTo(255U);
+    }
     return frame;
 }
 
@@ -2009,6 +2115,16 @@ InferenceEngine::Prediction InferenceEngine::run_model(
 
     if (pose.numel() >= 9) {
         const auto pose_access = pose.accessor<float, 3>();
+        prediction.pose_translation = cv::Vec3f(
+            pose_access[0][frame_index][0],
+            pose_access[0][frame_index][1],
+            pose_access[0][frame_index][2]);
+        prediction.pose_quaternion = cv::Vec4f(
+            pose_access[0][frame_index][3],
+            pose_access[0][frame_index][4],
+            pose_access[0][frame_index][5],
+            pose_access[0][frame_index][6]);
+        prediction.has_pose = true;
         prediction.fov_h = pose_access[0][frame_index][7];
         prediction.fov_w = pose_access[0][frame_index][8];
     }
@@ -2118,14 +2234,29 @@ std::vector<InferenceEngine::Prediction> InferenceEngine::run_group_model(
         }
         if (pose.dim() == 3 && pose.size(0) >= 1 && pose.size(1) >= 3 && pose.size(2) >= 9) {
             const auto pose_values = pose.accessor<float, 3>();
+            prediction.pose_translation = cv::Vec3f(
+                pose_values[0][sequence][0],
+                pose_values[0][sequence][1],
+                pose_values[0][sequence][2]);
+            prediction.pose_quaternion = cv::Vec4f(
+                pose_values[0][sequence][3],
+                pose_values[0][sequence][4],
+                pose_values[0][sequence][5],
+                pose_values[0][sequence][6]);
+            prediction.has_pose = true;
             prediction.fov_h = pose_values[0][sequence][7];
             prediction.fov_w = pose_values[0][sequence][8];
         }
-        if (!std::isfinite(prediction.fov_h) || prediction.fov_h <= 0.01f || prediction.fov_h >= 3.1f) {
-            prediction.fov_h = 1.2f;
+        // Reprojection must use the FOV predicted for this B=1,S=3 view.
+        // Do not silently replace an invalid value with a guessed camera
+        // intrinsics fallback; GroupWorldFusion will reject the group.
+        if (!std::isfinite(prediction.fov_h) || prediction.fov_h <= 0.01f
+            || prediction.fov_h >= 3.1f) {
+            prediction.fov_h = std::numeric_limits<float>::quiet_NaN();
         }
-        if (!std::isfinite(prediction.fov_w) || prediction.fov_w <= 0.01f || prediction.fov_w >= 3.1f) {
-            prediction.fov_w = 1.2f;
+        if (!std::isfinite(prediction.fov_w) || prediction.fov_w <= 0.01f
+            || prediction.fov_w >= 3.1f) {
+            prediction.fov_w = std::numeric_limits<float>::quiet_NaN();
         }
         predictions.push_back(std::move(prediction));
     }
@@ -2461,17 +2592,19 @@ cv::Mat InferenceEngine::estimate_pair_homography(
     cv::Ptr<cv::Feature2D> detector;
     int norm = cv::NORM_HAMMING;
     try {
-        detector = cv::SIFT::create(1200);
+        detector = cv::SIFT::create(3000);
         norm = cv::NORM_L2;
     } catch (const cv::Exception&) {
-        detector = cv::ORB::create(1200);
+        detector = cv::ORB::create(3000);
     }
     std::vector<cv::KeyPoint> source_keypoints;
     std::vector<cv::KeyPoint> target_keypoints;
     cv::Mat source_descriptors;
     cv::Mat target_descriptors;
-    detector->detectAndCompute(source_gray, cv::noArray(), source_keypoints, source_descriptors);
-    detector->detectAndCompute(target_gray, cv::noArray(), target_keypoints, target_descriptors);
+    detector->detectAndCompute(
+        source_gray, cv::noArray(), source_keypoints, source_descriptors);
+    detector->detectAndCompute(
+        target_gray, cv::noArray(), target_keypoints, target_descriptors);
     if (source_descriptors.empty() || target_descriptors.empty()
         || source_keypoints.size() < 8U || target_keypoints.size() < 8U) {
         return cv::Mat::eye(3, 3, CV_32FC1);
@@ -2481,11 +2614,11 @@ cv::Mat InferenceEngine::estimate_pair_homography(
     matcher.knnMatch(source_descriptors, target_descriptors, knn, 2);
     std::vector<cv::DMatch> good;
     for (const auto& pair : knn) {
-        if (pair.size() == 2U && pair[0].distance < 0.75f * pair[1].distance) {
+        if (pair.size() == 2U && pair[0].distance < 0.82f * pair[1].distance) {
             good.push_back(pair[0]);
         }
     }
-    if (good.size() < 8U) {
+    if (good.size() < 5U) {
         return cv::Mat::eye(3, 3, CV_32FC1);
     }
     std::vector<cv::Point2f> source_points;
@@ -2498,8 +2631,11 @@ cv::Mat InferenceEngine::estimate_pair_homography(
     }
     cv::Mat inlier_mask;
     cv::Mat homography = cv::findHomography(
-        source_points, target_points, cv::RANSAC, 3.0, inlier_mask);
-    if (homography.empty() || inlier_mask.empty() || cv::countNonZero(inlier_mask) < 8) {
+        source_points, target_points, cv::RANSAC, 4.0, inlier_mask);
+    if (homography.empty() || inlier_mask.empty()
+        || cv::countNonZero(inlier_mask) < 5
+        || !plausible_planar_homography(
+            homography, source.match_rgb_u8.size(), target.match_rgb_u8.size())) {
         return cv::Mat::eye(3, 3, CV_32FC1);
     }
     homography.convertTo(homography, CV_32FC1);
@@ -2838,6 +2974,24 @@ CandidateCommit InferenceEngine::process_prepared(
         group.union_valid = prepared.group_union_valid;
         return process_world_group(prepared.raw, state, group, prepared.read_ms);
     }
+    if (prepared.has_observation_group && prepared.observation_views.size() == 3U) {
+        std::vector<FrameImage> views;
+        views.reserve(prepared.observation_views.size());
+        for (const PreparedView& prepared_view : prepared.observation_views) {
+            FrameImage view;
+            view.path = prepared_view.path;
+            view.rgb_u8 = prepared_view.rgb_u8;
+            view.rgb_f = prepared_view.rgb_f;
+            view.match_rgb_u8 = prepared_view.match_rgb_u8;
+            view.match_rgb_f = prepared_view.match_rgb_f;
+            view.support = prepared_view.support;
+            view.forced_homography = prepared_view.canvas_homography;
+            view.forced_homography_valid = prepared_view.pair_alignment_valid;
+            views.push_back(std::move(view));
+        }
+        return process_observation_group(
+            prepared.raw, state, views, prepared.read_ms);
+    }
     return process_impl(
         prepared.raw,
         state,
@@ -2845,6 +2999,1299 @@ CandidateCommit InferenceEngine::process_prepared(
         nullptr,
         prepared.has_observation_group && options_.group_stride >= 3,
         prepared.read_ms);
+}
+
+CandidateCommit InferenceEngine::process_observation_group(
+    const RawFrame& raw,
+    const CanvasState& state,
+    const std::vector<FrameImage>& views,
+    const double read_ms) {
+    if (views.size() != 3U) {
+        throw std::runtime_error("three-camera observation requires exactly three views");
+    }
+    Timer total_timer;
+    const int anchor_index = std::clamp(raw.group_anchor_index, 0, 2);
+    const FrameImage& anchor_view = views[static_cast<std::size_t>(anchor_index)];
+    CandidateCommit anchor_result = process_impl(
+        raw,
+        state,
+        anchor_view,
+        nullptr,
+        true,
+        read_ms,
+        nullptr);
+
+    // The anchor is the only geometry owner for pixels already represented in
+    // the Canvas. Side views are still real S1 inferences: they may add a
+    // previously unsupported, homography-consistent strip, but can never
+    // overwrite an anchor point. This prevents parallax from becoming a
+    // second surface while allowing all three same-time images to contribute
+    // visible coverage.
+    std::vector<std::uint32_t> current_observed_slots;
+    current_observed_slots.reserve(state.slot_count() / 2U);
+    CanvasState merged_state = state;
+    if (anchor_result.has_patch) {
+        commit_patch(merged_state, anchor_result.patch);
+        current_observed_slots.insert(
+            current_observed_slots.end(),
+            anchor_result.patch.observed_slots.begin(),
+            anchor_result.patch.observed_slots.end());
+    } else if (!state.initialized) {
+        // A non-initialized Canvas cannot accept a side-only first frame: the
+        // anchor path is the source of the required canvas dimensions and
+        // anchor RGB. Preserve the original no-patch result in this impossible
+        // recovery case instead of manufacturing an invalid transaction.
+        anchor_result.metrics.total_ms = total_timer.ms();
+        return anchor_result;
+    }
+
+    // The production GUI stores one point per raster slot and derives XY from
+    // that slot.  A fully dense anchor floor leaves no local capacity for a
+    // side camera to add the floor hidden by a raised robot/object at the same
+    // XY.  Reserve a deterministic half-grid only from the robust anchor floor
+    // (never from raised geometry).  The retained floor density still exceeds
+    // the GUI display budget, while neighbouring free slots can carry the
+    // complementary side-view floor without flattening the object.
+    if (merged_state.shape_valid()) {
+        std::vector<float> floor_x;
+        std::vector<float> floor_y;
+        std::vector<float> floor_z;
+        for (int y = 0; y < merged_state.height; y += 3) {
+            for (int x = 0; x < merged_state.width; x += 3) {
+                const std::size_t slot = static_cast<std::size_t>(y)
+                    * merged_state.width + x;
+                if (merged_state.valid[slot] == 0U
+                    || !std::isfinite(merged_state.depth[slot])
+                    || merged_state.depth[slot] <= 1e-5f) {
+                    continue;
+                }
+                floor_x.push_back(2.0f * static_cast<float>(x)
+                    / static_cast<float>(std::max(1, merged_state.width - 1)) - 1.0f);
+                floor_y.push_back(2.0f * static_cast<float>(y)
+                    / static_cast<float>(std::max(1, merged_state.height - 1)) - 1.0f);
+                floor_z.push_back(merged_state.depth[slot]);
+            }
+        }
+        if (floor_z.size() >= 512U) {
+            std::vector<std::uint8_t> keep(floor_z.size(), 1U);
+            std::array<double, 6> coefficients{};
+            float residual_center = 0.0f;
+            float residual_limit = 0.0f;
+            const float depth_scale = std::max(std::abs(median_value(floor_z)), 1e-5f);
+            for (int iteration = 0; iteration < 5; ++iteration) {
+                fit_quadratic_surface(floor_x, floor_y, floor_z, keep, coefficients);
+                std::vector<float> residuals;
+                residuals.reserve(floor_z.size());
+                for (std::size_t index = 0; index < floor_z.size(); ++index) {
+                    residuals.push_back(floor_z[index] - static_cast<float>(
+                        quadratic_surface_value(
+                            coefficients, floor_x[index], floor_y[index])));
+                }
+                std::vector<float> kept_residuals;
+                kept_residuals.reserve(residuals.size());
+                for (std::size_t index = 0; index < residuals.size(); ++index) {
+                    if (keep[index] != 0U) {
+                        kept_residuals.push_back(residuals[index]);
+                    }
+                }
+                residual_center = median_value(kept_residuals);
+                std::vector<float> deviations;
+                deviations.reserve(kept_residuals.size());
+                for (const float residual : kept_residuals) {
+                    deviations.push_back(std::abs(residual - residual_center));
+                }
+                residual_limit = std::max(
+                    0.008f * depth_scale,
+                    3.0f * 1.4826f * std::max(median_value(deviations), 1e-6f));
+                for (std::size_t index = 0; index < residuals.size(); ++index) {
+                    keep[index] = std::abs(residuals[index] - residual_center)
+                            <= residual_limit
+                        ? 1U : 0U;
+                }
+            }
+            for (int y = 0; y < merged_state.height; ++y) {
+                for (int x = 0; x < merged_state.width; ++x) {
+                    if (((x + y) & 1) == 0) {
+                        continue;
+                    }
+                    const std::size_t slot = static_cast<std::size_t>(y)
+                        * merged_state.width + x;
+                    if (merged_state.valid[slot] == 0U
+                        || !std::isfinite(merged_state.depth[slot])) {
+                        continue;
+                    }
+                    const float normalized_x = 2.0f * static_cast<float>(x)
+                        / static_cast<float>(std::max(1, merged_state.width - 1)) - 1.0f;
+                    const float normalized_y = 2.0f * static_cast<float>(y)
+                        / static_cast<float>(std::max(1, merged_state.height - 1)) - 1.0f;
+                    const float expected = static_cast<float>(quadratic_surface_value(
+                        coefficients, normalized_x, normalized_y));
+                    if (std::abs(merged_state.depth[slot] - expected - residual_center)
+                        > residual_limit) {
+                        continue;
+                    }
+                    set_slot_value(
+                        merged_state, static_cast<std::uint32_t>(slot), SlotValue{});
+                    merged_state.support[slot] = 0U;
+                }
+            }
+            current_observed_slots.erase(
+                std::remove_if(
+                    current_observed_slots.begin(),
+                    current_observed_slots.end(),
+                    [&merged_state](const std::uint32_t slot) {
+                        return slot >= merged_state.slot_count()
+                            || merged_state.valid[slot] == 0U;
+                    }),
+                current_observed_slots.end());
+        }
+    }
+    const cv::Mat anchor_homography = last_homography_.clone();
+    double total_model_ms = anchor_result.metrics.model_ms;
+    int total_forward_calls = anchor_result.metrics.forward_calls;
+    int planar_side_sources = 0;
+    int homography_side_sources = 0;
+    std::size_t accepted_side_sources = 0U;
+    std::size_t rejected_side_sources = 0U;
+
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        if (view_index == anchor_index) {
+            continue;
+        }
+
+        // A 2-D homography cannot turn a fixed side-camera image into the
+        // anchor camera's surface: parallax then becomes a duplicate/ghost
+        // layer.  Run the existing S=2 pair model on the real anchor/side
+        // images and project the side depth through its predicted relative
+        // pose instead.  This keeps the GUI launcher on S1/S2; no three-image
+        // model is involved.
+        CandidateCommit side_result;
+        try {
+            side_result = process_pair_observation(
+                raw,
+                merged_state,
+                anchor_view,
+                views[static_cast<std::size_t>(view_index)],
+                0.0);
+        } catch (const std::exception&) {
+            ++rejected_side_sources;
+            continue;
+        }
+        total_model_ms += side_result.metrics.model_ms;
+        total_forward_calls += side_result.metrics.forward_calls;
+        if (side_result.metrics.homography_error_px > 0.5) {
+            ++planar_side_sources;
+        }
+        if (side_result.metrics.group_max_depth_residual > 0.5) {
+            ++homography_side_sources;
+        }
+
+        bool accepted = side_result.has_patch
+            && !side_result.patch.scene_jump;
+        CandidatePatch side_patch;
+        if (accepted) {
+            side_patch = side_result.patch;
+            side_patch.base_version = merged_state.version;
+            side_patch.initialize_canvas = false;
+            side_patch.anchor_rgba.clear();
+            side_patch.scene_jump = false;
+            if (side_patch.updates.empty()) {
+                accepted = false;
+            } else {
+                commit_patch(merged_state, side_patch);
+                current_observed_slots.insert(
+                    current_observed_slots.end(),
+                    side_patch.observed_slots.begin(),
+                    side_patch.observed_slots.end());
+                ++accepted_side_sources;
+            }
+        }
+        if (!accepted) {
+            ++rejected_side_sources;
+        }
+    }
+
+    // When a real model pass succeeded, discard only large old regions outside
+    // the current three-camera observation footprint. The previous observation
+    // path kept every old support cell forever, so a changing mask left stale
+    // planes/objects behind and produced visible ghosts. Skipped-model frames
+    // keep the old canvas unchanged to preserve temporal continuity.
+    if (state.initialized && !anchor_result.metrics.skipped_model
+        && current_observed_slots.size() >= 4096U) {
+        cv::Mat current_footprint(
+            state.height, state.width, CV_8UC1, cv::Scalar(0));
+        for (const std::uint32_t slot : current_observed_slots) {
+            if (slot >= state.slot_count()) {
+                continue;
+            }
+            const int x = static_cast<int>(slot % static_cast<std::uint32_t>(state.width));
+            const int y = static_cast<int>(slot / static_cast<std::uint32_t>(state.width));
+            current_footprint.at<std::uint8_t>(y, x) = 255U;
+        }
+        if (cv::countNonZero(current_footprint) >= 4096) {
+            cv::dilate(
+                current_footprint,
+                current_footprint,
+                cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
+            cv::Mat outside_current;
+            cv::bitwise_not(current_footprint, outside_current);
+            cv::Mat stale;
+            cv::bitwise_and(
+                state_mask(state.valid, state.width, state.height),
+                outside_current,
+                stale);
+            stale = filter_components(stale, 256);
+            for (int y = 0; y < stale.rows; ++y) {
+                for (int x = 0; x < stale.cols; ++x) {
+                    if (stale.at<std::uint8_t>(y, x) == 0U) {
+                        continue;
+                    }
+                    const std::uint32_t slot = static_cast<std::uint32_t>(
+                        y * state.width + x);
+                    set_slot_value(merged_state, slot, SlotValue{});
+                    merged_state.support[slot] = 0U;
+                }
+            }
+        }
+    }
+
+    // Rebuild one transaction from the original state to the merged result.
+    // The commit worker therefore sees one logical frame/version, even though
+    // the existing S1 graph was called once per real camera view.
+    CandidatePatch merged_patch;
+    merged_patch.frame_seq = raw.frame_seq;
+    merged_patch.base_version = state.version;
+    merged_patch.width = merged_state.width;
+    merged_patch.height = merged_state.height;
+    merged_patch.initialize_canvas = !state.initialized;
+    merged_patch.anchor_camera = anchor_result.patch.anchor_camera;
+    merged_patch.scene_jump = anchor_result.patch.scene_jump;
+    if (merged_patch.initialize_canvas) {
+        merged_patch.anchor_rgba = merged_state.anchor_rgba;
+    }
+
+    const std::size_t slot_count = merged_state.slot_count();
+    merged_patch.updates.reserve(slot_count);
+    for (std::size_t slot = 0; slot < slot_count; ++slot) {
+        const SlotValue before = state.shape_valid()
+            ? slot_value_at(state, static_cast<std::uint32_t>(slot))
+            : SlotValue{};
+        const SlotValue after = slot_value_at(
+            merged_state, static_cast<std::uint32_t>(slot));
+        if (!slot_value_equal(before, after)) {
+            merged_patch.updates.push_back(SlotUpdate{
+                static_cast<std::uint32_t>(slot), after});
+        }
+        const std::uint8_t before_support = state.shape_valid()
+            ? state.support[slot]
+            : 0U;
+        const std::uint8_t after_support = merged_state.support[slot];
+        if (before_support == 0U && after_support != 0U) {
+            merged_patch.observed_slots.push_back(
+                static_cast<std::uint32_t>(slot));
+        } else if (before_support != 0U && after_support == 0U) {
+            merged_patch.cleared_support_slots.push_back(
+                static_cast<std::uint32_t>(slot));
+        }
+    }
+    merged_patch.changed_ratio = slot_count == 0U ? 0.0f
+        : static_cast<float>(static_cast<double>(merged_patch.updates.size())
+            / static_cast<double>(slot_count));
+
+    anchor_result.patch = std::move(merged_patch);
+    anchor_result.has_patch = anchor_result.patch.initialize_canvas
+        || !anchor_result.patch.updates.empty()
+        || !anchor_result.patch.observed_slots.empty()
+        || !anchor_result.patch.cleared_support_slots.empty();
+    anchor_result.metrics.group_size = 3;
+    anchor_result.metrics.group_stride = 3;
+    anchor_result.metrics.group_anchor_index = anchor_index;
+    anchor_result.metrics.group_fused_sources = static_cast<int>(
+        1U + accepted_side_sources);
+    anchor_result.metrics.group_rejected_sources = static_cast<int>(
+        rejected_side_sources);
+    anchor_result.metrics.forward_calls = total_forward_calls;
+    anchor_result.metrics.forward_batch_size = 1;
+    anchor_result.metrics.forward_sequence_size = 1;
+    anchor_result.metrics.model_ms = total_model_ms;
+    // In observation mode this field records how many of the two side views
+    // actually passed the planar-homography branch (0..2). It makes fallback
+    // to unstable pair-pose geometry visible in the existing metrics stream.
+    anchor_result.metrics.homography_error_px =
+        static_cast<double>(planar_side_sources);
+    // Observation-mode diagnostic: how many side views used a validated
+    // direct/chained image homography instead of pose-only floor projection.
+    anchor_result.metrics.group_max_depth_residual =
+        static_cast<double>(homography_side_sources);
+    anchor_result.metrics.changed_ratio = anchor_result.patch.changed_ratio;
+    anchor_result.metrics.changed_point_count = static_cast<std::uint32_t>(
+        anchor_result.patch.updates.size());
+    anchor_result.metrics.valid_point_count = static_cast<std::uint32_t>(
+        std::count(merged_state.valid.begin(), merged_state.valid.end(),
+            static_cast<std::uint8_t>(1U)));
+    anchor_result.frame.status = anchor_result.has_patch
+        ? FrameStatus::Committed
+        : FrameStatus::NoChange;
+    anchor_result.frame.changed_ratio = anchor_result.patch.changed_ratio;
+    anchor_result.frame.changed_point_count = anchor_result.metrics.changed_point_count;
+    anchor_result.frame.valid_point_count = anchor_result.metrics.valid_point_count;
+    anchor_result.metrics.total_ms = total_timer.ms();
+
+    // Do not carry a side-view RGB or transform into the next logical frame.
+    // The committed merged Canvas is the only stable reference for the next
+    // group; the anchor transform remains the temporal reference.
+    live_rgb_float_ = state_rgb_float(merged_state);
+    last_homography_ = anchor_homography;
+    return anchor_result;
+}
+
+CandidateCommit InferenceEngine::process_pair_observation(
+    const RawFrame& raw,
+    const CanvasState& state,
+    const FrameImage& anchor,
+    const FrameImage& side,
+    const double read_ms) {
+    Timer total_timer;
+    CandidateCommit result;
+    result.frame.frame_seq = raw.frame_seq;
+    result.frame.base_version = state.version;
+    result.frame.commit_version = state.version;
+    result.frame.image_name = side.path.filename().string();
+    result.metrics.frame_seq = raw.frame_seq;
+    result.metrics.image = result.frame.image_name;
+    result.metrics.read_ms = read_ms;
+    result.metrics.group_size = 3;
+    result.metrics.group_stride = options_.group_stride;
+    result.metrics.group_anchor_index = raw.group_anchor_index;
+    result.metrics.forward_batch_size = 1;
+    result.metrics.forward_sequence_size = 2;
+    result.metrics.roi_width = options_.width;
+    result.metrics.roi_height = options_.height;
+    result.metrics.model_input_width = options_.width;
+    result.metrics.model_input_height = options_.height;
+
+    if (!state.initialized || !has_pair_module_
+        || anchor.match_rgb_f.empty() || side.match_rgb_f.empty()) {
+        result.frame.status = FrameStatus::NoChange;
+        result.metrics.total_ms = total_timer.ms();
+        return result;
+    }
+
+    const int model_width = options_.width;
+    const int model_height = options_.height;
+    const auto make_pair_input = [&](const FrameImage& frame) {
+        const cv::Mat& source = frame.match_rgb_f;
+        const double scale = static_cast<double>(model_width)
+            / static_cast<double>(std::max(1, source.cols));
+        const int resized_height = std::max(
+            1, static_cast<int>(std::round(static_cast<double>(source.rows) * scale)));
+        cv::Mat resized;
+        cv::resize(
+            source,
+            resized,
+            cv::Size(model_width, resized_height),
+            0.0,
+            0.0,
+            cv::INTER_AREA);
+        if (resized_height == model_height) {
+            return resized;
+        }
+        if (resized_height < model_height) {
+            const int top = (model_height - resized_height) / 2;
+            cv::Mat padded;
+            cv::copyMakeBorder(
+                resized,
+                padded,
+                top,
+                model_height - resized_height - top,
+                0,
+                0,
+                cv::BORDER_REPLICATE);
+            return padded;
+        }
+        const int crop_top = (resized_height - model_height) / 2;
+        return resized(cv::Rect(0, crop_top, model_width, model_height)).clone();
+    };
+
+    const cv::Mat anchor_input = make_pair_input(anchor);
+    const cv::Mat side_input = make_pair_input(side);
+    const std::vector<cv::Mat> pair_inputs = {anchor_input, side_input};
+    Timer model_timer;
+    // The observer artifact exposes one selected frame per call.  Read both
+    // poses from the same S=2 pair with two forwards; this is deliberately
+    // still the existing pair model, never the rejected S=3 graph.
+    const Prediction anchor_prediction = run_model(pair_inputs, 0);
+    const Prediction side_prediction = run_model(pair_inputs, 1);
+    result.metrics.model_ms = model_timer.ms();
+    result.metrics.forward_calls = 2;
+    if (!anchor_prediction.has_pose || !side_prediction.has_pose
+        || anchor_prediction.depth.empty() || side_prediction.depth.empty()) {
+        result.metrics.total_ms = total_timer.ms();
+        return result;
+    }
+
+    const auto rotation_from_quaternion = [](const cv::Vec4f& quaternion) {
+        const float x = quaternion[0];
+        const float y = quaternion[1];
+        const float z = quaternion[2];
+        const float w = quaternion[3];
+        const float denominator = x * x + y * y + z * z + w * w;
+        if (!std::isfinite(denominator) || denominator < 1e-8f) {
+            return cv::Matx33f::eye();
+        }
+        const float scale = 2.0f / denominator;
+        return cv::Matx33f(
+            1.0f - scale * (y * y + z * z),
+            scale * (x * y - z * w),
+            scale * (x * z + y * w),
+            scale * (x * y + z * w),
+            1.0f - scale * (x * x + z * z),
+            scale * (y * z - x * w),
+            scale * (x * z - y * w),
+            scale * (y * z + x * w),
+            1.0f - scale * (x * x + y * y));
+    };
+    const cv::Matx33f anchor_rotation = rotation_from_quaternion(
+        anchor_prediction.pose_quaternion);
+    const cv::Matx33f side_rotation = rotation_from_quaternion(
+        side_prediction.pose_quaternion);
+    const cv::Vec3f& anchor_translation = anchor_prediction.pose_translation;
+    const cv::Vec3f& side_translation = side_prediction.pose_translation;
+    const float anchor_fx = static_cast<float>(model_width * 0.5)
+        / std::tan(std::max(0.05f, anchor_prediction.fov_w * 0.5f));
+    const float anchor_fy = static_cast<float>(model_height * 0.5)
+        / std::tan(std::max(0.05f, anchor_prediction.fov_h * 0.5f));
+    const float side_fx = static_cast<float>(model_width * 0.5)
+        / std::tan(std::max(0.05f, side_prediction.fov_w * 0.5f));
+    const float side_fy = static_cast<float>(model_height * 0.5)
+        / std::tan(std::max(0.05f, side_prediction.fov_h * 0.5f));
+    const float anchor_cx = static_cast<float>(model_width) * 0.5f;
+    const float anchor_cy = static_cast<float>(model_height) * 0.5f;
+    const float side_cx = static_cast<float>(model_width) * 0.5f;
+    const float side_cy = static_cast<float>(model_height) * 0.5f;
+    const cv::Point origin = content_origin(
+        anchor.support,
+        std::max(32, static_cast<int>(std::round(options_.width * 0.05))),
+        std::max(128, static_cast<int>(std::round(options_.width * 0.18))));
+
+    const double anchor_scale = static_cast<double>(model_width)
+        / static_cast<double>(std::max(1, anchor.match_rgb_f.cols));
+    const int anchor_resized_height = std::max(
+        1, static_cast<int>(std::round(
+            static_cast<double>(anchor.match_rgb_f.rows) * anchor_scale)));
+    const int anchor_pad_top = anchor_resized_height < model_height
+        ? (model_height - anchor_resized_height) / 2
+        : 0;
+
+    auto project_anchor = [&](const cv::Vec3f& point, double& pixel_x, double& pixel_y) {
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1])
+            || !std::isfinite(point[2]) || point[2] <= 1e-5f) {
+            return false;
+        }
+        pixel_x = static_cast<double>(anchor_cx)
+            + static_cast<double>(anchor_fx) * point[0] / point[2];
+        pixel_y = static_cast<double>(anchor_cy)
+            + static_cast<double>(anchor_fy) * point[1] / point[2];
+        return std::isfinite(pixel_x) && std::isfinite(pixel_y);
+    };
+
+    // Pair-model depth has an arbitrary global scale. Calibrate that scale
+    // against already committed anchor pixels before projecting the side
+    // camera; using a raw pair depth here would make a second floating layer.
+    std::vector<float> scale_values;
+    scale_values.reserve(50000U);
+    for (int y = anchor_pad_top + 8; y < model_height - 8; y += 4) {
+        for (int x = 8; x < model_width - 8; x += 4) {
+            const float depth = anchor_prediction.depth.at<float>(y, x);
+            if (!std::isfinite(depth) || depth <= 1e-5f) {
+                continue;
+            }
+            const cv::Vec3f camera_point(
+                (static_cast<float>(x) - anchor_cx) * depth / anchor_fx,
+                (static_cast<float>(y) - anchor_cy) * depth / anchor_fy,
+                depth);
+            const cv::Vec3f world_point = anchor_rotation.t()
+                * (camera_point - anchor_translation);
+            const cv::Vec3f anchor_point = anchor_rotation * world_point
+                + anchor_translation;
+            double projected_x = 0.0;
+            double projected_y = 0.0;
+            if (!project_anchor(anchor_point, projected_x, projected_y)) {
+                continue;
+            }
+            const int canvas_x = origin.x + static_cast<int>(std::lround(projected_x));
+            const int canvas_y = origin.y + static_cast<int>(std::lround(projected_y));
+            if (canvas_x < 0 || canvas_x >= state.width
+                || canvas_y < 0 || canvas_y >= state.height) {
+                continue;
+            }
+            const std::size_t slot = static_cast<std::size_t>(canvas_y) * state.width
+                + static_cast<std::size_t>(canvas_x);
+            if (slot >= state.valid.size() || state.valid[slot] == 0U
+                || !std::isfinite(state.depth[slot]) || state.depth[slot] <= 1e-5f) {
+                continue;
+            }
+            scale_values.push_back(state.depth[slot] / std::max(anchor_point[2], 1e-5f));
+        }
+    }
+    double pair_scale = 1.0;
+    if (scale_values.size() >= 128U) {
+        pair_scale = std::clamp(
+            static_cast<double>(median_value(scale_values)),
+            0.25,
+            4.0);
+    }
+
+    const double side_scale = static_cast<double>(model_width)
+        / static_cast<double>(std::max(1, side.match_rgb_f.cols));
+    const int side_resized_height = std::max(
+        1, static_cast<int>(std::round(
+            static_cast<double>(side.match_rgb_f.rows) * side_scale)));
+    const int side_pad_top = side_resized_height < model_height
+        ? (model_height - side_resized_height) / 2
+        : 0;
+    const int side_crop_top = side_resized_height > model_height
+        ? (side_resized_height - model_height) / 2
+        : 0;
+    const cv::Rect side_content_rect = [&]() {
+        if (!side.support.empty() && cv::countNonZero(side.support) > 0) {
+            return cv::boundingRect(side.support);
+        }
+        return cv::Rect(0, 0, side.match_rgb_u8.cols, side.match_rgb_u8.rows);
+    }();
+    const auto source_pixel_for_model = [&](const int model_x, const int model_y,
+                                            int& source_x, int& source_y) {
+        const int raw_x = static_cast<int>(std::lround(
+            static_cast<double>(model_x) / side_scale));
+        const int raw_y = static_cast<int>(std::lround(
+            static_cast<double>(model_y - side_pad_top + side_crop_top)
+                / side_scale));
+        if (raw_x < 4 || raw_x >= side_content_rect.width - 4
+            || raw_y < 4 || raw_y >= side_content_rect.height - 4
+            || raw_x >= side.match_rgb_u8.cols
+            || raw_y >= side.match_rgb_u8.rows) {
+            return false;
+        }
+        const int support_x = side_content_rect.x + raw_x;
+        const int support_y = side_content_rect.y + raw_y;
+        if (!side.support.empty()
+            && (support_x < 0 || support_x >= side.support.cols
+                || support_y < 0 || support_y >= side.support.rows
+                || side.support.at<std::uint8_t>(support_y, support_x) == 0U)) {
+            return false;
+        }
+        source_x = raw_x;
+        source_y = raw_y;
+        return true;
+    };
+
+    std::array<std::vector<float>, 3> side_color_values;
+    std::array<std::vector<float>, 3> anchor_color_values;
+    for (int y = side_pad_top + 12; y < model_height - 12; y += 4) {
+        for (int x = 12; x < model_width - 12; x += 4) {
+            const float depth = side_prediction.depth.at<float>(y, x);
+            const float confidence = side_prediction.confidence.at<float>(y, x);
+            if (!std::isfinite(depth) || depth <= 1e-5f
+                || !std::isfinite(confidence)
+                || confidence < static_cast<float>(options_.min_conf)) {
+                continue;
+            }
+            int source_x = 0;
+            int source_y = 0;
+            if (!source_pixel_for_model(x, y, source_x, source_y)) {
+                continue;
+            }
+            const cv::Vec3f side_point(
+                (static_cast<float>(x) - side_cx) * depth / side_fx,
+                (static_cast<float>(y) - side_cy) * depth / side_fy,
+                depth);
+            const cv::Vec3f world_point = side_rotation.t()
+                * (side_point - side_translation);
+            cv::Vec3f anchor_point = anchor_rotation * world_point
+                + anchor_translation;
+            anchor_point *= static_cast<float>(pair_scale);
+            double projected_x = 0.0;
+            double projected_y = 0.0;
+            if (!project_anchor(anchor_point, projected_x, projected_y)) {
+                continue;
+            }
+            const int canvas_x = origin.x + static_cast<int>(std::lround(projected_x));
+            const int canvas_y = origin.y + static_cast<int>(std::lround(projected_y));
+            if (canvas_x < 0 || canvas_x >= state.width
+                || canvas_y < 0 || canvas_y >= state.height) {
+                continue;
+            }
+            const std::size_t slot = static_cast<std::size_t>(canvas_y) * state.width
+                + static_cast<std::size_t>(canvas_x);
+            if (slot >= state.slot_count() || state.valid[slot] == 0U
+                || !std::isfinite(state.depth[slot]) || state.depth[slot] <= 1e-5f) {
+                continue;
+            }
+            const cv::Vec3b source_color = side.match_rgb_u8.at<cv::Vec3b>(
+                source_y, source_x);
+            const auto destination_color = unpack_rgba(state.rgba[slot]);
+            for (int channel = 0; channel < 3; ++channel) {
+                const float source_value =
+                    static_cast<float>(source_color[channel]) / 255.0f;
+                const float destination_value =
+                    static_cast<float>(destination_color[channel]) / 255.0f;
+                if (source_value > 0.04f && source_value < 0.96f
+                    && destination_value > 0.04f && destination_value < 0.96f) {
+                    side_color_values[static_cast<std::size_t>(channel)]
+                        .push_back(source_value);
+                    anchor_color_values[static_cast<std::size_t>(channel)]
+                        .push_back(destination_value);
+                }
+            }
+        }
+    }
+
+    // Match the joint B1S3 colour rule used by the tuned local path.
+    // A robust additive exposure offset preserves each camera's chroma;
+    // fitting an independent gain per channel desaturated the dark green
+    // floor in newly exposed side-camera regions.
+    std::array<double, 3> side_color_bias{0.0, 0.0, 0.0};
+    for (int channel = 0; channel < 3; ++channel) {
+        const auto& source_values =
+            side_color_values[static_cast<std::size_t>(channel)];
+        const auto& destination_values =
+            anchor_color_values[static_cast<std::size_t>(channel)];
+        if (source_values.size() < 128U
+            || destination_values.size() != source_values.size()) {
+            continue;
+        }
+        std::vector<float> differences;
+        differences.reserve(source_values.size());
+        for (std::size_t index = 0; index < source_values.size(); ++index) {
+            differences.push_back(
+                destination_values[index] - source_values[index]);
+        }
+        side_color_bias[static_cast<std::size_t>(channel)] =
+            std::clamp(
+                static_cast<double>(median_value(differences)),
+                -0.18,
+                0.18);
+    }
+
+    // Prepare a local colour bridge from the already committed canvas.
+    // Global per-channel exposure correction aligns the cameras on average;
+    // this short feather removes the remaining visible boundary step without
+    // allowing a side camera to rewrite existing anchor texture.
+    const cv::Mat existing_valid =
+        state_mask(state.valid, state.width, state.height);
+    cv::Mat distance_to_existing;
+    std::vector<cv::Mat> nearest_existing_channels;
+    if (cv::countNonZero(existing_valid) > 0) {
+        cv::Mat missing_existing;
+        cv::bitwise_not(existing_valid, missing_existing);
+        cv::distanceTransform(
+            missing_existing,
+            distance_to_existing,
+            cv::DIST_L2,
+            3);
+        const cv::Mat existing_rgb = state_rgb_float(state);
+        std::vector<cv::Mat> existing_channels;
+        cv::split(existing_rgb, existing_channels);
+        nearest_existing_channels.reserve(existing_channels.size());
+        for (const cv::Mat& channel : existing_channels) {
+            nearest_existing_channels.push_back(
+                nearest_fill_values(channel, existing_valid));
+        }
+    }
+
+    const int step = 2;
+    const std::size_t slot_count = state.slot_count();
+    std::vector<int> update_index(slot_count, -1);
+    std::vector<std::uint8_t> observed(slot_count, 0U);
+    std::vector<float> update_quality;
+    CandidatePatch patch;
+    patch.frame_seq = raw.frame_seq;
+    patch.base_version = state.version;
+    patch.width = state.width;
+    patch.height = state.height;
+    patch.initialize_canvas = false;
+    patch.scene_jump = false;
+    patch.anchor_camera = state.anchor_camera;
+    patch.updates.reserve(slot_count / 8U);
+    patch.observed_slots.reserve(slot_count / 8U);
+
+    // For cameras surrounding the robot, the pair model's relative pose is
+    // not stable enough to place the low-texture floor.  Use the real-image
+    // side-to-anchor homography only for the dominant planar surface.  The
+    // anchor keeps ownership of every existing cell, so this path can fill
+    // floor hidden from one camera without creating a second robot or floor.
+    cv::Mat side_to_canvas;
+    if (side.forced_homography_valid && !side.forced_homography.empty()) {
+        side_to_canvas = side.forced_homography.clone();
+        if (!last_homography_.empty()) {
+            side_to_canvas = last_homography_ * side_to_canvas;
+        }
+        side_to_canvas.convertTo(side_to_canvas, CV_32FC1);
+        if (!cv::checkRange(side_to_canvas)) {
+            side_to_canvas.release();
+        }
+    }
+
+    std::vector<float> committed_depths;
+    committed_depths.reserve(state.slot_count());
+    for (std::size_t slot = 0; slot < state.slot_count(); ++slot) {
+        if (state.valid[slot] != 0U && std::isfinite(state.depth[slot])
+            && state.depth[slot] > 1e-5f) {
+            committed_depths.push_back(state.depth[slot]);
+        }
+    }
+    const float floor_depth = median_value(committed_depths);
+
+    // Preserve the anchor floor's perspective instead of writing one constant
+    // depth sheet.  A robust quadratic in normalized canvas coordinates is
+    // sufficient for the gently curved model depth while rejecting raised
+    // robot/object pixels as minority residuals.
+    std::vector<float> floor_x;
+    std::vector<float> floor_y;
+    std::vector<float> floor_z;
+    for (int canvas_y = 0; canvas_y < state.height; canvas_y += 3) {
+        for (int canvas_x = 0; canvas_x < state.width; canvas_x += 3) {
+            const std::size_t slot = static_cast<std::size_t>(canvas_y)
+                * state.width + canvas_x;
+            if (state.valid[slot] == 0U || !std::isfinite(state.depth[slot])
+                || state.depth[slot] <= 1e-5f) {
+                continue;
+            }
+            floor_x.push_back(2.0f * static_cast<float>(canvas_x)
+                / static_cast<float>(std::max(1, state.width - 1)) - 1.0f);
+            floor_y.push_back(2.0f * static_cast<float>(canvas_y)
+                / static_cast<float>(std::max(1, state.height - 1)) - 1.0f);
+            floor_z.push_back(state.depth[slot]);
+        }
+    }
+    std::vector<std::uint8_t> floor_keep(floor_z.size(), 1U);
+    std::array<double, 6> floor_coefficients{};
+    float floor_surface_center = 0.0f;
+    float floor_surface_limit = std::max(
+        0.008f * std::max(floor_depth, 1e-3f), 1e-6f);
+    for (int iteration = 0; iteration < 5 && floor_z.size() >= 512U; ++iteration) {
+        fit_quadratic_surface(
+            floor_x, floor_y, floor_z, floor_keep, floor_coefficients);
+        std::vector<float> residuals;
+        residuals.reserve(floor_z.size());
+        for (std::size_t index = 0; index < floor_z.size(); ++index) {
+            residuals.push_back(floor_z[index] - static_cast<float>(
+                quadratic_surface_value(
+                    floor_coefficients, floor_x[index], floor_y[index])));
+        }
+        const float center = median_value(residuals);
+        std::vector<float> deviations;
+        deviations.reserve(residuals.size());
+        for (const float residual : residuals) {
+            deviations.push_back(std::abs(residual - center));
+        }
+        const float limit = std::max(
+            0.008f * std::max(floor_depth, 1e-3f),
+            3.0f * 1.4826f * std::max(median_value(deviations), 1e-6f));
+        floor_surface_center = center;
+        floor_surface_limit = limit;
+        for (std::size_t index = 0; index < residuals.size(); ++index) {
+            floor_keep[index] = std::abs(residuals[index] - center) <= limit
+                ? 1U : 0U;
+        }
+    }
+    const bool floor_surface_valid =
+        std::count(floor_keep.begin(), floor_keep.end(), 1U) >= 512;
+
+    cv::Mat anchor_current_support = anchor.support.clone();
+    if (!last_homography_.empty()) {
+        anchor_current_support = warp_like(
+            anchor.support,
+            last_homography_,
+            cv::Size(state.width, state.height),
+            cv::INTER_NEAREST);
+    }
+    cv::threshold(
+        anchor_current_support,
+        anchor_current_support,
+        127.0,
+        255.0,
+        cv::THRESH_BINARY);
+    anchor_current_support.convertTo(anchor_current_support, CV_8UC1);
+    cv::Mat outside_anchor_support;
+    cv::bitwise_not(anchor_current_support, outside_anchor_support);
+    cv::Mat distance_to_anchor_support;
+    cv::distanceTransform(
+        outside_anchor_support,
+        distance_to_anchor_support,
+        cv::DIST_L2,
+        3);
+
+    // A 3-D plane has affine inverse depth in normalized image coordinates.
+    // Iteratively fit the dominant plane; raised robot/box pixels become
+    // robust outliers and are never permitted to enter side-only coverage.
+    std::vector<cv::Vec3d> plane_samples;
+    plane_samples.reserve(
+        static_cast<std::size_t>(model_width / 4) * (model_height / 4));
+    for (int y = side_pad_top + 12; y < model_height - 12; y += 4) {
+        for (int x = 12; x < model_width - 12; x += 4) {
+            const float depth = side_prediction.depth.at<float>(y, x);
+            const float confidence = side_prediction.confidence.at<float>(y, x);
+            int source_x = 0;
+            int source_y = 0;
+            if (!std::isfinite(depth) || depth <= 1e-5f
+                || !std::isfinite(confidence)
+                || confidence < static_cast<float>(options_.min_conf)
+                || !source_pixel_for_model(x, y, source_x, source_y)) {
+                continue;
+            }
+            plane_samples.emplace_back(
+                (static_cast<double>(x) - side_cx) / side_fx,
+                (static_cast<double>(y) - side_cy) / side_fy,
+                1.0 / static_cast<double>(depth));
+        }
+    }
+    cv::Vec3d plane_coefficients(0.0, 0.0, 0.0);
+    double plane_center = 0.0;
+    double plane_limit = 0.0;
+    std::vector<std::uint8_t> plane_keep(plane_samples.size(), 1U);
+    for (int iteration = 0; iteration < 5 && plane_samples.size() >= 512U; ++iteration) {
+        cv::Mat normal = cv::Mat::zeros(3, 3, CV_64F);
+        cv::Mat rhs = cv::Mat::zeros(3, 1, CV_64F);
+        std::size_t kept = 0U;
+        for (std::size_t index = 0; index < plane_samples.size(); ++index) {
+            if (plane_keep[index] == 0U) {
+                continue;
+            }
+            const cv::Vec3d& sample = plane_samples[index];
+            const double basis[3] = {sample[0], sample[1], 1.0};
+            for (int row = 0; row < 3; ++row) {
+                rhs.at<double>(row, 0) += basis[row] * sample[2];
+                for (int column = 0; column < 3; ++column) {
+                    normal.at<double>(row, column) += basis[row] * basis[column];
+                }
+            }
+            ++kept;
+        }
+        cv::Mat solution;
+        if (kept < 512U || !cv::solve(normal, rhs, solution, cv::DECOMP_SVD)) {
+            plane_keep.assign(plane_keep.size(), 0U);
+            break;
+        }
+        plane_coefficients = cv::Vec3d(
+            solution.at<double>(0, 0),
+            solution.at<double>(1, 0),
+            solution.at<double>(2, 0));
+        std::vector<float> residuals;
+        residuals.reserve(plane_samples.size());
+        for (const cv::Vec3d& sample : plane_samples) {
+            residuals.push_back(static_cast<float>(sample[2]
+                - (plane_coefficients[0] * sample[0]
+                    + plane_coefficients[1] * sample[1]
+                    + plane_coefficients[2])));
+        }
+        plane_center = median_value(residuals);
+        std::vector<float> deviations;
+        deviations.reserve(residuals.size());
+        for (const float residual : residuals) {
+            deviations.push_back(std::abs(residual - plane_center));
+        }
+        plane_limit = std::max(
+            0.012 * std::abs(plane_coefficients[2]),
+            3.0 * 1.4826 * static_cast<double>(
+                std::max(median_value(deviations), 1e-7f)));
+        for (std::size_t index = 0; index < residuals.size(); ++index) {
+            plane_keep[index] =
+                std::abs(static_cast<double>(residuals[index]) - plane_center)
+                    <= plane_limit
+                ? 1U : 0U;
+        }
+    }
+    const bool dominant_side_plane_valid =
+        std::isfinite(floor_depth) && floor_depth > 1e-5f
+        && floor_surface_valid
+        && std::count(plane_keep.begin(), plane_keep.end(), 1U) >= 512;
+    const bool use_planar_homography = dominant_side_plane_valid
+        && !side_to_canvas.empty();
+    const bool use_planar_completion = dominant_side_plane_valid;
+    result.metrics.homography_error_px = use_planar_completion ? 1.0 : 0.0;
+    result.metrics.group_max_depth_residual = use_planar_homography ? 1.0 : 0.0;
+    const cv::Point side_origin = content_origin(
+        side.support,
+        std::max(32, static_cast<int>(std::round(options_.width * 0.05))),
+        std::max(128, static_cast<int>(std::round(options_.width * 0.18))));
+    const cv::Mat side_bright_nonplanar =
+        bright_nonplanar_mask(side.match_rgb_u8);
+
+    const int projection_step = use_planar_completion ? 1 : step;
+    for (int y = side_pad_top + 8; y < model_height - 8; y += projection_step) {
+        for (int x = 8; x < model_width - 8; x += projection_step) {
+            const float depth = side_prediction.depth.at<float>(y, x);
+            const float confidence = side_prediction.confidence.at<float>(y, x);
+            if (!std::isfinite(depth) || depth <= 1e-5f
+                || !std::isfinite(confidence)
+                || confidence < static_cast<float>(options_.min_conf)) {
+                continue;
+            }
+            int source_x = 0;
+            int source_y = 0;
+            if (!source_pixel_for_model(x, y, source_x, source_y)) {
+                continue;
+            }
+            if (use_planar_completion
+                && !side_bright_nonplanar.empty()
+                && side_bright_nonplanar.at<std::uint8_t>(source_y, source_x) != 0U) {
+                // Pair depth can flatten the bright robot into the dominant
+                // inverse-depth plane. It is still an occluder in RGB and
+                // must never be copied as floor completion.
+                continue;
+            }
+            if (!use_planar_completion) {
+                // A side view may contribute only its robust dominant floor.
+                // Falling back to raw S2 object depth duplicates the robot and
+                // creates the vertical curtains seen in the real GUI.
+                continue;
+            }
+            int canvas_x = -1;
+            int canvas_y = -1;
+            float candidate_depth = 0.0f;
+            if (use_planar_completion) {
+                const double normalized_x =
+                    (static_cast<double>(x) - side_cx) / side_fx;
+                const double normalized_y =
+                    (static_cast<double>(y) - side_cy) / side_fy;
+                const double inverse_depth = 1.0 / static_cast<double>(depth);
+                const double residual = inverse_depth
+                    - (plane_coefficients[0] * normalized_x
+                        + plane_coefficients[1] * normalized_y
+                        + plane_coefficients[2]);
+                if (std::abs(residual - plane_center) > plane_limit) {
+                    continue;
+                }
+                if (use_planar_homography) {
+                    const double source_canvas_x = side_origin.x + source_x;
+                    const double source_canvas_y = side_origin.y + source_y;
+                    const double denominator =
+                        side_to_canvas.at<float>(2, 0) * source_canvas_x
+                        + side_to_canvas.at<float>(2, 1) * source_canvas_y
+                        + side_to_canvas.at<float>(2, 2);
+                    if (!std::isfinite(denominator)
+                        || std::abs(denominator) < 1e-8) {
+                        continue;
+                    }
+                    canvas_x = static_cast<int>(std::lround((
+                        side_to_canvas.at<float>(0, 0) * source_canvas_x
+                        + side_to_canvas.at<float>(0, 1) * source_canvas_y
+                        + side_to_canvas.at<float>(0, 2)) / denominator));
+                    canvas_y = static_cast<int>(std::lround((
+                        side_to_canvas.at<float>(1, 0) * source_canvas_x
+                        + side_to_canvas.at<float>(1, 1) * source_canvas_y
+                        + side_to_canvas.at<float>(1, 2)) / denominator));
+                } else {
+                    // The third camera has little direct texture overlap with
+                    // the anchor. Intersect its ray with the fitted dominant
+                    // plane, then use the existing S2 relative camera pose for
+                    // XY only. Object/robot depth is deliberately discarded.
+                    const double fitted_inverse_depth =
+                        plane_coefficients[0] * normalized_x
+                        + plane_coefficients[1] * normalized_y
+                        + plane_coefficients[2] + plane_center;
+                    if (!std::isfinite(fitted_inverse_depth)
+                        || fitted_inverse_depth <= 1e-8) {
+                        continue;
+                    }
+                    const float planar_side_depth = static_cast<float>(
+                        1.0 / fitted_inverse_depth);
+                    const cv::Vec3f side_floor_point(
+                        (static_cast<float>(x) - side_cx)
+                            * planar_side_depth / side_fx,
+                        (static_cast<float>(y) - side_cy)
+                            * planar_side_depth / side_fy,
+                        planar_side_depth);
+                    const cv::Vec3f world_floor_point = side_rotation.t()
+                        * (side_floor_point - side_translation);
+                    cv::Vec3f anchor_floor_point = anchor_rotation
+                        * world_floor_point + anchor_translation;
+                    anchor_floor_point *= static_cast<float>(pair_scale);
+                    double projected_x = 0.0;
+                    double projected_y = 0.0;
+                    if (!project_anchor(
+                            anchor_floor_point, projected_x, projected_y)) {
+                        continue;
+                    }
+                    const double unscaled_canvas_x = origin.x + projected_x;
+                    const double unscaled_canvas_y = origin.y + projected_y;
+                    if (!last_homography_.empty()) {
+                        const double denominator =
+                            last_homography_.at<float>(2, 0) * unscaled_canvas_x
+                            + last_homography_.at<float>(2, 1) * unscaled_canvas_y
+                            + last_homography_.at<float>(2, 2);
+                        if (!std::isfinite(denominator)
+                            || std::abs(denominator) < 1e-8) {
+                            continue;
+                        }
+                        canvas_x = static_cast<int>(std::lround((
+                            last_homography_.at<float>(0, 0) * unscaled_canvas_x
+                            + last_homography_.at<float>(0, 1) * unscaled_canvas_y
+                            + last_homography_.at<float>(0, 2)) / denominator));
+                        canvas_y = static_cast<int>(std::lround((
+                            last_homography_.at<float>(1, 0) * unscaled_canvas_x
+                            + last_homography_.at<float>(1, 1) * unscaled_canvas_y
+                            + last_homography_.at<float>(1, 2)) / denominator));
+                    } else {
+                        canvas_x = static_cast<int>(std::lround(unscaled_canvas_x));
+                        canvas_y = static_cast<int>(std::lround(unscaled_canvas_y));
+                    }
+                }
+                if (canvas_x < 0 || canvas_x >= state.width
+                    || canvas_y < 0 || canvas_y >= state.height
+                    || distance_to_anchor_support.at<float>(canvas_y, canvas_x) > 160.0f) {
+                    continue;
+                }
+                const float normalized_canvas_x =
+                    2.0f * static_cast<float>(canvas_x)
+                    / static_cast<float>(std::max(1, state.width - 1)) - 1.0f;
+                const float normalized_canvas_y =
+                    2.0f * static_cast<float>(canvas_y)
+                    / static_cast<float>(std::max(1, state.height - 1)) - 1.0f;
+                candidate_depth = static_cast<float>(quadratic_surface_value(
+                    floor_coefficients,
+                    normalized_canvas_x,
+                    normalized_canvas_y));
+            }
+            if (canvas_x < 0 || canvas_x >= state.width
+                || canvas_y < 0 || canvas_y >= state.height) {
+                continue;
+            }
+            std::size_t slot = static_cast<std::size_t>(canvas_y) * state.width
+                + static_cast<std::size_t>(canvas_x);
+            if (slot >= slot_count) {
+                continue;
+            }
+            SlotValue before = slot_value_at(
+                state, static_cast<std::uint32_t>(slot));
+            bool already_valid = before.valid != 0U
+                && std::isfinite(before.depth) && before.depth > 1e-5f;
+            if (!std::isfinite(candidate_depth) || candidate_depth <= 1e-5f) {
+                continue;
+            }
+            if (use_planar_completion && already_valid) {
+                const float normalized_canvas_x =
+                    2.0f * static_cast<float>(canvas_x)
+                    / static_cast<float>(std::max(1, state.width - 1)) - 1.0f;
+                const float normalized_canvas_y =
+                    2.0f * static_cast<float>(canvas_y)
+                    / static_cast<float>(std::max(1, state.height - 1)) - 1.0f;
+                const float expected_floor_depth = static_cast<float>(
+                    quadratic_surface_value(
+                        floor_coefficients,
+                        normalized_canvas_x,
+                        normalized_canvas_y));
+                const bool existing_is_floor = std::isfinite(expected_floor_depth)
+                    && std::abs(before.depth - expected_floor_depth
+                        - floor_surface_center) <= floor_surface_limit;
+                if (existing_is_floor) {
+                    // The anchor already represents this floor location.
+                    continue;
+                }
+
+                // One GUI raster slot can carry only one Z value.  Keep the
+                // raised anchor point (robot/object) and place the side-view
+                // floor in the nearest locally reserved slot.  This is a
+                // sub-pixel XY dither, not a second registration transform.
+                int best_x = -1;
+                int best_y = -1;
+                int best_distance_squared = std::numeric_limits<int>::max();
+                constexpr int kConflictSearchRadius = 6;
+                for (int dy = -kConflictSearchRadius;
+                     dy <= kConflictSearchRadius;
+                     ++dy) {
+                    for (int dx = -kConflictSearchRadius;
+                         dx <= kConflictSearchRadius;
+                         ++dx) {
+                        const int distance_squared = dx * dx + dy * dy;
+                        if (distance_squared == 0
+                            || distance_squared > kConflictSearchRadius
+                                * kConflictSearchRadius
+                            || distance_squared >= best_distance_squared) {
+                            continue;
+                        }
+                        const int candidate_x = canvas_x + dx;
+                        const int candidate_y = canvas_y + dy;
+                        if (candidate_x < 0 || candidate_x >= state.width
+                            || candidate_y < 0 || candidate_y >= state.height) {
+                            continue;
+                        }
+                        const std::size_t candidate_slot =
+                            static_cast<std::size_t>(candidate_y) * state.width
+                            + static_cast<std::size_t>(candidate_x);
+                        if (state.valid[candidate_slot] != 0U
+                            || update_index[candidate_slot] >= 0) {
+                            continue;
+                        }
+                        best_x = candidate_x;
+                        best_y = candidate_y;
+                        best_distance_squared = distance_squared;
+                    }
+                }
+                if (best_x < 0 || best_y < 0) {
+                    continue;
+                }
+                canvas_x = best_x;
+                canvas_y = best_y;
+                slot = static_cast<std::size_t>(canvas_y) * state.width
+                    + static_cast<std::size_t>(canvas_x);
+                before = slot_value_at(
+                    state, static_cast<std::uint32_t>(slot));
+                already_valid = false;
+                const float displaced_normalized_x =
+                    2.0f * static_cast<float>(canvas_x)
+                    / static_cast<float>(std::max(1, state.width - 1)) - 1.0f;
+                const float displaced_normalized_y =
+                    2.0f * static_cast<float>(canvas_y)
+                    / static_cast<float>(std::max(1, state.height - 1)) - 1.0f;
+                candidate_depth = static_cast<float>(quadratic_surface_value(
+                    floor_coefficients,
+                    displaced_normalized_x,
+                    displaced_normalized_y));
+                if (!std::isfinite(candidate_depth)
+                    || candidate_depth <= 1e-5f) {
+                    continue;
+                }
+            }
+            float depth_residual = 0.0f;
+            if (already_valid) {
+                depth_residual = std::abs(candidate_depth - before.depth)
+                    / std::max(std::abs(before.depth), 1e-3f);
+                // Existing anchor geometry remains authoritative unless the
+                // pair result agrees locally. This is the anti-ghost gate.
+                if (depth_residual > 0.18f) {
+                    continue;
+                }
+            }
+
+            const cv::Vec3b source_color = side.match_rgb_u8.at<cv::Vec3b>(
+                source_y, source_x);
+            const auto old_color = unpack_rgba(before.rgba);
+            const float color_alpha = already_valid ? 0.18f : 1.0f;
+            std::array<std::uint8_t, 3> corrected_color{};
+            for (int channel = 0; channel < 3; ++channel) {
+                const double source_value =
+                    static_cast<double>(source_color[channel]) / 255.0;
+                const double corrected_value = std::clamp(
+                    source_value
+                    + side_color_bias[static_cast<std::size_t>(channel)],
+                    0.0,
+                    1.0);
+                corrected_color[static_cast<std::size_t>(channel)] =
+                    static_cast<std::uint8_t>(std::clamp(
+                        static_cast<int>(std::lround(corrected_value * 255.0)),
+                        0,
+                        255));
+            }
+            if (!already_valid
+                && !distance_to_existing.empty()
+                && nearest_existing_channels.size() == 3U) {
+                const float distance =
+                    distance_to_existing.at<float>(canvas_y, canvas_x);
+                if (std::isfinite(distance) && distance < 16.0f) {
+                    const float old_weight =
+                        0.55f * (1.0f - distance / 16.0f);
+                    for (int channel = 0; channel < 3; ++channel) {
+                        const float nearest = nearest_existing_channels[
+                            static_cast<std::size_t>(channel)]
+                                .at<float>(canvas_y, canvas_x);
+                        const float current = static_cast<float>(
+                            corrected_color[static_cast<std::size_t>(channel)])
+                            / 255.0f;
+                        corrected_color[static_cast<std::size_t>(channel)] =
+                            static_cast<std::uint8_t>(std::clamp(
+                                static_cast<int>(std::lround(
+                                    (nearest * old_weight
+                                        + current * (1.0f - old_weight))
+                                    * 255.0f)),
+                                0,
+                                255));
+                    }
+                }
+            }
+            const std::uint8_t red = static_cast<std::uint8_t>(std::clamp(
+                static_cast<int>(std::lround(
+                    static_cast<double>(old_color[0]) * (1.0 - color_alpha)
+                    + static_cast<double>(corrected_color[0]) * color_alpha)),
+                0,
+                255));
+            const std::uint8_t green = static_cast<std::uint8_t>(std::clamp(
+                static_cast<int>(std::lround(
+                    static_cast<double>(old_color[1]) * (1.0 - color_alpha)
+                    + static_cast<double>(corrected_color[1]) * color_alpha)),
+                0,
+                255));
+            const std::uint8_t blue = static_cast<std::uint8_t>(std::clamp(
+                static_cast<int>(std::lround(
+                    static_cast<double>(old_color[2]) * (1.0 - color_alpha)
+                    + static_cast<double>(corrected_color[2]) * color_alpha)),
+                0,
+                255));
+            SlotValue after;
+            after.depth = already_valid
+                ? before.depth * 0.90f + candidate_depth * 0.10f
+                : candidate_depth;
+            after.confidence = already_valid
+                ? std::max(before.confidence, confidence)
+                : confidence;
+            // Match the joint three-view path's ownership rule: once a canvas
+            // cell has anchor texture, side cameras may validate its geometry
+            // but must not repeatedly rewrite its RGB. Re-blending calibrated
+            // side colour every live frame washed the green floor toward grey.
+            // A side camera still supplies colour for genuinely new coverage.
+            after.rgba = already_valid
+                ? before.rgba
+                : pack_rgba(red, green, blue);
+            after.last_update_frame = static_cast<std::uint32_t>(raw.frame_seq);
+            after.valid = 1U;
+            const SlotUpdate update{
+                static_cast<std::uint32_t>(slot),
+                after};
+            const int previous_index = update_index[slot];
+            if (previous_index < 0) {
+                update_index[slot] = static_cast<int>(patch.updates.size());
+                patch.updates.push_back(update);
+                update_quality.push_back(confidence - depth_residual);
+            } else if (confidence - depth_residual
+                > update_quality[static_cast<std::size_t>(previous_index)]) {
+                patch.updates[static_cast<std::size_t>(previous_index)] = update;
+                update_quality[static_cast<std::size_t>(previous_index)] =
+                    confidence - depth_residual;
+            }
+            if (observed[slot] == 0U) {
+                observed[slot] = 1U;
+                patch.observed_slots.push_back(static_cast<std::uint32_t>(slot));
+            }
+        }
+    }
+
+    patch.changed_ratio = slot_count == 0U ? 0.0f
+        : static_cast<float>(static_cast<double>(patch.updates.size())
+            / static_cast<double>(slot_count));
+    result.metrics.changed_ratio = patch.changed_ratio;
+    result.metrics.changed_point_count = static_cast<std::uint32_t>(
+        patch.updates.size());
+    result.metrics.group_fused_sources = patch.updates.size() >= 128U ? 1 : 0;
+    result.metrics.group_rejected_sources = patch.updates.size() >= 128U ? 0 : 1;
+    std::size_t valid_count = static_cast<std::size_t>(std::count(
+        state.valid.begin(), state.valid.end(), static_cast<std::uint8_t>(1U)));
+    for (const SlotUpdate& update : patch.updates) {
+        if (update.slot_id < state.valid.size() && state.valid[update.slot_id] == 0U
+            && update.after.valid != 0U) {
+            ++valid_count;
+        }
+    }
+    result.metrics.valid_point_count = static_cast<std::uint32_t>(valid_count);
+    result.frame.status = patch.updates.size() >= 128U
+        ? FrameStatus::Committed
+        : FrameStatus::NoChange;
+    result.frame.changed_point_count = result.metrics.changed_point_count;
+    result.frame.valid_point_count = result.metrics.valid_point_count;
+    result.patch = std::move(patch);
+    result.has_patch = result.frame.status == FrameStatus::Committed;
+    result.metrics.total_ms = total_timer.ms();
+    return result;
 }
 
 CandidateCommit InferenceEngine::process_world_group(
@@ -2877,690 +4324,167 @@ CandidateCommit InferenceEngine::process_world_group(
     Timer model_timer;
     const std::vector<Prediction> predictions = run_group_model(group.model_rgb_f);
     result.metrics.model_ms = model_timer.ms();
+    if (predictions.size() != 3U) {
+        throw std::runtime_error("B=1,S=3 group model did not return three predictions");
+    }
 
-    struct WorldSample {
-        cv::Vec3f point;
-        cv::Vec3f color;
-        float confidence = 0.0f;
-        std::uint8_t view = 0U;
-        int pixel_x = 0;
-        int pixel_y = 0;
-    };
-    std::vector<WorldSample> candidates;
-    std::vector<float> confidence_values;
-    const std::size_t expected = 3U * static_cast<std::size_t>(options_.group_width)
-        * static_cast<std::size_t>(options_.group_height);
-    candidates.reserve(expected);
-    confidence_values.reserve(expected);
-    for (std::size_t view = 0; view < predictions.size(); ++view) {
+    std::array<GroupWorldView, 3> views;
+    for (std::size_t view = 0; view < 3U; ++view) {
         const Prediction& prediction = predictions[view];
-        if (prediction.world_points.empty() || prediction.world_points_confidence.empty()) {
-            throw std::runtime_error("joint three-camera prediction has no world points");
-        }
-        const cv::Mat& color = group.model_rgb_f[view];
-        // World predictions become unstable near the resized model crop. A
-        // slightly wider guard removes narrow side-camera strips that can be
-        // connected to the real floor and therefore survive component tests.
-        constexpr int model_border = 20;
-        for (int y = 0; y < prediction.world_points.rows; ++y) {
-            for (int x = 0; x < prediction.world_points.cols; ++x) {
-                if (x < model_border || y < model_border
-                    || x >= prediction.world_points.cols - model_border
-                    || y >= prediction.world_points.rows - model_border) {
-                    continue;
-                }
-                const cv::Vec3f point = prediction.world_points.at<cv::Vec3f>(y, x);
-                const float confidence = prediction.world_points_confidence.at<float>(y, x);
-                if (!std::isfinite(point[0]) || !std::isfinite(point[1])
-                    || !std::isfinite(point[2]) || !std::isfinite(confidence)) {
-                    continue;
-                }
-                candidates.push_back(WorldSample{
-                    point, color.at<cv::Vec3f>(y, x), confidence,
-                    static_cast<std::uint8_t>(view), x, y});
-                confidence_values.push_back(confidence);
-            }
-        }
-    }
-    if (candidates.size() < 1024U) {
-        throw std::runtime_error("joint three-camera prediction contains too few finite world points");
-    }
-    std::sort(confidence_values.begin(), confidence_values.end());
-    const std::size_t confidence_index = static_cast<std::size_t>(
-        0.10 * static_cast<double>(confidence_values.size() - 1U));
-    const float confidence_threshold = std::max(
-        static_cast<float>(options_.min_conf), confidence_values[confidence_index]);
-
-    std::vector<float> xs;
-    std::vector<float> ys;
-    std::vector<float> zs;
-    xs.reserve(candidates.size());
-    ys.reserve(candidates.size());
-    zs.reserve(candidates.size());
-    for (const WorldSample& sample : candidates) {
-        if (sample.confidence < confidence_threshold) {
-            continue;
-        }
-        xs.push_back(sample.point[0]);
-        ys.push_back(sample.point[1]);
-        zs.push_back(sample.point[2]);
-    }
-    if (xs.size() < 1024U) {
-        throw std::runtime_error("joint three-camera confidence filter removed too many world points");
-    }
-    const float center_x = median_value(xs);
-    const float center_y = median_value(ys);
-    std::vector<float> planar_radius;
-    planar_radius.reserve(xs.size() * 2U);
-    for (std::size_t index = 0; index < xs.size(); ++index) {
-        planar_radius.push_back(std::abs(xs[index] - center_x));
-        planar_radius.push_back(std::abs(ys[index] - center_y));
-    }
-    std::sort(planar_radius.begin(), planar_radius.end());
-    const std::size_t radius_index = static_cast<std::size_t>(
-        0.985 * static_cast<double>(planar_radius.size() - 1U));
-    const float world_scale = std::max(2.1f * planar_radius[radius_index], 1e-6f);
-
-    // The area below the arm is the dominant low-texture surface. Fit it
-    // robustly and keep it separate from raised objects: otherwise three
-    // camera observations compete for the same XY cell and produce ghosts.
-    std::vector<std::uint8_t> plane_keep(xs.size(), 1U);
-    std::array<double, 6> plane_coefficients{};
-    float plane_center = 0.0f;
-    float plane_threshold = 0.01f * world_scale;
-    for (int iteration = 0; iteration < 5; ++iteration) {
-        fit_quadratic_surface(xs, ys, zs, plane_keep, plane_coefficients);
-        std::vector<float> residuals;
-        residuals.reserve(xs.size());
-        for (std::size_t index = 0; index < xs.size(); ++index) {
-            if (plane_keep[index] != 0U) {
-                residuals.push_back(static_cast<float>(
-                    zs[index] - quadratic_surface_value(
-                        plane_coefficients, xs[index], ys[index])));
-            }
-        }
-        plane_center = median_value(residuals);
-        std::vector<float> deviations;
-        deviations.reserve(residuals.size());
-        for (const float residual : residuals) {
-            deviations.push_back(std::abs(residual - plane_center));
-        }
-        const float robust_sigma = 1.4826f * std::max(median_value(deviations), 1e-6f);
-        plane_threshold = std::clamp(
-            1.5f * robust_sigma,
-            0.006f * world_scale,
-            0.018f * world_scale);
-        for (std::size_t index = 0; index < xs.size(); ++index) {
-            const float residual = static_cast<float>(
-                zs[index] - quadratic_surface_value(
-                    plane_coefficients, xs[index], ys[index]));
-            plane_keep[index] = std::abs(residual - plane_center) <= plane_threshold ? 1U : 0U;
-        }
+        views[view].world_points = prediction.world_points;
+        views[view].world_confidence = prediction.world_points_confidence;
+        views[view].rgb = group.model_rgb_f[view];
+        views[view].translation = prediction.pose_translation;
+        views[view].quaternion = prediction.pose_quaternion;
+        views[view].fov_h = prediction.fov_h;
+        views[view].fov_w = prediction.fov_w;
+        views[view].has_pose = prediction.has_pose;
     }
 
     Timer patch_timer;
+    const GroupWorldFusionResult fusion = group_world_fusion_.fuse(views, state);
+    if (!fusion.accepted) {
+        result.metrics.group_rejected_sources = 3;
+        result.metrics.fallback = "world_fusion_rejected: " + fusion.rejection_reason;
+        result.metrics.valid_point_count = static_cast<std::uint32_t>(std::count(
+            state.valid.begin(), state.valid.end(), static_cast<std::uint8_t>(1U)));
+        result.frame.status = FrameStatus::NoChange;
+        result.frame.valid_point_count = result.metrics.valid_point_count;
+        result.metrics.patch_ms = patch_timer.ms();
+        result.metrics.total_ms = total_timer.ms();
+        return result;
+    }
+
     const std::size_t slot_count = state.slot_count();
-    // Fit the normalized world footprint by the shorter canvas side. Using
-    // the longer side clipped valid Y support on the 770x630 atlas and exposed
-    // that canvas limit as a false horizontal reconstruction edge.
-    const float canvas_scale = static_cast<float>(std::min(state.width, state.height));
-    std::vector<float> best_confidence(slot_count, -std::numeric_limits<float>::infinity());
-    std::vector<float> atlas_x(slot_count, 0.0f);
-    std::vector<float> atlas_y(slot_count, 0.0f);
-    std::vector<float> atlas_depth(slot_count, 0.0f);
-    std::vector<std::uint32_t> atlas_rgba(slot_count, 0U);
-    std::vector<std::uint8_t> atlas_valid(slot_count, 0U);
-    std::array<std::vector<float>, 3> view_confidence;
-    std::array<std::vector<float>, 3> view_depth;
-    std::array<std::vector<cv::Vec3f>, 3> view_color;
-    std::array<std::vector<std::uint8_t>, 3> view_valid;
-    for (std::size_t view = 0; view < 3U; ++view) {
-        view_confidence[view].assign(
-            slot_count, -std::numeric_limits<float>::infinity());
-        view_depth[view].assign(slot_count, 0.0f);
-        view_color[view].assign(slot_count, cv::Vec3f(0.0f, 0.0f, 0.0f));
-        view_valid[view].assign(slot_count, 0U);
+    if (slot_count == 0U || !state.shape_valid()) {
+        throw std::runtime_error("world group requires an initialized CanvasState");
     }
-    std::vector<const WorldSample*> raised_anchor_samples;
-    raised_anchor_samples.reserve(candidates.size() / 8U);
-    const std::uint8_t anchor_view = static_cast<std::uint8_t>(
-        std::clamp(raw.group_anchor_index, 0, 2));
-    for (const WorldSample& sample : candidates) {
-        if (sample.confidence < confidence_threshold) {
-            continue;
-        }
-        const float nx = (sample.point[0] - center_x) / world_scale;
-        const float ny = (sample.point[1] - center_y) / world_scale;
-        const float residual = static_cast<float>(
-            sample.point[2] - quadratic_surface_value(
-                plane_coefficients, sample.point[0], sample.point[1]) - plane_center);
-        if (std::abs(residual) > plane_threshold) {
-            // Points above the support surface are retained from the anchor
-            // camera only. The joint model still uses all three images, but
-            // duplicate side-view arms cannot enter the published cloud.
-            if (sample.view == anchor_view
-                && std::abs(residual) <= 0.2f * world_scale
-                && std::abs(nx) <= 0.5f && std::abs(ny) <= 0.5f) {
-                raised_anchor_samples.push_back(&sample);
-            }
-            continue;
-        }
-        const int center_x_px = static_cast<int>(
-            std::lround(nx * canvas_scale + state.width * 0.5f));
-        const int center_y_px = static_cast<int>(
-            std::lround(-ny * canvas_scale + state.height * 0.5f));
-        // A 406x252 prediction cannot densely cover a 770x630 atlas with
-        // one cell per sample. Splat only the fitted lower surface into a
-        // 3x3 footprint; raised geometry remains unsplatted and independent.
-        for (int offset_y = -1; offset_y <= 1; ++offset_y) {
-            const int y = center_y_px + offset_y;
-            if (y < 0 || y >= state.height) {
-                continue;
-            }
-            for (int offset_x = -1; offset_x <= 1; ++offset_x) {
-                const int x = center_x_px + offset_x;
-                if (x < 0 || x >= state.width) {
-                    continue;
-                }
-                const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
-                const std::size_t view = static_cast<std::size_t>(sample.view);
-                // Select one representative per camera and cell first. The
-                // three camera layers are feathered below; choosing an owner
-                // here used to turn every projected camera boundary into a
-                // visible straight seam.
-                if (view_valid[view][slot] != 0U
-                    && sample.confidence <= view_confidence[view][slot]) {
-                    continue;
-                }
-                view_confidence[view][slot] = sample.confidence;
-                view_depth[view][slot] = residual / world_scale;
-                view_color[view][slot] = sample.color;
-                view_valid[view][slot] = 1U;
-            }
-        }
-    }
-
-    // Feather the three projected floor layers in their overlap. Distance to
-    // each layer's support boundary suppresses crop-edge samples gradually,
-    // while the confidence term resolves genuine local quality differences.
-    // A single-view cell keeps full weight, so this does not shrink coverage.
-    std::array<cv::Mat, 3> view_edge_distance;
-    for (std::size_t view = 0; view < 3U; ++view) {
-        cv::Mat support(state.height, state.width, CV_8UC1, view_valid[view].data());
-        cv::Mat support_u8;
-        support.convertTo(support_u8, CV_8UC1, 255.0);
-        cv::distanceTransform(support_u8, view_edge_distance[view], cv::DIST_L2, 3);
-    }
-    std::array<cv::Vec3f, 3> view_color_bias{
-        cv::Vec3f(0.0f, 0.0f, 0.0f),
-        cv::Vec3f(0.0f, 0.0f, 0.0f),
-        cv::Vec3f(0.0f, 0.0f, 0.0f)};
-    for (std::size_t view = 0; view < 3U; ++view) {
-        if (view == static_cast<std::size_t>(anchor_view)) {
-            continue;
-        }
-        std::array<std::vector<float>, 3> channel_differences;
-        for (std::size_t slot = 0; slot < slot_count; ++slot) {
-            if (view_valid[view][slot] == 0U
-                || view_valid[static_cast<std::size_t>(anchor_view)][slot] == 0U) {
-                continue;
-            }
-            const cv::Vec3f side = view_color[view][slot];
-            const cv::Vec3f anchor =
-                view_color[static_cast<std::size_t>(anchor_view)][slot];
-            for (int channel = 0; channel < 3; ++channel) {
-                if (side[channel] > 0.03f && side[channel] < 0.97f
-                    && anchor[channel] > 0.03f && anchor[channel] < 0.97f) {
-                    channel_differences[static_cast<std::size_t>(channel)].push_back(
-                        anchor[channel] - side[channel]);
-                }
-            }
-        }
-        for (int channel = 0; channel < 3; ++channel) {
-            const auto& differences = channel_differences[static_cast<std::size_t>(channel)];
-            if (differences.size() >= 128U) {
-                view_color_bias[view][channel] = std::clamp(
-                    median_value(differences), -0.18f, 0.18f);
-            }
-        }
-    }
-    const float confidence_span = std::max(
-        confidence_values.back() - confidence_threshold, 1e-6f);
-    constexpr float feather_radius = 32.0f;
-    for (int y = 0; y < state.height; ++y) {
-        for (int x = 0; x < state.width; ++x) {
-            const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
-            int contributor_count = 0;
-            for (std::size_t view = 0; view < 3U; ++view) {
-                contributor_count += view_valid[view][slot] != 0U ? 1 : 0;
-            }
-            if (contributor_count == 0) {
-                continue;
-            }
-            float weight_sum = 0.0f;
-            float depth_sum = 0.0f;
-            float confidence_sum = 0.0f;
-            cv::Vec3f color_sum(0.0f, 0.0f, 0.0f);
-            for (std::size_t view = 0; view < 3U; ++view) {
-                if (view_valid[view][slot] == 0U) {
-                    continue;
-                }
-                float weight = 1.0f;
-                if (contributor_count > 1) {
-                    const float edge_weight = std::clamp(
-                        view_edge_distance[view].at<float>(y, x) / feather_radius,
-                        0.05f,
-                        1.0f);
-                    const float confidence_weight = 0.2f + 0.8f * std::clamp(
-                        (view_confidence[view][slot] - confidence_threshold)
-                            / confidence_span,
-                        0.0f,
-                        1.0f);
-                    weight = edge_weight * confidence_weight;
-                    if (view == static_cast<std::size_t>(anchor_view)) {
-                        weight *= 1.1f;
-                    }
-                }
-                weight_sum += weight;
-                depth_sum += weight * view_depth[view][slot];
-                confidence_sum += weight * view_confidence[view][slot];
-                color_sum += weight * (view_color[view][slot] + view_color_bias[view]);
-            }
-            if (weight_sum <= 1e-6f) {
-                continue;
-            }
-            best_confidence[slot] = confidence_sum / weight_sum;
-            atlas_x[slot] = (static_cast<float>(x) - state.width * 0.5f) / canvas_scale;
-            atlas_y[slot] = -(static_cast<float>(y) - state.height * 0.5f) / canvas_scale;
-            atlas_depth[slot] = depth_sum / weight_sum;
-            const cv::Vec3f color = color_sum / weight_sum;
-            atlas_rgba[slot] = pack_rgba(
-                static_cast<std::uint8_t>(std::clamp(
-                    static_cast<int>(std::lround(color[0] * 255.0f)), 0, 255)),
-                static_cast<std::uint8_t>(std::clamp(
-                    static_cast<int>(std::lround(color[1] * 255.0f)), 0, 255)),
-                static_cast<std::uint8_t>(std::clamp(
-                    static_cast<int>(std::lround(color[2] * 255.0f)), 0, 255)));
-            atlas_valid[slot] = 1U;
-        }
-    }
-
-    // Regularize only the planar atlas support. Keep its largest connected
-    // component, remove one-cell tendrils, and close small internal holes.
-    // Raised geometry has not been inserted yet and is therefore untouched.
-    cv::Mat plane_mask(state.height, state.width, CV_8UC1, cv::Scalar(0));
-    for (int y = 0; y < state.height; ++y) {
-        for (int x = 0; x < state.width; ++x) {
-            const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
-            if (atlas_valid[slot] != 0U) {
-                plane_mask.at<std::uint8_t>(y, x) = 255U;
-            }
-        }
-    }
-    cv::morphologyEx(
-        plane_mask,
-        plane_mask,
-        cv::MORPH_OPEN,
-        cv::Mat::ones(3, 3, CV_8UC1));
-    cv::Mat labels;
-    cv::Mat stats;
-    cv::Mat centroids;
-    const int component_count = cv::connectedComponentsWithStats(
-        plane_mask, labels, stats, centroids, 8, CV_32S);
-    int largest_area = 0;
-    for (int component = 1; component < component_count; ++component) {
-        const int area = stats.at<int>(component, cv::CC_STAT_AREA);
-        if (area > largest_area) {
-            largest_area = area;
-        }
-    }
-    cv::Mat main_plane = cv::Mat::zeros(plane_mask.size(), CV_8UC1);
-    if (largest_area > 0) {
-        const int minimum_plane_component = std::max(
-            512, static_cast<int>(std::lround(0.005 * largest_area)));
-        for (int component = 1; component < component_count; ++component) {
-            const int area = stats.at<int>(component, cv::CC_STAT_AREA);
-            const int width = stats.at<int>(component, cv::CC_STAT_WIDTH);
-            const int height = stats.at<int>(component, cv::CC_STAT_HEIGHT);
-            const bool is_largest = area == largest_area;
-            const bool broad_support = width >= 64 && height >= 64
-                && std::max(width, height) <= 4 * std::min(width, height);
-            if (area >= minimum_plane_component && (is_largest || broad_support)) {
-                main_plane.setTo(255U, labels == component);
-            }
-        }
-        const cv::Mat observed_plane = main_plane.clone();
-
-        // Seal only narrow support cuts before classifying holes. Occlusions
-        // from the robot/device can leave an interior floor region connected
-        // to the exterior through a thin channel, so direct inverse-component
-        // testing would incorrectly preserve that gap.
-        cv::morphologyEx(
-            main_plane,
-            main_plane,
-            cv::MORPH_CLOSE,
-            cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(31, 31)));
-
-        // Fill only bounded interior support holes. Components touching the
-        // canvas border are unobserved exterior and must never be extrapolated.
-        cv::Mat inverse_plane;
-        cv::bitwise_not(main_plane, inverse_plane);
-        cv::Mat hole_labels;
-        cv::Mat hole_stats;
-        cv::Mat hole_centroids;
-        const int hole_count = cv::connectedComponentsWithStats(
-            inverse_plane, hole_labels, hole_stats, hole_centroids, 8, CV_32S);
-        for (int component = 1; component < hole_count; ++component) {
-            const int left = hole_stats.at<int>(component, cv::CC_STAT_LEFT);
-            const int top = hole_stats.at<int>(component, cv::CC_STAT_TOP);
-            const int width = hole_stats.at<int>(component, cv::CC_STAT_WIDTH);
-            const int height = hole_stats.at<int>(component, cv::CC_STAT_HEIGHT);
-            const int area = hole_stats.at<int>(component, cv::CC_STAT_AREA);
-            const bool touches_border = left == 0 || top == 0
-                || left + width >= state.width || top + height >= state.height;
-            if (!touches_border && area <= 12000) {
-                main_plane.setTo(255U, hole_labels == component);
-            }
-        }
-        cv::morphologyEx(
-            main_plane,
-            main_plane,
-            cv::MORPH_CLOSE,
-            cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
-
-        // Mark directly observed support for smooth interpolation after the
-        // nearest-source geometry propagation below.
-        plane_mask = observed_plane;
-    }
-
-    std::vector<std::int32_t> nearest_plane(slot_count, -1);
-    std::deque<int> plane_queue;
-    for (int y = 0; y < state.height; ++y) {
-        for (int x = 0; x < state.width; ++x) {
-            const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
-            const bool retained = main_plane.at<std::uint8_t>(y, x) != 0U;
-            if (!retained) {
-                atlas_valid[slot] = 0U;
-                continue;
-            }
-            if (atlas_valid[slot] != 0U) {
-                nearest_plane[slot] = static_cast<std::int32_t>(slot);
-                plane_queue.push_back(static_cast<int>(slot));
-            }
-        }
-    }
-    constexpr int neighbor_x[4] = {-1, 1, 0, 0};
-    constexpr int neighbor_y[4] = {0, 0, -1, 1};
-    while (!plane_queue.empty()) {
-        const int slot = plane_queue.front();
-        plane_queue.pop_front();
-        const int x = slot % state.width;
-        const int y = slot / state.width;
-        for (int direction = 0; direction < 4; ++direction) {
-            const int nx = x + neighbor_x[direction];
-            const int ny = y + neighbor_y[direction];
-            if (nx < 0 || nx >= state.width || ny < 0 || ny >= state.height
-                || main_plane.at<std::uint8_t>(ny, nx) == 0U) {
-                continue;
-            }
-            const std::size_t neighbor = static_cast<std::size_t>(ny) * state.width + nx;
-            if (nearest_plane[neighbor] >= 0) {
-                continue;
-            }
-            nearest_plane[neighbor] = nearest_plane[static_cast<std::size_t>(slot)];
-            plane_queue.push_back(static_cast<int>(neighbor));
-        }
-    }
-    for (std::size_t slot = 0; slot < slot_count; ++slot) {
-        const std::int32_t source_slot = nearest_plane[slot];
-        if (source_slot < 0 || static_cast<std::size_t>(source_slot) == slot) {
-            continue;
-        }
-        const std::size_t source = static_cast<std::size_t>(source_slot);
-        const int x = static_cast<int>(slot % static_cast<std::size_t>(state.width));
-        const int y = static_cast<int>(slot / static_cast<std::size_t>(state.width));
-        best_confidence[slot] = best_confidence[source];
-        atlas_x[slot] = (static_cast<float>(x) - state.width * 0.5f) / canvas_scale;
-        atlas_y[slot] = -(static_cast<float>(y) - state.height * 0.5f) / canvas_scale;
-        atlas_depth[slot] = atlas_depth[source];
-        atlas_rgba[slot] = atlas_rgba[source];
-        atlas_valid[slot] = 1U;
-    }
-
-    // Interpolate only synthesized bounded holes from surrounding measured
-    // floor samples. This preserves real printed/black object texture while
-    // preventing nearest-neighbour color blocks inside repaired support.
-    cv::Mat interpolation_weight(
-        state.height, state.width, CV_32FC1, cv::Scalar(0.0f));
-    cv::Mat interpolation_depth(
-        state.height, state.width, CV_32FC1, cv::Scalar(0.0f));
-    cv::Mat interpolation_confidence(
-        state.height, state.width, CV_32FC1, cv::Scalar(0.0f));
-    cv::Mat interpolation_color(
-        state.height, state.width, CV_32FC3, cv::Scalar(0.0f, 0.0f, 0.0f));
-    for (int y = 0; y < state.height; ++y) {
-        for (int x = 0; x < state.width; ++x) {
-            if (plane_mask.at<std::uint8_t>(y, x) == 0U) {
-                continue;
-            }
-            const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
-            if (atlas_valid[slot] == 0U) {
-                continue;
-            }
-            const auto rgba = unpack_rgba(atlas_rgba[slot]);
-            interpolation_weight.at<float>(y, x) = 1.0f;
-            interpolation_depth.at<float>(y, x) = atlas_depth[slot];
-            interpolation_confidence.at<float>(y, x) = best_confidence[slot];
-            interpolation_color.at<cv::Vec3f>(y, x) = cv::Vec3f(
-                static_cast<float>(rgba[0]),
-                static_cast<float>(rgba[1]),
-                static_cast<float>(rgba[2]));
-        }
-    }
-    cv::Mat smooth_weight;
-    cv::Mat smooth_depth;
-    cv::Mat smooth_confidence;
-    cv::Mat smooth_color;
-    constexpr double hole_sigma = 18.0;
-    cv::GaussianBlur(
-        interpolation_weight, smooth_weight, cv::Size(), hole_sigma, hole_sigma);
-    cv::GaussianBlur(
-        interpolation_depth, smooth_depth, cv::Size(), hole_sigma, hole_sigma);
-    cv::GaussianBlur(
-        interpolation_confidence, smooth_confidence, cv::Size(), hole_sigma, hole_sigma);
-    cv::GaussianBlur(
-        interpolation_color, smooth_color, cv::Size(), hole_sigma, hole_sigma);
-    for (int y = 0; y < state.height; ++y) {
-        for (int x = 0; x < state.width; ++x) {
-            if (main_plane.at<std::uint8_t>(y, x) == 0U
-                || plane_mask.at<std::uint8_t>(y, x) != 0U) {
-                continue;
-            }
-            const float weight = smooth_weight.at<float>(y, x);
-            if (weight <= 1e-6f) {
-                continue;
-            }
-            const std::size_t slot = static_cast<std::size_t>(y) * state.width + x;
-            atlas_depth[slot] = smooth_depth.at<float>(y, x) / weight;
-            best_confidence[slot] = smooth_confidence.at<float>(y, x) / weight;
-            const cv::Vec3f color = smooth_color.at<cv::Vec3f>(y, x) / weight;
-            atlas_rgba[slot] = pack_rgba(
-                static_cast<std::uint8_t>(std::clamp(
-                    static_cast<int>(std::lround(color[0])), 0, 255)),
-                static_cast<std::uint8_t>(std::clamp(
-                    static_cast<int>(std::lround(color[1])), 0, 255)),
-                static_cast<std::uint8_t>(std::clamp(
-                    static_cast<int>(std::lround(color[2])), 0, 255)));
-        }
-    }
-
-    // Reject isolated non-planar predictions in anchor-image space. Real
-    // robot/object surfaces form sizeable connected regions; single bright
-    // pixels otherwise become visibly floating 3D points.
-    if (!raised_anchor_samples.empty()) {
-        cv::Mat raised_mask(
-            options_.group_height, options_.group_width, CV_8UC1, cv::Scalar(0));
-        for (const WorldSample* sample : raised_anchor_samples) {
-            raised_mask.at<std::uint8_t>(sample->pixel_y, sample->pixel_x) = 255U;
-        }
-        cv::Mat raised_labels;
-        cv::Mat raised_stats;
-        cv::Mat raised_centroids;
-        const int raised_component_count = cv::connectedComponentsWithStats(
-            raised_mask, raised_labels, raised_stats, raised_centroids, 8, CV_32S);
-        std::vector<std::uint8_t> keep_component(
-            static_cast<std::size_t>(raised_component_count), 0U);
-        for (int component = 1; component < raised_component_count; ++component) {
-            if (raised_stats.at<int>(component, cv::CC_STAT_AREA) >= 24) {
-                keep_component[static_cast<std::size_t>(component)] = 1U;
-            }
-        }
-        raised_anchor_samples.erase(
-            std::remove_if(
-                raised_anchor_samples.begin(),
-                raised_anchor_samples.end(),
-                [&](const WorldSample* sample) {
-                    const int component = raised_labels.at<int>(sample->pixel_y, sample->pixel_x);
-                    return component <= 0
-                        || keep_component[static_cast<std::size_t>(component)] == 0U;
-                }),
-            raised_anchor_samples.end());
-    }
-    if (!raised_anchor_samples.empty()) {
-        cv::Mat raised_world_mask(
-            state.height, state.width, CV_8UC1, cv::Scalar(0));
-        for (const WorldSample* sample : raised_anchor_samples) {
-            const int x = static_cast<int>(std::lround(
-                (sample->point[0] - center_x) / world_scale * canvas_scale
-                + state.width * 0.5f));
-            const int y = static_cast<int>(std::lround(
-                -(sample->point[1] - center_y) / world_scale * canvas_scale
-                + state.height * 0.5f));
-            if (x >= 0 && x < state.width && y >= 0 && y < state.height) {
-                cv::circle(raised_world_mask, cv::Point(x, y), 1, cv::Scalar(255), -1);
-            }
-        }
-        cv::Mat world_labels;
-        cv::Mat world_stats;
-        cv::Mat world_centroids;
-        const int world_component_count = cv::connectedComponentsWithStats(
-            raised_world_mask, world_labels, world_stats, world_centroids, 8, CV_32S);
-        std::vector<std::uint8_t> keep_world_component(
-            static_cast<std::size_t>(world_component_count), 0U);
-        for (int component = 1; component < world_component_count; ++component) {
-            if (world_stats.at<int>(component, cv::CC_STAT_AREA) >= 48) {
-                keep_world_component[static_cast<std::size_t>(component)] = 1U;
-            }
-        }
-        raised_anchor_samples.erase(
-            std::remove_if(
-                raised_anchor_samples.begin(),
-                raised_anchor_samples.end(),
-                [&](const WorldSample* sample) {
-                    const int x = static_cast<int>(std::lround(
-                        (sample->point[0] - center_x) / world_scale * canvas_scale
-                        + state.width * 0.5f));
-                    const int y = static_cast<int>(std::lround(
-                        -(sample->point[1] - center_y) / world_scale * canvas_scale
-                        + state.height * 0.5f));
-                    if (x < 0 || x >= state.width || y < 0 || y >= state.height) {
-                        return true;
-                    }
-                    const int component = world_labels.at<int>(y, x);
-                    return component <= 0
-                        || keep_world_component[static_cast<std::size_t>(component)] == 0U;
-                }),
-            raised_anchor_samples.end());
-    }
-
-    // Non-planar points occupy unused storage slots and retain their true
-    // coordinates, so they never overwrite the independently rasterized
-    // lower surface. Deterministic thinning only applies if the canvas is
-    // unexpectedly too small for all anchor-view raised points.
-    const std::size_t free_slot_count = static_cast<std::size_t>(
-        std::count(atlas_valid.begin(), atlas_valid.end(), static_cast<std::uint8_t>(0U)));
-    const std::size_t raised_stride = free_slot_count == 0U ? raised_anchor_samples.size() + 1U
-        : std::max<std::size_t>(
-            1U, (raised_anchor_samples.size() + free_slot_count - 1U) / free_slot_count);
-    std::size_t free_slot = 0U;
-    for (std::size_t index = 0; index < raised_anchor_samples.size(); index += raised_stride) {
-        while (free_slot < slot_count && atlas_valid[free_slot] != 0U) {
-            ++free_slot;
-        }
-        if (free_slot >= slot_count) {
-            break;
-        }
-        const WorldSample& sample = *raised_anchor_samples[index];
-        atlas_x[free_slot] = (sample.point[0] - center_x) / world_scale;
-        atlas_y[free_slot] = (sample.point[1] - center_y) / world_scale;
-        atlas_depth[free_slot] = static_cast<float>(
-            sample.point[2] - quadratic_surface_value(
-                plane_coefficients, sample.point[0], sample.point[1]) - plane_center) / world_scale;
-        best_confidence[free_slot] = sample.confidence;
-        atlas_rgba[free_slot] = pack_rgba(
-            static_cast<std::uint8_t>(std::clamp(
-                static_cast<int>(std::lround(sample.color[0] * 255.0f)), 0, 255)),
-            static_cast<std::uint8_t>(std::clamp(
-                static_cast<int>(std::lround(sample.color[1] * 255.0f)), 0, 255)),
-            static_cast<std::uint8_t>(std::clamp(
-                static_cast<int>(std::lround(sample.color[2] * 255.0f)), 0, 255)));
-        atlas_valid[free_slot] = 1U;
-        ++free_slot;
-    }
-
     CandidatePatch patch;
     patch.frame_seq = raw.frame_seq;
     patch.base_version = state.version;
     patch.width = state.width;
     patch.height = state.height;
     patch.initialize_canvas = !state.initialized;
-    patch.changed_ratio = 1.0f;
+    patch.changed_ratio = 0.0f;
     patch.scene_jump = false;
+    patch.anchor_camera.depth_scale = -1.0f;
+    // The preview is intentionally separate from geometry. Real GUI point
+    // positions come solely from physical slot row/column plus state.depth.
     if (patch.initialize_canvas) {
-        patch.anchor_rgba = atlas_rgba;
-        patch.anchor_camera.fx = 1.0f;
-        patch.anchor_camera.fy = 1.0f;
-        patch.anchor_camera.cx = static_cast<float>(state.width) * 0.5f;
-        patch.anchor_camera.cy = static_cast<float>(state.height) * 0.5f;
-        // Negative depth_scale marks a direct hybrid world-coordinate atlas.
-        // The exporter/viewer must preserve its Z values instead of applying
-        // the legacy aligned-depth plane residual regularizer.
-        patch.anchor_camera.depth_scale = -1.0f;
+        patch.anchor_rgba.assign(slot_count, 0U);
     }
-    patch.updates.reserve(slot_count);
-    patch.observed_slots.reserve(xs.size());
+
+    std::vector<std::uint8_t> desired_valid(slot_count, 0U);
+    std::vector<FusedSlot> desired(slot_count);
+    for (const FusedSlot& fused_slot : fusion.slots) {
+        if (fused_slot.slot_id >= slot_count) {
+            throw std::runtime_error("world fusion produced a slot outside CanvasState");
+        }
+        desired_valid[fused_slot.slot_id] = 1U;
+        desired[fused_slot.slot_id] = fused_slot;
+        patch.observed_slots.push_back(fused_slot.slot_id);
+    }
+
+    const auto color_difference = [](const std::uint32_t lhs, const std::uint32_t rhs) {
+        const auto left = unpack_rgba(lhs);
+        const auto right = unpack_rgba(rhs);
+        return std::max({
+            std::abs(static_cast<int>(left[0]) - static_cast<int>(right[0])),
+            std::abs(static_cast<int>(left[1]) - static_cast<int>(right[1])),
+            std::abs(static_cast<int>(left[2]) - static_cast<int>(right[2]))});
+    };
+    patch.updates.reserve(fusion.slots.size() + 128U);
     for (std::size_t slot = 0; slot < slot_count; ++slot) {
-        if (atlas_valid[slot] != 0U) {
-            SlotValue after;
-            after.depth = atlas_depth[slot];
-            after.confidence = best_confidence[slot];
-            after.rgba = atlas_rgba[slot];
-            after.last_update_frame = static_cast<std::uint32_t>(raw.frame_seq);
-            after.valid = 1U;
-            after.x = atlas_x[slot];
-            after.y = atlas_y[slot];
-            patch.updates.push_back(SlotUpdate{static_cast<std::uint32_t>(slot), after});
-            patch.observed_slots.push_back(static_cast<std::uint32_t>(slot));
-        } else if (state.initialized && state.valid[slot] != 0U) {
-            patch.updates.push_back(SlotUpdate{static_cast<std::uint32_t>(slot), SlotValue{}});
+        if (desired_valid[slot] == 0U) {
+            continue;
         }
-        if (state.initialized && state.support[slot] != 0U && atlas_valid[slot] == 0U) {
-            patch.cleared_support_slots.push_back(static_cast<std::uint32_t>(slot));
+        const FusedSlot& next = desired[slot];
+        const SlotValue before = slot_value_at(state, static_cast<std::uint32_t>(slot));
+        const bool old_valid = before.valid != 0U && std::isfinite(before.depth);
+        const float z_delta = std::abs(before.depth - next.depth);
+        const int rgb_delta = color_difference(before.rgba, next.rgba);
+        const bool unchanged = old_valid
+            && (next.floor
+                ? (z_delta < 0.0001f && rgb_delta < 3)
+                : (z_delta < 0.002f && rgb_delta < 6));
+        if (unchanged) {
+            continue;
+        }
+        SlotValue after = before;
+        after.depth = next.depth;
+        after.confidence = next.confidence;
+        after.rgba = next.rgba;
+        after.last_update_frame = static_cast<std::uint32_t>(raw.frame_seq);
+        after.valid = 1U;
+        patch.updates.push_back(SlotUpdate{
+            static_cast<std::uint32_t>(slot), after});
+    }
+
+    // Every object layer is tied to its logical cell. Missing current object
+    // clusters are explicit invalidations; persistent floor cells are not
+    // cleared when a later view is temporarily occluded.
+    const int logical_width = state.width / 2;
+    const int logical_height = state.height / 2;
+    for (int logical_y = 0; logical_y < logical_height; ++logical_y) {
+        for (int logical_x = 0; logical_x < logical_width; ++logical_x) {
+            for (int layer = 1; layer <= 3; ++layer) {
+                const int dx = (layer == 1 || layer == 3) ? 1 : 0;
+                const int dy = layer >= 2 ? 1 : 0;
+                const int pixel_x = logical_x * 2 + dx;
+                const int pixel_y = logical_y * 2 + dy;
+                const std::uint32_t slot = static_cast<std::uint32_t>(
+                    pixel_y * state.width + pixel_x);
+                if (state.valid[slot] == 0U || desired_valid[slot] != 0U) {
+                    continue;
+                }
+                SlotValue after = slot_value_at(state, slot);
+                after.depth = 0.0f;
+                after.confidence = 0.0f;
+                after.rgba = 0U;
+                after.last_update_frame = static_cast<std::uint32_t>(raw.frame_seq);
+                after.valid = 0U;
+                patch.updates.push_back(SlotUpdate{slot, after});
+                patch.cleared_support_slots.push_back(slot);
+            }
         }
     }
-    const std::size_t valid_count = static_cast<std::size_t>(
-        std::count(atlas_valid.begin(), atlas_valid.end(), static_cast<std::uint8_t>(1U)));
-    result.metrics.patch_ms = patch_timer.ms();
+
+    bool support_change = false;
+    for (const std::uint32_t slot : patch.observed_slots) {
+        if (state.support[slot] == 0U) {
+            support_change = true;
+            break;
+        }
+    }
+    patch.changed_ratio = slot_count > 0U
+        ? static_cast<float>(patch.updates.size()) / static_cast<float>(slot_count)
+        : 0.0f;
+    std::size_t valid_count = static_cast<std::size_t>(std::count(
+        state.valid.begin(), state.valid.end(), static_cast<std::uint8_t>(1U)));
+    for (const SlotUpdate& update : patch.updates) {
+        const bool old_valid = state.valid[update.slot_id] != 0U;
+        const bool new_valid = update.after.valid != 0U;
+        if (old_valid != new_valid) {
+            if (new_valid) {
+                ++valid_count;
+            } else if (valid_count > 0U) {
+                --valid_count;
+            }
+        }
+    }
     result.metrics.changed_point_count = static_cast<std::uint32_t>(patch.updates.size());
     result.metrics.valid_point_count = static_cast<std::uint32_t>(valid_count);
-    result.metrics.changed_ratio = slot_count == 0U ? 0.0
-        : static_cast<double>(patch.updates.size()) / static_cast<double>(slot_count);
-    result.frame.status = FrameStatus::Committed;
-    result.frame.changed_ratio = static_cast<float>(result.metrics.changed_ratio);
+    result.metrics.changed_ratio = patch.changed_ratio;
+    result.metrics.support_changed_ratio = support_change ? 1.0 : 0.0;
     result.frame.changed_point_count = result.metrics.changed_point_count;
     result.frame.valid_point_count = result.metrics.valid_point_count;
+    result.frame.changed_ratio = patch.changed_ratio;
+    result.frame.status = patch.initialize_canvas || !patch.updates.empty() || support_change
+        ? FrameStatus::Committed
+        : FrameStatus::NoChange;
     result.patch = std::move(patch);
-    result.has_patch = true;
+    result.has_patch = result.frame.status == FrameStatus::Committed;
+    result.metrics.patch_ms = patch_timer.ms();
     result.metrics.total_ms = total_timer.ms();
     return result;
 }
@@ -3571,7 +4495,8 @@ CandidateCommit InferenceEngine::process_impl(
     const FrameImage& frame,
     const PreparedGroup* prepared_group,
     const bool observation_group,
-    const double read_ms) {
+    const double read_ms,
+    const cv::Mat* forced_homography) {
     Timer total_timer;
     CandidateCommit result;
     result.frame.frame_seq = raw.frame_seq;
@@ -3609,8 +4534,40 @@ CandidateCommit InferenceEngine::process_impl(
 
     Timer align_timer;
     InferenceMetrics metrics = result.metrics;
-    cv::Mat homography = estimate_homography(frame, state, metrics);
-    if (state.initialized && !metrics.fallback.empty() && !last_homography_.empty()) {
+    const bool has_forced_homography = forced_homography != nullptr
+        && !forced_homography->empty();
+    cv::Mat homography = has_forced_homography
+        ? forced_homography->clone()
+        : estimate_homography(frame, state, metrics);
+    if (observation_group) {
+        // The three cameras and the anchor selection are fixed. Keep the
+        // anchor image centred at a stable reduced scale so the surrounding
+        // cameras have real atlas space instead of being clipped at the
+        // 770x630 canvas border.
+        constexpr float kObservationAtlasScale = 0.68f;
+        homography = cv::Mat::eye(3, 3, CV_32FC1);
+        homography.at<float>(0, 0) = kObservationAtlasScale;
+        homography.at<float>(1, 1) = kObservationAtlasScale;
+        homography.at<float>(0, 2) =
+            0.5f * (1.0f - kObservationAtlasScale)
+            * static_cast<float>(state.width);
+        homography.at<float>(1, 2) =
+            0.5f * (1.0f - kObservationAtlasScale)
+            * static_cast<float>(state.height);
+        metrics.fallback.clear();
+        metrics.homography_inliers = 12;
+        metrics.homography_error_px = 0.0;
+    }
+    if (has_forced_homography) {
+        // The transform was computed before the Canvas was updated, against
+        // the two real source images in this group. Do not run temporal
+        // fallback or phase refinement on a fixed-camera side view.
+        metrics.fallback.clear();
+        metrics.homography_inliers = 12;
+        metrics.homography_error_px = 0.0;
+    }
+    if (!observation_group && !has_forced_homography && state.initialized
+        && !metrics.fallback.empty() && !last_homography_.empty()) {
         // Python's feature build accepted this frame in the reference replay,
         // while the native OpenCV build can fall below the eight-point RANSAC
         // minimum on a late view. Reuse the last accepted current-to-canvas
@@ -3622,7 +4579,8 @@ CandidateCommit InferenceEngine::process_impl(
         metrics.homography_inliers = 0;
         metrics.homography_error_px = -1.0;
     }
-    if (state.initialized && metrics.fallback.empty()) {
+    if (!observation_group && !has_forced_homography && state.initialized
+        && metrics.fallback.empty()) {
         // Python performs a second, small phase-correlation correction on the
         // unchanged overlap after feature RANSAC.  Without it a sub-pixel
         // homography error is converted into a one-pixel support/photo strip.
@@ -3871,13 +4829,15 @@ CandidateCommit InferenceEngine::process_impl(
         int source_width = frame.match_rgb_f.cols;
         int source_height = frame.match_rgb_f.rows;
         if (!state.initialized) {
-            const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
-            const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
+            const cv::Point origin = content_origin(
+                frame.support,
+                std::max(32, static_cast<int>(std::round(options_.width * 0.05))),
+                std::max(128, static_cast<int>(std::round(options_.width * 0.18))));
             roi = cv::Rect(
-                std::clamp(pad_left, 0, std::max(0, state.width - 1)),
-                std::clamp(pad_top, 0, std::max(0, state.height - 1)),
-                std::min(source_width, state.width - std::clamp(pad_left, 0, std::max(0, state.width - 1))),
-                std::min(source_height, state.height - std::clamp(pad_top, 0, std::max(0, state.height - 1))));
+                std::clamp(origin.x, 0, std::max(0, state.width - 1)),
+                std::clamp(origin.y, 0, std::max(0, state.height - 1)),
+                std::min(source_width, state.width - std::clamp(origin.x, 0, std::max(0, state.width - 1))),
+                std::min(source_height, state.height - std::clamp(origin.y, 0, std::max(0, state.height - 1))));
         } else if (cv::countNonZero(fusion_mask) > 0) {
             roi = cv::boundingRect(fusion_mask);
             const int context = 32;
@@ -3946,14 +4906,19 @@ CandidateCommit InferenceEngine::process_impl(
         result.metrics.roi_height = first_height;
         result.metrics.model_input_width = first_width;
         result.metrics.model_input_height = first_height;
-        const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
-        const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
+        const cv::Point origin = content_origin(
+            frame.support,
+            std::max(32, static_cast<int>(std::round(options_.width * 0.05))),
+            std::max(128, static_cast<int>(std::round(options_.width * 0.18))));
         model_to_canvas.at<float>(0, 0) = static_cast<float>(frame.match_rgb_u8.cols)
             / static_cast<float>(first_width);
         model_to_canvas.at<float>(1, 1) = static_cast<float>(frame.match_rgb_u8.rows)
             / static_cast<float>(first_height);
-        model_to_canvas.at<float>(0, 2) = static_cast<float>(pad_left);
-        model_to_canvas.at<float>(1, 2) = static_cast<float>(pad_top);
+        model_to_canvas.at<float>(0, 2) = static_cast<float>(origin.x);
+        model_to_canvas.at<float>(1, 2) = static_cast<float>(origin.y);
+        if (observation_group) {
+            model_to_canvas = homography * model_to_canvas;
+        }
         model_support = cv::Mat::ones(first_height, first_width, CV_32FC1);
     } else if (observation_group) {
         // A non-overlapping three-image input group is one static logical
@@ -3977,15 +4942,17 @@ CandidateCommit InferenceEngine::process_impl(
         result.metrics.roi_height = first_height;
         result.metrics.model_input_width = first_width;
         result.metrics.model_input_height = first_height;
-        const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
-        const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
+        const cv::Point origin = content_origin(
+            frame.support,
+            std::max(32, static_cast<int>(std::round(options_.width * 0.05))),
+            std::max(128, static_cast<int>(std::round(options_.width * 0.18))));
         cv::Mat source_to_frame = cv::Mat::eye(3, 3, CV_32FC1);
         source_to_frame.at<float>(0, 0) = static_cast<float>(frame.match_rgb_f.cols)
             / static_cast<float>(first_width);
         source_to_frame.at<float>(1, 1) = static_cast<float>(frame.match_rgb_f.rows)
             / static_cast<float>(first_height);
-        source_to_frame.at<float>(0, 2) = static_cast<float>(pad_left);
-        source_to_frame.at<float>(1, 2) = static_cast<float>(pad_top);
+        source_to_frame.at<float>(0, 2) = static_cast<float>(origin.x);
+        source_to_frame.at<float>(1, 2) = static_cast<float>(origin.y);
         model_to_canvas = homography * source_to_frame;
         model_support = cv::Mat::ones(first_height, first_width, CV_32FC1);
     } else {
@@ -4120,6 +5087,52 @@ CandidateCommit InferenceEngine::process_impl(
         valid_warp,
         static_cast<float>(options_.min_conf));
     cv::bitwise_and(candidate_valid, warped_roi_valid, candidate_valid);
+    if (observation_group && cv::countNonZero(candidate_valid) >= 512) {
+        cv::Mat depth_consistent = candidate_valid.clone();
+        for (int y = 2; y < model_depth_canvas.rows - 2; ++y) {
+            for (int x = 2; x < model_depth_canvas.cols - 2; ++x) {
+                if (candidate_valid.at<std::uint8_t>(y, x) == 0U) {
+                    continue;
+                }
+                const float depth = model_depth_canvas.at<float>(y, x);
+                if (!std::isfinite(depth) || depth <= 1e-5f) {
+                    depth_consistent.at<std::uint8_t>(y, x) = 0U;
+                    continue;
+                }
+                int agreeing_neighbors = 0;
+                for (int dy = -2; dy <= 2; dy += 2) {
+                    for (int dx = -2; dx <= 2; dx += 2) {
+                        if (dx == 0 && dy == 0) {
+                            continue;
+                        }
+                        const int nx = x + dx;
+                        const int ny = y + dy;
+                        if (candidate_valid.at<std::uint8_t>(ny, nx) == 0U) {
+                            continue;
+                        }
+                        const float neighbor_depth =
+                            model_depth_canvas.at<float>(ny, nx);
+                        if (!std::isfinite(neighbor_depth)
+                            || neighbor_depth <= 1e-5f) {
+                            continue;
+                        }
+                        const float relative_difference =
+                            std::abs(neighbor_depth - depth)
+                            / std::max(
+                                std::max(std::abs(neighbor_depth), std::abs(depth)),
+                                1e-3f);
+                        if (relative_difference <= 0.18f) {
+                            ++agreeing_neighbors;
+                        }
+                    }
+                }
+                if (agreeing_neighbors < 2) {
+                    depth_consistent.at<std::uint8_t>(y, x) = 0U;
+                }
+            }
+        }
+        candidate_valid = std::move(depth_consistent);
+    }
     cv::Mat group_gap_fill = cv::Mat::zeros(candidate_valid.size(), CV_8UC1);
     cv::Mat group_rgb_source_valid = candidate_valid.clone();
     if (prepared_group != nullptr) {
@@ -4356,14 +5369,15 @@ CandidateCommit InferenceEngine::process_impl(
         cv::bitwise_or(update_mask, group_gap_fill, update_mask);
     }
 
-    // A non-overlapping three-camera group is one logical frame.  Its
-    // foreground may move to a new canvas footprint between groups; keeping
-    // the previous group's unsupported foreground forever turns that motion
-    // into a second arm/ghost.  Do this replacement only for the data1-style
-    // stride-3 path.  Sliding groups (stride 1) retain the legacy incremental
-    // canvas semantics and must not clear their legitimate overlap.
+    // The B=1,S=3 group model owns a complete non-overlapping footprint and
+    // may replace it between groups.  The S1/S2 observation path does not:
+    // its foreground mask is allowed to flicker with camera exposure, so
+    // clearing old slots here would turn a harmless mask change into a large
+    // point-cloud jump.  Observation fusion only adds validated side-view
+    // coverage and keeps the stable Canvas history.
     cv::Mat group_stale_clear = cv::Mat::zeros(update_mask.size(), CV_8UC1);
-    const bool replace_group_footprint = logical_group && options_.group_stride >= 3;
+    const bool replace_group_footprint =
+        prepared_group != nullptr && options_.group_stride >= 3;
     if (replace_group_footprint && state.initialized && result.metrics.fallback.empty()) {
         cv::Mat current_footprint;
         cv::bitwise_or(valid_warp, group_gap_fill, current_footprint);
@@ -5111,8 +6125,8 @@ FramePreprocessor::FrameImage FramePreprocessor::load_frame(
     frame.rgb_u8 = cv::Mat::zeros(options_.canvas_height, options_.canvas_width, CV_8UC3);
     const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
     const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
-    const int copy_x = pad_left;
-    const int copy_y = pad_top;
+    int copy_x = pad_left;
+    int copy_y = pad_top;
     if (copy_x >= 0 && copy_y >= 0
         && copy_x + frame.match_rgb_u8.cols <= frame.rgb_u8.cols
         && copy_y + frame.match_rgb_u8.rows <= frame.rgb_u8.rows) {
@@ -5127,6 +6141,8 @@ FramePreprocessor::FrameImage FramePreprocessor::load_frame(
         const int source_y = std::max(0, (frame.match_rgb_u8.rows - copy_height) / 2);
         const int target_x = std::max(0, (frame.rgb_u8.cols - copy_width) / 2);
         const int target_y = std::max(0, (frame.rgb_u8.rows - copy_height) / 2);
+        copy_x = target_x;
+        copy_y = target_y;
         frame.match_rgb_u8(
             cv::Rect(source_x, source_y, copy_width, copy_height)).copyTo(
                 frame.rgb_u8(cv::Rect(target_x, target_y, copy_width, copy_height)));
@@ -5134,7 +6150,19 @@ FramePreprocessor::FrameImage FramePreprocessor::load_frame(
             cv::Rect(source_x, source_y, copy_width, copy_height)).copyTo(
                 frame.rgb_f(cv::Rect(target_x, target_y, copy_width, copy_height)));
     }
-    frame.support = foreground_mask(frame.rgb_f);
+    // See the engine loader above: support all pixels from the actual camera
+    // image, including dark but geometrically meaningful surfaces, while
+    // excluding only the synthetic canvas padding.
+    frame.support = cv::Mat::zeros(frame.rgb_f.size(), CV_8UC1);
+    const int support_x = copy_x;
+    const int support_y = copy_y;
+    const int support_width = std::min(
+        frame.match_rgb_u8.cols, frame.support.cols - support_x);
+    const int support_height = std::min(
+        frame.match_rgb_u8.rows, frame.support.rows - support_y);
+    if (support_width > 0 && support_height > 0) {
+        frame.support(cv::Rect(support_x, support_y, support_width, support_height)).setTo(255U);
+    }
     return frame;
 }
 
@@ -5187,17 +6215,19 @@ cv::Mat FramePreprocessor::estimate_pair_homography(
     cv::Ptr<cv::Feature2D> detector;
     int norm = cv::NORM_HAMMING;
     try {
-        detector = cv::SIFT::create(1200);
+        detector = cv::SIFT::create(3000);
         norm = cv::NORM_L2;
     } catch (const cv::Exception&) {
-        detector = cv::ORB::create(1200);
+        detector = cv::ORB::create(3000);
     }
     std::vector<cv::KeyPoint> source_keypoints;
     std::vector<cv::KeyPoint> target_keypoints;
     cv::Mat source_descriptors;
     cv::Mat target_descriptors;
-    detector->detectAndCompute(source_gray, cv::noArray(), source_keypoints, source_descriptors);
-    detector->detectAndCompute(target_gray, cv::noArray(), target_keypoints, target_descriptors);
+    detector->detectAndCompute(
+        source_gray, cv::noArray(), source_keypoints, source_descriptors);
+    detector->detectAndCompute(
+        target_gray, cv::noArray(), target_keypoints, target_descriptors);
     if (source_descriptors.empty() || target_descriptors.empty()
         || source_keypoints.size() < 8U || target_keypoints.size() < 8U) {
         return cv::Mat::eye(3, 3, CV_32FC1);
@@ -5207,11 +6237,11 @@ cv::Mat FramePreprocessor::estimate_pair_homography(
     matcher.knnMatch(source_descriptors, target_descriptors, knn, 2);
     std::vector<cv::DMatch> good;
     for (const auto& pair : knn) {
-        if (pair.size() == 2U && pair[0].distance < 0.75f * pair[1].distance) {
+        if (pair.size() == 2U && pair[0].distance < 0.82f * pair[1].distance) {
             good.push_back(pair[0]);
         }
     }
-    if (good.size() < 8U) {
+    if (good.size() < 5U) {
         return cv::Mat::eye(3, 3, CV_32FC1);
     }
     std::vector<cv::Point2f> source_points;
@@ -5224,8 +6254,11 @@ cv::Mat FramePreprocessor::estimate_pair_homography(
     }
     cv::Mat inlier_mask;
     cv::Mat homography = cv::findHomography(
-        source_points, target_points, cv::RANSAC, 3.0, inlier_mask);
-    if (homography.empty() || inlier_mask.empty() || cv::countNonZero(inlier_mask) < 8) {
+        source_points, target_points, cv::RANSAC, 4.0, inlier_mask);
+    if (homography.empty() || inlier_mask.empty()
+        || cv::countNonZero(inlier_mask) < 5
+        || !plausible_planar_homography(
+            homography, source.match_rgb_u8.size(), target.match_rgb_u8.size())) {
         return cv::Mat::eye(3, 3, CV_32FC1);
     }
     homography.convertTo(homography, CV_32FC1);
@@ -5237,6 +6270,84 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
     prepared_input.raw = raw;
     prepared_input.frame_seq = raw.frame_seq;
     Timer read_timer;
+    if (options_.group_mode) {
+        if (raw.group_paths.size() != 3U) {
+            throw std::runtime_error("B=1,S=3 preprocessing requires exactly three images");
+        }
+        // group_paths/group_images are in GUI arrival order. LiveFrameSource
+        // supplies the fixed arrival-position permutation {1,0,2}; source_seq
+        // itself is never used to infer a camera identity.
+        std::array<std::size_t, 3> arrival_for_model{};
+        std::array<bool, 3> seen_model{};
+        for (std::size_t arrival = 0; arrival < 3U; ++arrival) {
+            const std::size_t model_slot = raw.group_model_slot_for_arrival[arrival];
+            if (model_slot >= 3U || seen_model[model_slot]) {
+                throw std::runtime_error("invalid GUI burst model-slot permutation");
+            }
+            seen_model[model_slot] = true;
+            arrival_for_model[model_slot] = arrival;
+        }
+
+        std::array<FrameImage, 3> frames_by_model;
+        for (std::size_t model_slot = 0; model_slot < 3U; ++model_slot) {
+            const std::size_t arrival = arrival_for_model[model_slot];
+            if (arrival < raw.group_images.size() && raw.group_images[arrival]) {
+                frames_by_model[model_slot] = load_frame(
+                    raw.group_paths[arrival], *raw.group_images[arrival]);
+            } else {
+                frames_by_model[model_slot] = load_frame(raw.group_paths[arrival]);
+            }
+        }
+        const FrameImage& anchor = frames_by_model[static_cast<std::size_t>(
+            std::clamp(raw.group_anchor_index, 0, 2))];
+        prepared_input.path = anchor.path;
+        prepared_input.rgb_u8 = anchor.rgb_u8;
+        prepared_input.rgb_f = anchor.rgb_f;
+        prepared_input.match_rgb_u8 = anchor.match_rgb_u8;
+        prepared_input.match_rgb_f = anchor.match_rgb_f;
+        prepared_input.support = anchor.support;
+        prepared_input.group_model_rgb_f.reserve(3U);
+        for (const FrameImage& frame : frames_by_model) {
+            // Preserve aspect ratio, then round height to the model patch
+            // multiple before center crop/pad to exactly 406x252.
+            const cv::Mat& source = frame.match_rgb_f;
+            const double model_scale = static_cast<double>(options_.group_width)
+                / static_cast<double>(source.cols);
+            const int resized_height = round_to_multiple_14(
+                static_cast<double>(source.rows) * model_scale);
+            cv::Mat resized_model;
+            cv::resize(
+                source,
+                resized_model,
+                cv::Size(options_.group_width, resized_height),
+                0.0,
+                0.0,
+                cv::INTER_AREA);
+            cv::Mat model_rgb;
+            if (resized_height > options_.group_height) {
+                const int crop_y = (resized_height - options_.group_height) / 2;
+                model_rgb = resized_model(cv::Rect(
+                    0, crop_y, options_.group_width, options_.group_height)).clone();
+            } else if (resized_height < options_.group_height) {
+                model_rgb = cv::Mat::zeros(
+                    options_.group_height, options_.group_width, CV_32FC3);
+                const int pad_top = (options_.group_height - resized_height) / 2;
+                resized_model.copyTo(model_rgb(cv::Rect(
+                    0, pad_top, options_.group_width, resized_height)));
+            } else {
+                model_rgb = std::move(resized_model);
+            }
+            prepared_input.group_model_rgb_f.push_back(std::move(model_rgb));
+        }
+        prepared_input.has_group = true;
+        prepared_input.read_ms = read_timer.ms();
+        prepared_input.image_names.reserve(raw.group_paths.size());
+        for (const auto& path : raw.group_paths) {
+            prepared_input.image_names.push_back(path.filename().string());
+        }
+        return prepared_input;
+    }
+
     if (raw.group_paths.size() == 3U) {
         std::vector<FrameImage> frames;
         frames.reserve(raw.group_paths.size());
@@ -5252,6 +6363,17 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
         }
         const int anchor_index = std::clamp(raw.group_anchor_index, 0, 2);
         const FrameImage& anchor = frames[static_cast<std::size_t>(anchor_index)];
+        prepared_input.observation_views.reserve(frames.size());
+        for (const FrameImage& frame : frames) {
+            PreparedView view;
+            view.path = frame.path;
+            view.rgb_u8 = frame.rgb_u8;
+            view.rgb_f = frame.rgb_f;
+            view.match_rgb_u8 = frame.match_rgb_u8;
+            view.match_rgb_f = frame.match_rgb_f;
+            view.support = frame.support;
+            prepared_input.observation_views.push_back(std::move(view));
+        }
         prepared_input.path = anchor.path;
         prepared_input.rgb_u8 = anchor.rgb_u8;
         prepared_input.rgb_f = anchor.rgb_f;
@@ -5261,20 +6383,78 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
         prepared_input.group_model_rgb_f.reserve(3U);
         prepared_input.group_warped_rgb_f.reserve(3U);
         prepared_input.group_valid_warp.reserve(3U);
-        const int pad_left = std::max(32, static_cast<int>(std::round(options_.width * 0.05)));
-        const int pad_top = std::max(128, static_cast<int>(std::round(options_.width * 0.18)));
-        const cv::Mat pad_translation = [&]() {
+        const auto canvas_translation = [&](const FrameImage& frame) {
+            const cv::Point origin = content_origin(
+                frame.support,
+                std::max(32, static_cast<int>(std::round(options_.width * 0.05))),
+                std::max(128, static_cast<int>(std::round(options_.width * 0.18))));
             cv::Mat result = cv::Mat::eye(3, 3, CV_32FC1);
-            result.at<float>(0, 2) = static_cast<float>(pad_left);
-            result.at<float>(1, 2) = static_cast<float>(pad_top);
+            result.at<float>(0, 2) = static_cast<float>(origin.x);
+            result.at<float>(1, 2) = static_cast<float>(origin.y);
             return result;
-        }();
-        const cv::Mat inverse_pad_translation = [&]() {
-            cv::Mat result = cv::Mat::eye(3, 3, CV_32FC1);
-            result.at<float>(0, 2) = -static_cast<float>(pad_left);
-            result.at<float>(1, 2) = -static_cast<float>(pad_top);
-            return result;
-        }();
+        };
+        const cv::Mat anchor_translation = canvas_translation(anchor);
+        std::array<cv::Mat, 3> frame_to_anchor;
+        std::array<bool, 3> frame_to_anchor_valid{};
+        for (int index = 0; index < 3; ++index) {
+            if (index == anchor_index) {
+                frame_to_anchor[static_cast<std::size_t>(index)] =
+                    cv::Mat::eye(3, 3, CV_32FC1);
+                frame_to_anchor_valid[static_cast<std::size_t>(index)] = true;
+                continue;
+            }
+            cv::Mat direct = estimate_pair_homography(
+                frames[static_cast<std::size_t>(index)], anchor);
+            const bool valid = !direct.empty()
+                && cv::norm(
+                    direct - cv::Mat::eye(3, 3, CV_32FC1),
+                    cv::NORM_INF) > 1e-3
+                && plausible_planar_homography(
+                    direct,
+                    frames[static_cast<std::size_t>(index)].match_rgb_u8.size(),
+                    anchor.match_rgb_u8.size());
+            frame_to_anchor[static_cast<std::size_t>(index)] = std::move(direct);
+            frame_to_anchor_valid[static_cast<std::size_t>(index)] = valid;
+        }
+        // A camera opposite the anchor can have too little direct floor
+        // overlap for a non-degenerate homography. Route it through the third
+        // fixed camera when that camera has a validated direct anchor map.
+        for (int index = 0; index < 3; ++index) {
+            if (index == anchor_index
+                || frame_to_anchor_valid[static_cast<std::size_t>(index)]) {
+                continue;
+            }
+            const int bridge_index = 3 - anchor_index - index;
+            if (bridge_index < 0 || bridge_index >= 3
+                || !frame_to_anchor_valid[static_cast<std::size_t>(bridge_index)]) {
+                continue;
+            }
+            const cv::Mat source_to_bridge = estimate_pair_homography(
+                frames[static_cast<std::size_t>(index)],
+                frames[static_cast<std::size_t>(bridge_index)]);
+            if (source_to_bridge.empty()
+                || cv::norm(
+                    source_to_bridge - cv::Mat::eye(3, 3, CV_32FC1),
+                    cv::NORM_INF) <= 1e-3
+                || !plausible_planar_homography(
+                    source_to_bridge,
+                    frames[static_cast<std::size_t>(index)].match_rgb_u8.size(),
+                    frames[static_cast<std::size_t>(bridge_index)].match_rgb_u8.size())) {
+                continue;
+            }
+            cv::Mat chained =
+                frame_to_anchor[static_cast<std::size_t>(bridge_index)]
+                * source_to_bridge;
+            chained.convertTo(chained, CV_32FC1);
+            if (!plausible_planar_homography(
+                    chained,
+                    frames[static_cast<std::size_t>(index)].match_rgb_u8.size(),
+                    anchor.match_rgb_u8.size())) {
+                continue;
+            }
+            frame_to_anchor[static_cast<std::size_t>(index)] = std::move(chained);
+            frame_to_anchor_valid[static_cast<std::size_t>(index)] = true;
+        }
         for (int index = 0; index < 3; ++index) {
             // Match omnivggt_edge preprocessing exactly. The source images
             // are 5:4, while the group graph is 406x252; directly resizing
@@ -5310,12 +6490,18 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
             prepared_input.group_model_rgb_f.push_back(std::move(model_rgb));
             cv::Mat aligned_rgb = frames[static_cast<std::size_t>(index)].rgb_f.clone();
             cv::Mat aligned_support = frames[static_cast<std::size_t>(index)].support.clone();
+            cv::Mat canvas_homography = cv::Mat::eye(3, 3, CV_32FC1);
+            bool pair_alignment_valid = index == anchor_index;
             if (index != anchor_index) {
-                const cv::Mat match_homography = estimate_pair_homography(
-                    frames[static_cast<std::size_t>(index)],
-                    frames[static_cast<std::size_t>(anchor_index)]);
-                const cv::Mat canvas_homography = pad_translation
-                    * match_homography * inverse_pad_translation;
+                const cv::Mat& match_homography =
+                    frame_to_anchor[static_cast<std::size_t>(index)];
+                pair_alignment_valid =
+                    frame_to_anchor_valid[static_cast<std::size_t>(index)];
+                const cv::Mat source_translation = canvas_translation(
+                    frames[static_cast<std::size_t>(index)]);
+                const cv::Mat inverse_source_translation = source_translation.inv();
+                canvas_homography = anchor_translation
+                    * match_homography * inverse_source_translation;
                 aligned_rgb = warp_like(
                     frames[static_cast<std::size_t>(index)].rgb_f,
                     canvas_homography,
@@ -5329,6 +6515,10 @@ PreparedInput FramePreprocessor::prepare(const RawFrame& raw) const {
                 cv::threshold(aligned_support, aligned_support, 127.0, 255.0, cv::THRESH_BINARY);
                 aligned_support.convertTo(aligned_support, CV_8UC1);
             }
+            prepared_input.observation_views[static_cast<std::size_t>(index)].canvas_homography =
+                canvas_homography;
+            prepared_input.observation_views[static_cast<std::size_t>(index)].pair_alignment_valid =
+                pair_alignment_valid;
             prepared_input.group_warped_rgb_f.push_back(std::move(aligned_rgb));
             prepared_input.group_valid_warp.push_back(std::move(aligned_support));
         }

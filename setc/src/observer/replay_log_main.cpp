@@ -33,8 +33,7 @@ Args parse_args(const int argc, char** argv) {
         } else if (key == "--output_ply" && ++i < argc) {
             args.output_ply = argv[i];
         } else if (key == "--help" || key == "-h") {
-            std::cout << "Usage: omnivggt_replay_log --run_dir RUN [--frame N] [--output_ply FILE]"
-                         "\n";
+            std::cout << "Usage: omnivggt_replay_log --run_dir RUN [--frame N] [--output_ply FILE]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("invalid or incomplete argument: " + key);
