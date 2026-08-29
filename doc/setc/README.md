@@ -782,15 +782,6 @@ setc/build_hikvision/Release/omnivggt_hikvision_capture.exe `
 上面四个 `*_FROM_MVS` 只是占位符，不能直接照抄；请替换成你的相机在 MVS 参数页
 中显示的实际节点名。
 
-采集输出可以直接给 Python 流程读取，JSON sidecar 会按图片 stem 自动匹配：
-
-```powershell
-python -m stream_omnivggt.cli.run_stream_demo `
-  --image-dir hikvision_capture/images `
-  --camera-dir hikvision_capture/cameras `
-  --mock-backend
-```
-
 注意：采集器保存的是当前 MVS 输出分辨率下的原始 BGR 图像，改变 ROI、Offset、
 binning、decimation 或后续 resize 后，必须同步变换 K，最稳妥的做法是按最终输出
 分辨率重新标定。MVS DLL 需要在运行时 PATH 中可见；Windows 下通常由 MVS 安装器
