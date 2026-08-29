@@ -39,6 +39,14 @@ std::atomic<bool> g_stop_requested{false};
 
 void on_signal(int) { g_stop_requested.store(true); }
 
+void windows_server_debug(const std::string& message) {
+#ifdef _WIN32
+    std::cerr << "[observer-windows-server] " << message << std::endl;
+#else
+    (void)message;
+#endif
+}
+
 struct ServerArgs {
     InferenceOptions inference;
     fs::path image_dir;
@@ -414,8 +422,11 @@ public:
     }
 
     void note_received(const RawFrame& raw) {
+        windows_server_debug("runtime note_received manifest begin");
         append_group_manifest(raw, "Received");
+        windows_server_debug("runtime note_received manifest complete");
         const CommitVersion version = current_version();
+        windows_server_debug("runtime note_received version read");
         live_head_frame_.store(std::max(live_head_frame_.load(), raw.frame_seq));
         FrameRecord record;
         record.frame_seq = raw.frame_seq;
@@ -423,8 +434,11 @@ public:
         record.commit_version = version;
         record.status = FrameStatus::Received;
         record.image_name = raw.path.filename().string();
+        windows_server_debug("runtime note_received frame status publish begin");
         publish(make_frame_status(record));
+        windows_server_debug("runtime note_received frame status publish complete");
         publish(make_live_head(raw.frame_seq, version));
+        windows_server_debug("runtime note_received live head publish complete");
     }
 
     void record_coalesced(const RawFrame& raw) {
@@ -983,11 +997,19 @@ int main(int argc, char** argv) {
         std::thread accept_thread([&] { accept_loop(listener, runtime, stop_requested); });
         std::thread source_thread([&] {
             try {
+                windows_server_debug("source run begin");
                 source.run(
                     frame_queue,
                     stop_requested,
-                    [&runtime](const RawFrame& raw) { runtime.note_received(raw); },
+                    [&runtime](const RawFrame& raw) {
+                        windows_server_debug(
+                            "source note_received begin frame=" + std::to_string(raw.frame_seq));
+                        runtime.note_received(raw);
+                        windows_server_debug(
+                            "source note_received complete frame=" + std::to_string(raw.frame_seq));
+                    },
                     [&runtime](const RawFrame& raw) { runtime.record_coalesced(raw); });
+                windows_server_debug("source run complete; frame queue closed");
             } catch (const std::exception& error) {
                 std::cerr << "frame source: " << error.what() << "\n";
                 stop_requested.store(true);
@@ -998,18 +1020,29 @@ int main(int argc, char** argv) {
         std::thread prepare_thread([&] {
             try {
                 FramePreprocessor preprocessor(configured_args.inference);
+                windows_server_debug("preprocess worker ready");
                 while (true) {
                     const std::optional<RawFrame> raw = frame_queue.pop();
                     if (!raw.has_value()) {
+                        windows_server_debug("preprocess worker saw closed frame queue");
                         break;
                     }
+                    windows_server_debug(
+                        "preprocess begin frame=" + std::to_string(raw->frame_seq)
+                        + ", group_paths=" + std::to_string(raw->group_paths.size()));
                     inflight_gate.acquire();
                     try {
                         PreparedInput prepared = preprocessor.prepare(*raw);
+                        windows_server_debug(
+                            "preprocess complete frame=" + std::to_string(raw->frame_seq)
+                            + "; prepared queue push begin");
                         if (!prepared_queue.push_wait(std::move(prepared))) {
+                            windows_server_debug("prepared queue closed while pushing");
                             inflight_gate.release();
                             break;
                         }
+                        windows_server_debug(
+                            "prepared queue push complete frame=" + std::to_string(raw->frame_seq));
                     } catch (const std::exception& error) {
                         runtime.record_failed(*raw, error.what());
                         inflight_gate.release();
@@ -1027,22 +1060,32 @@ int main(int argc, char** argv) {
             try {
                 // LibTorch and the CUDA context are owned by this worker only.
                 InferenceEngine engine(configured_args.inference);
+                windows_server_debug("inference worker ready; waiting for prepared input");
                 // Drain every frame already accepted before the source closes.
                 // In --once/--num_images mode the queue may be closed while it
                 // still contains the final frame.
                 while (true) {
                     const std::optional<PreparedInput> prepared = prepared_queue.pop();
                     if (!prepared.has_value()) {
+                        windows_server_debug("inference worker saw closed prepared queue");
                         break;
                     }
+                    windows_server_debug(
+                        "inference begin frame=" + std::to_string(prepared->raw.frame_seq));
                     try {
                         const CanvasState state = runtime.snapshot();
                         CandidateCommit candidate = engine.process_prepared(*prepared, state);
+                        windows_server_debug(
+                            "inference complete frame=" + std::to_string(candidate.frame.frame_seq)
+                            + "; commit queue push begin");
                         const FrameSeq frame_seq = candidate.frame.frame_seq;
                         if (!commit_queue.push_wait(std::move(candidate))) {
+                            windows_server_debug("commit queue closed while pushing");
                             inflight_gate.release();
                             break;
                         }
+                        windows_server_debug(
+                            "commit queue push complete frame=" + std::to_string(frame_seq));
                         runtime.wait_until_frame_handled(frame_seq);
                         inflight_gate.release();
                     } catch (const std::exception& error) {
@@ -1060,12 +1103,18 @@ int main(int argc, char** argv) {
         });
 
         std::thread commit_thread([&] {
+            windows_server_debug("commit worker ready");
             while (true) {
                 const std::optional<CandidateCommit> candidate = commit_queue.pop();
                 if (!candidate.has_value()) {
+                    windows_server_debug("commit worker saw closed commit queue");
                     break;
                 }
+                windows_server_debug(
+                    "commit begin frame=" + std::to_string(candidate->frame.frame_seq));
                 runtime.commit(*candidate);
+                windows_server_debug(
+                    "commit complete frame=" + std::to_string(candidate->frame.frame_seq));
             }
             if (args.once) {
                 stop_requested.store(true);

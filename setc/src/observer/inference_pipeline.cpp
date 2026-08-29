@@ -33,6 +33,14 @@ namespace omnivggt::observer {
 
 namespace {
 
+void windows_debug_log(const std::string& message) {
+#ifdef _WIN32
+    std::cerr << "[observer-windows] " << message << std::endl;
+#else
+    (void)message;
+#endif
+}
+
 class Timer {
 public:
     Timer() : start_(std::chrono::steady_clock::now()) {}
@@ -1723,6 +1731,9 @@ std::string InferenceMetrics::csv_line() const {
 }
 
 InferenceEngine::InferenceEngine(InferenceOptions options) : options_(std::move(options)) {
+    windows_debug_log("InferenceEngine ctor begin; group_mode="
+        + std::string(options_.group_mode ? "true" : "false")
+        + ", device=" + options_.device + ", dtype=" + options_.dtype);
     if (options_.group_mode) {
         if (options_.group_model.empty()) {
             throw std::invalid_argument("group mode requires a B=1,S=3 TorchScript model");
@@ -1751,6 +1762,7 @@ InferenceEngine::InferenceEngine(InferenceOptions options) : options_(std::move(
     }
     device_ = parse_device(options_.device);
     dtype_ = parse_dtype(options_.dtype);
+    windows_debug_log("device/dtype parsed");
     if (!options_.model.empty()) {
         module_ = torch::jit::load(options_.model, device_);
         module_.eval();
@@ -1758,9 +1770,13 @@ InferenceEngine::InferenceEngine(InferenceOptions options) : options_(std::move(
     }
 
     if (options_.group_mode) {
+        windows_debug_log("group TorchScript load begin: " + options_.group_model);
         group_module_ = torch::jit::load(options_.group_model, device_);
+        windows_debug_log("group TorchScript load complete");
         group_module_.eval();
+        windows_debug_log("group eval complete; executor configure begin");
         configure_torchscript_executor(group_module_);
+        windows_debug_log("group executor configure complete");
         has_group_module_ = true;
     }
 
@@ -1785,9 +1801,11 @@ InferenceEngine::InferenceEngine(InferenceOptions options) : options_(std::move(
     // Python's _single_frame_batch/_two_frame_batch.
     if (device_.is_cuda()) {
         if (options_.group_mode) {
+            windows_debug_log("group warmup begin");
             const cv::Mat group_warmup = cv::Mat::zeros(
                 options_.group_height, options_.group_width, CV_8UC3);
             (void)run_group_model({group_warmup, group_warmup, group_warmup});
+            windows_debug_log("group warmup complete");
             return;
         }
         const cv::Mat first_warmup = cv::Mat::zeros(
@@ -2166,6 +2184,9 @@ std::vector<InferenceEngine::Prediction> InferenceEngine::run_group_model(
     const torch::Tensor mask = torch::zeros(
         {1, 3, height, width}, torch::TensorOptions().dtype(torch::kFloat32)).to(device_, dtype_);
 
+    windows_debug_log("group forward begin; shape=" + std::to_string(width)
+        + "x" + std::to_string(height));
+
     std::vector<torch::jit::IValue> inputs;
     inputs.emplace_back(images);
     inputs.emplace_back(extrinsics);
@@ -2173,6 +2194,7 @@ std::vector<InferenceEngine::Prediction> InferenceEngine::run_group_model(
     inputs.emplace_back(depth_input);
     inputs.emplace_back(mask);
     const auto output_tuple = group_module_.forward(inputs).toTuple();
+    windows_debug_log("group forward complete; output tuple received");
     if (output_tuple->elements().size() < 3U) {
         throw std::runtime_error("group TorchScript model must return pose, depth and confidence");
     }
@@ -2210,6 +2232,7 @@ std::vector<InferenceEngine::Prediction> InferenceEngine::run_group_model(
     const auto confidence_access = confidence.accessor<float, 4>();
     const auto world_points_access = world_points.accessor<float, 5>();
     const auto world_confidence_access = world_points_confidence.accessor<float, 4>();
+    windows_debug_log("group output conversion begin");
     for (int sequence = 0; sequence < 3; ++sequence) {
         Prediction prediction;
         prediction.depth = cv::Mat(height, width, CV_32FC1);
@@ -2258,8 +2281,64 @@ std::vector<InferenceEngine::Prediction> InferenceEngine::run_group_model(
             || prediction.fov_w >= 3.1f) {
             prediction.fov_w = std::numeric_limits<float>::quiet_NaN();
         }
+#ifdef _WIN32
+        std::size_t finite_point_count = 0U;
+        std::size_t finite_confidence_count = 0U;
+        std::size_t positive_confidence_count = 0U;
+        std::size_t z_above_90_count = 0U;
+        cv::Vec3f point_min(
+            std::numeric_limits<float>::infinity(),
+            std::numeric_limits<float>::infinity(),
+            std::numeric_limits<float>::infinity());
+        cv::Vec3f point_max(
+            -std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity(),
+            -std::numeric_limits<float>::infinity());
+        float confidence_min = std::numeric_limits<float>::infinity();
+        float confidence_max = -std::numeric_limits<float>::infinity();
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const cv::Vec3f point = prediction.world_points.at<cv::Vec3f>(y, x);
+                const float point_confidence =
+                    prediction.world_points_confidence.at<float>(y, x);
+                if (std::isfinite(point[0]) && std::isfinite(point[1])
+                    && std::isfinite(point[2])) {
+                    ++finite_point_count;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        point_min[axis] = std::min(point_min[axis], point[axis]);
+                        point_max[axis] = std::max(point_max[axis], point[axis]);
+                    }
+                    if (point[2] > 0.90f) {
+                        ++z_above_90_count;
+                    }
+                }
+                if (std::isfinite(point_confidence)) {
+                    ++finite_confidence_count;
+                    confidence_min = std::min(confidence_min, point_confidence);
+                    confidence_max = std::max(confidence_max, point_confidence);
+                    if (point_confidence > 0.0f) {
+                        ++positive_confidence_count;
+                    }
+                }
+            }
+        }
+        std::ostringstream raw_stats;
+        raw_stats << "raw group view=" << sequence
+                  << " points=" << finite_point_count
+                  << " conf_finite=" << finite_confidence_count
+                  << " conf_positive=" << positive_confidence_count
+                  << " xyz_min=[" << point_min[0] << ',' << point_min[1] << ',' << point_min[2]
+                  << "] xyz_max=[" << point_max[0] << ',' << point_max[1] << ',' << point_max[2]
+                  << "] conf=[" << confidence_min << ',' << confidence_max << ']'
+                  << " z_gt_0.90=" << z_above_90_count
+                  << " pose_t=[" << prediction.pose_translation[0] << ','
+                  << prediction.pose_translation[1] << ',' << prediction.pose_translation[2]
+                  << "] fov=[" << prediction.fov_h << ',' << prediction.fov_w << ']';
+        windows_debug_log(raw_stats.str());
+#endif
         predictions.push_back(std::move(prediction));
     }
+    windows_debug_log("group output conversion complete");
     return predictions;
 }
 
@@ -4321,9 +4400,14 @@ CandidateCommit InferenceEngine::process_world_group(
     result.metrics.roi_width = options_.group_width;
     result.metrics.roi_height = options_.group_height;
 
+    windows_debug_log("first/world group processing begin; frame="
+        + std::to_string(raw.frame_seq));
     Timer model_timer;
     const std::vector<Prediction> predictions = run_group_model(group.model_rgb_f);
     result.metrics.model_ms = model_timer.ms();
+    windows_debug_log("first/world group model complete; frame="
+        + std::to_string(raw.frame_seq) + ", model_ms="
+        + std::to_string(result.metrics.model_ms));
     if (predictions.size() != 3U) {
         throw std::runtime_error("B=1,S=3 group model did not return three predictions");
     }
@@ -4342,7 +4426,11 @@ CandidateCommit InferenceEngine::process_world_group(
     }
 
     Timer patch_timer;
+    windows_debug_log("world fusion begin; frame=" + std::to_string(raw.frame_seq));
     const GroupWorldFusionResult fusion = group_world_fusion_.fuse(views, state);
+    windows_debug_log("world fusion complete; frame=" + std::to_string(raw.frame_seq)
+        + ", accepted=" + std::string(fusion.accepted ? "true" : "false")
+        + ", slots=" + std::to_string(fusion.slots.size()));
     if (!fusion.accepted) {
         result.metrics.group_rejected_sources = 3;
         result.metrics.fallback = "world_fusion_rejected: " + fusion.rejection_reason;

@@ -10,12 +10,83 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <utility>
 #include <vector>
 
 namespace omnivggt::observer {
 
 namespace {
+
+bool finite_vec(const cv::Vec3f& value);
+
+void windows_fusion_debug(const std::string& message) {
+#ifdef _WIN32
+    std::clog << "[observer-windows-fusion] " << message << std::endl;
+#else
+    (void)message;
+#endif
+}
+
+void windows_fusion_map_stats(
+    const std::string& label,
+    const cv::Mat& points,
+    const cv::Mat& confidence) {
+#ifdef _WIN32
+    std::size_t finite_points = 0U;
+    std::size_t finite_confidence = 0U;
+    std::size_t confidence_positive = 0U;
+    std::size_t z_above_90 = 0U;
+    cv::Vec3f point_min(
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity());
+    cv::Vec3f point_max(
+        -std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity());
+    float confidence_min = std::numeric_limits<float>::infinity();
+    float confidence_max = -std::numeric_limits<float>::infinity();
+    for (int y = 0; y < points.rows; ++y) {
+        for (int x = 0; x < points.cols; ++x) {
+            const cv::Vec3f point = points.at<cv::Vec3f>(y, x);
+            const float point_confidence = confidence.at<float>(y, x);
+            if (finite_vec(point)) {
+                ++finite_points;
+                for (int axis = 0; axis < 3; ++axis) {
+                    point_min[axis] = std::min(point_min[axis], point[axis]);
+                    point_max[axis] = std::max(point_max[axis], point[axis]);
+                }
+                if (point[2] > 0.90f) {
+                    ++z_above_90;
+                }
+            }
+            if (std::isfinite(point_confidence)) {
+                ++finite_confidence;
+                confidence_min = std::min(confidence_min, point_confidence);
+                confidence_max = std::max(confidence_max, point_confidence);
+                if (point_confidence > 0.0f) {
+                    ++confidence_positive;
+                }
+            }
+        }
+    }
+    std::ostringstream stats;
+    stats << label
+          << " points=" << finite_points
+          << " conf_finite=" << finite_confidence
+          << " conf_positive=" << confidence_positive
+          << " xyz_min=[" << point_min[0] << ',' << point_min[1] << ',' << point_min[2]
+          << "] xyz_max=[" << point_max[0] << ',' << point_max[1] << ',' << point_max[2]
+          << "] conf=[" << confidence_min << ',' << confidence_max << ']'
+          << " z_gt_0.90=" << z_above_90;
+    windows_fusion_debug(stats.str());
+#else
+    (void)label;
+    (void)points;
+    (void)confidence;
+#endif
+}
 
 constexpr int kMaxPlaneSamplesPerView = 4096;
 constexpr int kPlaneRansacTrials = 4096;
@@ -60,6 +131,12 @@ struct ObjectSample {
     float weight = 0.0f;
     cv::Vec3f color = cv::Vec3f(0.0f, 0.0f, 0.0f);
     int view = 0;
+};
+
+struct HeightCluster {
+    std::vector<ObjectSample> samples;
+    float total_weight = 0.0f;
+    float height = 0.0f;
 };
 
 struct ViewObjectObservation {
@@ -370,6 +447,12 @@ struct ReprojectionStats {
     std::size_t contradict = 0U;
     std::size_t outside = 0U;
     std::size_t invalid = 0U;
+#ifdef _WIN32
+    std::vector<float> support_world_errors;
+    std::vector<float> support_depth_errors;
+    std::vector<float> failed_world_errors;
+    std::vector<float> failed_depth_errors;
+#endif
 };
 
 cv::Vec3f inverse_sim3_point(const Sim3& current_to_reference,
@@ -492,6 +575,28 @@ ReprojectionResult project_world_point_to_view(
         result.relation = ReprojectionRelation::Contradict;
     }
     return result;
+}
+
+void record_reprojection_error(
+    const ReprojectionResult& result,
+    ReprojectionStats& stats) {
+#ifdef _WIN32
+    if (!std::isfinite(result.world_error) || !std::isfinite(result.depth_error)) {
+        return;
+    }
+    const bool support = result.relation == ReprojectionRelation::Support;
+    auto& world_errors = support
+        ? stats.support_world_errors
+        : stats.failed_world_errors;
+    auto& depth_errors = support
+        ? stats.support_depth_errors
+        : stats.failed_depth_errors;
+    world_errors.push_back(result.world_error);
+    depth_errors.push_back(result.depth_error);
+#else
+    (void)result;
+    (void)stats;
+#endif
 }
 
 void record_failed_reprojection(const ReprojectionRelation relation,
@@ -993,6 +1098,50 @@ cv::Vec3f weighted_color(
     return color;
 }
 
+ViewObjectObservation make_object_observation(
+    const std::vector<ObjectSample>& samples,
+    const int view_id,
+    const int logical_x,
+    const int logical_y,
+    const std::array<std::array<float, 3>, 3>& gains) {
+    ViewObjectObservation observation;
+    if (samples.empty()) {
+        return observation;
+    }
+    observation.valid = true;
+    observation.view_id = view_id;
+    observation.logical_x = logical_x;
+    observation.logical_y = logical_y;
+    std::vector<float> u_values;
+    std::vector<float> v_values;
+    std::vector<float> confidence_values;
+    u_values.reserve(samples.size());
+    v_values.reserve(samples.size());
+    confidence_values.reserve(samples.size());
+    observation.weight = 0.0f;
+    for (const ObjectSample& sample : samples) {
+        u_values.push_back(sample.u);
+        v_values.push_back(sample.v);
+        confidence_values.push_back(sample.normalized_confidence);
+        observation.weight += std::max(sample.weight, 1e-4f);
+    }
+    observation.u = median_value(std::move(u_values));
+    observation.v = median_value(std::move(v_values));
+    observation.height = weighted_median_height(samples);
+    observation.confidence = median_value(std::move(confidence_values));
+    float ignored_confidence = 0.0f;
+    observation.color = weighted_color(samples, gains, ignored_confidence);
+    observation.sample_count = static_cast<int>(samples.size());
+    observation.valid = finite_vec(observation.color)
+        && std::isfinite(observation.u)
+        && std::isfinite(observation.v)
+        && std::isfinite(observation.height)
+        && std::isfinite(observation.confidence)
+        && std::isfinite(observation.weight)
+        && observation.weight > 0.0f;
+    return observation;
+}
+
 cv::Vec3f object_candidate_color(
     const ObjectSurfaceCandidate& candidate,
     float& confidence) {
@@ -1088,6 +1237,14 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             return reject("group point head returned invalid world-point maps");
         }
     }
+#ifdef _WIN32
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        windows_fusion_map_stats(
+            "raw view=" + std::to_string(view_index),
+            views[static_cast<std::size_t>(view_index)].world_points,
+            views[static_cast<std::size_t>(view_index)].world_confidence);
+    }
+#endif
 
     std::array<cv::Vec3f, 3> current_centers{};
     for (int index = 0; index < 3; ++index) {
@@ -1377,6 +1534,14 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             }
         }
     }
+#ifdef _WIN32
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        windows_fusion_map_stats(
+            "transformed view=" + std::to_string(view_index),
+            aligned_world_points[static_cast<std::size_t>(view_index)],
+            views[static_cast<std::size_t>(view_index)].world_confidence);
+    }
+#endif
 
     const float gui_scale = static_cast<float>(std::max(canvas_width_, canvas_height_));
     const auto world_to_cell = [&](const float u, const float v, int& logical_x, int& logical_y) {
@@ -1420,6 +1585,19 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     for (auto& samples : object_samples_by_view) {
         samples.resize(cell_count);
     }
+    std::size_t classified_finite_points = 0U;
+    std::size_t atlas_outside_points = 0U;
+    std::size_t strict_floor_points = 0U;
+    std::size_t strict_floor_neighborhood_rejected = 0U;
+    std::size_t near_floor_points = 0U;
+    std::size_t near_floor_neighborhood_rejected = 0U;
+    std::size_t positive_object_points = 0U;
+    std::size_t object_continuity_rejected = 0U;
+    std::size_t ignored_height_points = 0U;
+#ifdef _WIN32
+    std::vector<float> object_sample_heights;
+    object_sample_heights.reserve(positive_object_points);
+#endif
     for (int view_index = 0; view_index < 3; ++view_index) {
         const GroupWorldView& view = views[static_cast<std::size_t>(view_index)];
         const cv::Mat& aligned_points = aligned_world_points[static_cast<std::size_t>(view_index)];
@@ -1430,6 +1608,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 if (!finite_vec(point) || !std::isfinite(confidence)) {
                     continue;
                 }
+                ++classified_finite_points;
                 const cv::Vec3f delta = point - plane_origin_;
                 const float u = axis_x_.dot(delta);
                 const float v = axis_y_.dot(delta);
@@ -1437,6 +1616,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 int logical_x = 0;
                 int logical_y = 0;
                 if (!world_to_cell(u, v, logical_x, logical_y)) {
+                    ++atlas_outside_points;
                     continue;
                 }
                 const std::size_t cell = static_cast<std::size_t>(logical_y)
@@ -1450,9 +1630,11 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     x, y, view.world_points.cols, view.world_points.rows);
                 const float abs_height = std::abs(height);
                 if (abs_height <= floor_band_) {
+                    ++strict_floor_points;
                     if (!floor_neighborhood_consistent(
-                            aligned_points, view.world_confidence, x, y,
-                            plane_origin_, plane_normal_, floor_band_)) {
+                        aligned_points, view.world_confidence, x, y,
+                        plane_origin_, plane_normal_, floor_band_)) {
+                        ++strict_floor_neighborhood_rejected;
                         continue;
                     }
                     FloorSample& best = floor_best[
@@ -1465,9 +1647,11 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                         best.valid = true;
                     }
                 } else if (abs_height <= 2.5f * floor_band_) {
+                    ++near_floor_points;
                     if (!floor_neighborhood_consistent(
-                            aligned_points, view.world_confidence, x, y,
-                            plane_origin_, plane_normal_, floor_band_)) {
+                        aligned_points, view.world_confidence, x, y,
+                        plane_origin_, plane_normal_, floor_band_)) {
+                        ++near_floor_neighborhood_rejected;
                         continue;
                     }
                     FloorSample& best = near_floor_best[
@@ -1481,23 +1665,64 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     }
                 } else if (height > 1.5f * floor_band_
                     && height < max_object_height_
-                    && local_object_continuity(
-                        aligned_points, view.world_confidence, x, y, point, scene_scale_)) {
-                    object_samples_by_view[static_cast<std::size_t>(view_index)][cell].push_back(
-                        ObjectSample{
-                        u,
-                        v,
-                        height,
-                        normalized,
-                        std::max(weight, 1e-4f),
-                        view.rgb.at<cv::Vec3f>(y, x),
-                        view_index});
+                    ) {
+                    ++positive_object_points;
+                    if (local_object_continuity(
+                            aligned_points, view.world_confidence, x, y, point, scene_scale_)) {
+#ifdef _WIN32
+                        object_sample_heights.push_back(height);
+#endif
+                        object_samples_by_view[static_cast<std::size_t>(view_index)][cell].push_back(
+                            ObjectSample{
+                            u,
+                            v,
+                            height,
+                            normalized,
+                            std::max(weight, 1e-4f),
+                            view.rgb.at<cv::Vec3f>(y, x),
+                            view_index});
+                    } else {
+                        ++object_continuity_rejected;
+                    }
+                } else {
+                    ++ignored_height_points;
                 }
                 // Points outside the strict/near-floor bands and positive
                 // object band are intentionally ignored. Neither decision
                 // uses RGB.
             }
         }
+    }
+
+    if (accepted_fuse_count_ == 0U) {
+        std::size_t object_sample_points = 0U;
+        for (const auto& per_view : object_samples_by_view) {
+            for (const auto& per_cell : per_view) {
+                object_sample_points += per_cell.size();
+            }
+        }
+        std::ostringstream classification;
+        classification << "first-group classification"
+            << " plane_n=[" << plane_normal_[0] << ',' << plane_normal_[1] << ','
+            << plane_normal_[2] << "] plane_origin=[" << plane_origin_[0] << ','
+            << plane_origin_[1] << ',' << plane_origin_[2] << ']'
+            << " scene_scale=" << scene_scale_
+            << " floor_band=" << floor_band_
+            << " display_scale=" << display_scale_
+            << " max_object_height=" << max_object_height_
+            << " atlas_u=[" << u_min_ << ',' << u_max_ << "] atlas_v=["
+            << v_min_ << ',' << v_max_ << ']'
+            << " finite=" << classified_finite_points
+            << " outside_atlas=" << atlas_outside_points
+            << " strict_floor=" << strict_floor_points
+            << " strict_floor_neighborhood_rejected=" << strict_floor_neighborhood_rejected
+            << " near_floor=" << near_floor_points
+            << " near_floor_neighborhood_rejected=" << near_floor_neighborhood_rejected
+            << " positive_object=" << positive_object_points
+            << " object_continuity_rejected=" << object_continuity_rejected
+            << " object_samples=" << object_sample_points
+            << " ignored_height=" << ignored_height_points;
+        windows_fusion_debug(classification.str());
     }
 
     // Estimate side-camera exposure gains from actual three-dimensional
@@ -1854,6 +2079,12 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     std::vector<std::uint8_t> atlas_support2_cells(cell_count, 0U);
     std::vector<std::uint8_t> atlas_support3_cells(cell_count, 0U);
     ReprojectionStats reprojection_stats;
+#ifdef _WIN32
+    std::vector<float> pair_proposal_heights;
+    std::vector<float> bidirectional_pair_heights;
+    pair_proposal_heights.reserve(27795U);
+    bidirectional_pair_heights.reserve(27795U);
+#endif
 
     const auto object_candidate_is_better = [](const ObjectSurfaceCandidate& candidate,
         const ObjectSurfaceCandidate& current) {
@@ -1987,12 +2218,24 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                             views[static_cast<std::size_t>(first_view)],
                             reprojection_world_tolerance,
                             reprojection_depth_tolerance);
+                        record_reprojection_error(
+                            proposal.first_to_second, reprojection_stats);
+                        record_reprojection_error(
+                            proposal.second_to_first, reprojection_stats);
                         const bool first_support = proposal.first_to_second.relation
                             == ReprojectionRelation::Support;
                         const bool second_support = proposal.second_to_first.relation
                             == ReprojectionRelation::Support;
                         proposal.bidirectional_support = first_support && second_support;
                         ++reprojection_stats.atlas_pair;
+#ifdef _WIN32
+                        pair_proposal_heights.push_back(
+                            0.5f * (first.height + second->height));
+                        if (proposal.bidirectional_support) {
+                            bidirectional_pair_heights.push_back(
+                                0.5f * (first.height + second->height));
+                        }
+#endif
                         if (proposal.bidirectional_support) {
                             ++reprojection_stats.bidir_support;
                         } else {
@@ -2128,6 +2371,105 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
+    // A strict cross-view match is useful when it succeeds, but a partial
+    // occlusion can leave a real object visible in only one of the three
+    // images. Recover the former dominant-height-cluster behavior only for
+    // cells where the strict pass produced no candidate. This keeps the
+    // multi-view validation while preventing the floor layer from replacing
+    // all one-view raised geometry.
+    const float fallback_cluster_tolerance = std::max(
+        2.0f * floor_band_, 0.01f * scene_scale_);
+    std::vector<std::uint8_t> fallback_object_cells(cell_count, 0U);
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (object_best[cell].valid) {
+            continue;
+        }
+        std::vector<ObjectSample> samples;
+        for (int view_index = 0; view_index < 3; ++view_index) {
+            const auto& per_view_samples = object_samples_by_view[
+                static_cast<std::size_t>(view_index)][cell];
+            samples.insert(samples.end(), per_view_samples.begin(), per_view_samples.end());
+        }
+        if (samples.empty()) {
+            continue;
+        }
+        std::sort(samples.begin(), samples.end(), [](const ObjectSample& lhs,
+            const ObjectSample& rhs) {
+            return lhs.height < rhs.height;
+        });
+        std::vector<HeightCluster> clusters;
+        for (const ObjectSample& sample : samples) {
+            if (clusters.empty()
+                || sample.height - clusters.back().height > fallback_cluster_tolerance) {
+                HeightCluster cluster;
+                cluster.samples.push_back(sample);
+                cluster.total_weight = sample.weight;
+                cluster.height = sample.height;
+                clusters.push_back(std::move(cluster));
+            } else {
+                HeightCluster& cluster = clusters.back();
+                cluster.samples.push_back(sample);
+                cluster.total_weight += sample.weight;
+                cluster.height = weighted_median_height(cluster.samples);
+            }
+        }
+        if (clusters.empty()) {
+            continue;
+        }
+        std::size_t selected_index = 0U;
+        float selected_score = -1.0f;
+        for (std::size_t index = 0; index < clusters.size(); ++index) {
+            const HeightCluster& cluster = clusters[index];
+            const float score = cluster.total_weight
+                * std::sqrt(static_cast<float>(cluster.samples.size()));
+            if (score > selected_score
+                || (score == selected_score && cluster.samples.size()
+                    > clusters[selected_index].samples.size())
+                || (score == selected_score
+                    && cluster.samples.size() == clusters[selected_index].samples.size()
+                    && cluster.height < clusters[selected_index].height)) {
+                selected_index = index;
+                selected_score = score;
+            }
+        }
+
+        const HeightCluster& selected = clusters[selected_index];
+        ObjectSurfaceCandidate fallback;
+        fallback.valid = true;
+        fallback.logical_x = static_cast<int>(
+            cell % static_cast<std::size_t>(logical_width_));
+        fallback.logical_y = static_cast<int>(
+            cell / static_cast<std::size_t>(logical_width_));
+        for (int view_index = 0; view_index < 3; ++view_index) {
+            std::vector<ObjectSample> view_samples;
+            for (const ObjectSample& sample : selected.samples) {
+                if (sample.view == view_index) {
+                    view_samples.push_back(sample);
+                }
+            }
+            if (view_samples.empty()) {
+                continue;
+            }
+            ViewObjectObservation observation = make_object_observation(
+                view_samples,
+                view_index,
+                fallback.logical_x,
+                fallback.logical_y,
+                color_gain_);
+            if (!observation.valid) {
+                continue;
+            }
+            fallback.view_mask |= static_cast<std::uint8_t>(1U) << view_index;
+            fallback.observations[static_cast<std::size_t>(view_index)] =
+                std::move(observation);
+        }
+        finalize_object_candidate(fallback);
+        if (fallback.valid && support_count(fallback.view_mask) >= 1) {
+            object_best[cell] = std::move(fallback);
+            fallback_object_cells[cell] = 1U;
+        }
+    }
+
     std::vector<std::uint8_t> single_support_cells(cell_count, 0U);
     for (int view_index = 0; view_index < 3; ++view_index) {
         const auto& observations = object_observations_by_view[
@@ -2161,12 +2503,12 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
-    // Connected components run after cross-view matching. The existing
-    // minimum of eight logical cells is retained; support-1 observations are
-    // never put into this occupancy map in the first place.
+    // Connected components run after cross-view matching and the conservative
+    // single-view fallback. The existing minimum of eight logical cells is
+    // retained to reject isolated noise.
     cv::Mat occupancy(logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
-        if (object_best[cell].valid && support_count(object_best[cell].view_mask) >= 2) {
+        if (object_best[cell].valid) {
             const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
             const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
             occupancy.at<std::uint8_t>(y, x) = 255U;
@@ -2189,11 +2531,47 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
+    const float height_neighbor_threshold = std::max(
+        4.0f * floor_band_, 0.03f * scene_scale_);
+    for (int y = 0; y < logical_height_; ++y) {
+        for (int x = 0; x < logical_width_; ++x) {
+            const std::size_t cell = static_cast<std::size_t>(y) * logical_width_ + x;
+            if (!object_best[cell].valid
+                || support_count(object_best[cell].view_mask) != 1) {
+                continue;
+            }
+            std::vector<float> neighbor_heights;
+            neighbor_heights.reserve(8U);
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const int nx = x + dx;
+                    const int ny = y + dy;
+                    if (nx < 0 || nx >= logical_width_ || ny < 0 || ny >= logical_height_) {
+                        continue;
+                    }
+                    const std::size_t neighbor_cell =
+                        static_cast<std::size_t>(ny) * logical_width_ + nx;
+                    if (object_best[neighbor_cell].valid) {
+                        neighbor_heights.push_back(object_best[neighbor_cell].height);
+                    }
+                }
+            }
+            if (!neighbor_heights.empty()
+                && std::abs(object_best[cell].height
+                    - median_value(std::move(neighbor_heights))) > height_neighbor_threshold) {
+                object_best[cell].valid = false;
+            }
+        }
+    }
+
     std::vector<float> final_object_heights;
     std::size_t object_final = 0U;
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
         const ObjectSurfaceCandidate& candidate = object_best[cell];
-        if (!candidate.valid || support_count(candidate.view_mask) < 2) {
+        if (!candidate.valid) {
             continue;
         }
         const std::uint32_t slot_id = slot_for(candidate.logical_x, candidate.logical_y, 1);
@@ -2239,10 +2617,116 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         slot.rgba = apply_global_color_gain(slot.rgba, global_color_gain_);
     }
 
+    if (accepted_fuse_count_ == 0U) {
+        std::size_t result_floor_slots = 0U;
+        std::size_t result_object_slots = 0U;
+        std::size_t result_above_001 = 0U;
+        std::size_t result_above_005 = 0U;
+        float result_depth_min = std::numeric_limits<float>::infinity();
+        float result_depth_max = -std::numeric_limits<float>::infinity();
+        for (const FusedSlot& slot : result.slots) {
+            if (slot.floor) {
+                ++result_floor_slots;
+            } else {
+                ++result_object_slots;
+            }
+            result_depth_min = std::min(result_depth_min, slot.depth);
+            result_depth_max = std::max(result_depth_max, slot.depth);
+            if (slot.depth > 0.01f) {
+                ++result_above_001;
+            }
+            if (slot.depth > 0.05f) {
+                ++result_above_005;
+            }
+        }
+        std::ostringstream result_stats;
+        result_stats << "first-group fusion result"
+            << " slots=" << result.slots.size()
+            << " floor_slots=" << result_floor_slots
+            << " object_slots=" << result_object_slots
+            << " occupied_slots=" << result.occupied_slots.size()
+            << " depth=[" << result_depth_min << ',' << result_depth_max << ']'
+            << " depth_gt_0.01=" << result_above_001
+            << " depth_gt_0.05=" << result_above_005
+            << " object_final=" << object_final
+            << " object_height=[" << percentile_value(final_object_heights, 0.01f)
+            << ',' << percentile_value(final_object_heights, 0.99f) << ']';
+        windows_fusion_debug(result_stats.str());
+    }
+
     // Keep a low-rate diagnostic in the normal server log. This class does
     // not own the commit worker, so an accepted fusion group is the closest
     // commit-visible event available here; never create a /tmp audit file.
     ++accepted_fuse_count_;
+#ifdef _WIN32
+    if (accepted_fuse_count_ == 1U) {
+        std::ostringstream matching;
+        const std::size_t fallback_object_count = static_cast<std::size_t>(std::count(
+            fallback_object_cells.begin(), fallback_object_cells.end(),
+            static_cast<std::uint8_t>(1U)));
+        matching << "first-group matching"
+            << " object_pre_consistency=" << object_pre_consistency
+            << " pair_proposals=" << pair_proposals.size()
+            << " object_candidates_before_components="
+            << (reprojection_support2 + reprojection_support3 + fallback_object_count)
+            << " fallback_object_cells=" << fallback_object_count
+            << " support1_cells=" << atlas_support1
+            << " atlas_support2_cells=" << atlas_support2
+            << " atlas_support3_cells=" << atlas_support3
+            << " reprojection_support2=" << reprojection_support2
+            << " reprojection_support3=" << reprojection_support3
+            << " object_final=" << object_final
+            << " reprojection_bidir=" << reprojection_stats.bidir_support
+            << " reprojection_oneway=" << reprojection_stats.oneway_support
+            << " reprojection_occluded=" << reprojection_stats.occluded
+            << " reprojection_contradict=" << reprojection_stats.contradict
+            << " reprojection_outside=" << reprojection_stats.outside
+            << " reprojection_invalid=" << reprojection_stats.invalid
+            << " reproj_support_world_q50="
+            << percentile_value(reprojection_stats.support_world_errors, 0.50f)
+            << " reproj_support_world_q90="
+            << percentile_value(reprojection_stats.support_world_errors, 0.90f)
+            << " reproj_support_depth_q50="
+            << percentile_value(reprojection_stats.support_depth_errors, 0.50f)
+            << " reproj_support_depth_q90="
+            << percentile_value(reprojection_stats.support_depth_errors, 0.90f)
+            << " object_height_sample_q50="
+            << percentile_value(object_sample_heights, 0.50f)
+            << " object_height_sample_q90="
+            << percentile_value(object_sample_heights, 0.90f)
+            << " object_height_sample_q99="
+            << percentile_value(object_sample_heights, 0.99f)
+            << " pair_height_q50="
+            << percentile_value(pair_proposal_heights, 0.50f)
+            << " pair_height_q90="
+            << percentile_value(pair_proposal_heights, 0.90f)
+            << " pair_height_q99="
+            << percentile_value(pair_proposal_heights, 0.99f)
+            << " bidir_height_q50="
+            << percentile_value(bidirectional_pair_heights, 0.50f)
+            << " bidir_height_q90="
+            << percentile_value(bidirectional_pair_heights, 0.90f)
+            << " bidir_height_q99="
+            << percentile_value(bidirectional_pair_heights, 0.99f)
+            << " reproj_failed_world_q50="
+            << percentile_value(reprojection_stats.failed_world_errors, 0.50f)
+            << " reproj_failed_world_q90="
+            << percentile_value(reprojection_stats.failed_world_errors, 0.90f)
+            << " reproj_failed_world_q99="
+            << percentile_value(reprojection_stats.failed_world_errors, 0.99f)
+            << " reproj_failed_depth_q50="
+            << percentile_value(reprojection_stats.failed_depth_errors, 0.50f)
+            << " reproj_failed_depth_q90="
+            << percentile_value(reprojection_stats.failed_depth_errors, 0.90f)
+            << " reproj_failed_depth_q99="
+            << percentile_value(reprojection_stats.failed_depth_errors, 0.99f)
+            << " object_height_tolerance="
+            << object_cross_view_height_tolerance
+            << " fallback_cluster_tolerance=" << fallback_cluster_tolerance
+            << " reprojection_tolerance=" << reprojection_world_tolerance;
+        windows_fusion_debug(matching.str());
+    }
+#endif
     if (accepted_fuse_count_ % 30U == 0U) {
         const float object_h50 = percentile_value(final_object_heights, 0.50f);
         const float object_h90 = percentile_value(final_object_heights, 0.90f);
