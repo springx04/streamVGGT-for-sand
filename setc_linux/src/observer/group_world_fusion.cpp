@@ -64,6 +64,11 @@ struct HeightCluster {
     float height = 0.0f;
 };
 
+struct FloorUVSample {
+    float u = 0.0f;
+    float v = 0.0f;
+};
+
 bool finite_vec(const cv::Vec3f& value) {
     return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
 }
@@ -118,6 +123,24 @@ float percentile_value(std::vector<float> values, const float percentile) {
     auto it = values.begin() + static_cast<std::ptrdiff_t>(index);
     std::nth_element(values.begin(), it, values.end());
     return *it;
+}
+
+cv::Vec3f componentwise_median(const std::vector<cv::Vec3f>& values) {
+    std::vector<float> x;
+    std::vector<float> y;
+    std::vector<float> z;
+    x.reserve(values.size());
+    y.reserve(values.size());
+    z.reserve(values.size());
+    for (const cv::Vec3f& value : values) {
+        x.push_back(value[0]);
+        y.push_back(value[1]);
+        z.push_back(value[2]);
+    }
+    return cv::Vec3f(
+        median_value(std::move(x)),
+        median_value(std::move(y)),
+        median_value(std::move(z)));
 }
 
 bool rotation_from_quaternion(const cv::Vec4f& quaternion, cv::Matx33f& rotation) {
@@ -475,6 +498,28 @@ std::uint32_t color_to_rgba(const cv::Vec3f& color) {
     return pack_rgba(to_byte(color[0]), to_byte(color[1]), to_byte(color[2]));
 }
 
+float rgba_luminance(const std::uint32_t rgba) {
+    const auto channels = unpack_rgba(rgba);
+    return 0.2126f * static_cast<float>(channels[0]) / 255.0f
+        + 0.7152f * static_cast<float>(channels[1]) / 255.0f
+        + 0.0722f * static_cast<float>(channels[2]) / 255.0f;
+}
+
+std::uint32_t apply_global_color_gain(
+    const std::uint32_t rgba,
+    const float gain) {
+    const auto channels = unpack_rgba(rgba);
+    const auto scale_channel = [gain](const std::uint8_t channel) {
+        return static_cast<std::uint8_t>(std::lround(std::clamp(
+            static_cast<float>(channel) * gain, 0.0f, 255.0f)));
+    };
+    return pack_rgba(
+        scale_channel(channels[0]),
+        scale_channel(channels[1]),
+        scale_channel(channels[2]),
+        channels[3]);
+}
+
 bool valid_model_mats(const GroupWorldView& view) {
     return !view.world_points.empty()
         && !view.world_confidence.empty()
@@ -484,6 +529,108 @@ bool valid_model_mats(const GroupWorldView& view) {
         && view.rgb.type() == CV_32FC3
         && view.world_points.size() == view.world_confidence.size()
         && view.world_points.size() == view.rgb.size();
+}
+
+bool valid_aligned_point(
+    const cv::Mat& aligned_points,
+    const cv::Mat& confidence,
+    const int x,
+    const int y,
+    cv::Vec3f& point) {
+    if (x < 0 || y < 0 || x >= aligned_points.cols || y >= aligned_points.rows) {
+        return false;
+    }
+    point = aligned_points.at<cv::Vec3f>(y, x);
+    return finite_vec(point) && std::isfinite(confidence.at<float>(y, x));
+}
+
+bool local_object_continuity(
+    const cv::Mat& aligned_points,
+    const cv::Mat& confidence,
+    const int x,
+    const int y,
+    const cv::Vec3f& point,
+    const float scene_scale) {
+    std::vector<cv::Vec3f> neighbors;
+    std::vector<float> spacing;
+    neighbors.reserve(8U);
+    spacing.reserve(16U);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int nx = x + dx;
+            const int ny = y + dy;
+            cv::Vec3f neighbor;
+            if (!valid_aligned_point(aligned_points, confidence, nx, ny, neighbor)) {
+                continue;
+            }
+            if (dx != 0 || dy != 0) {
+                neighbors.push_back(neighbor);
+            }
+            // Estimate spacing strictly inside this pixel's 3x3 window. The
+            // previous implementation also compared the window's right/bottom
+            // edge with pixels at x+2/y+2; a single curtain/ray outside the
+            // neighborhood could therefore inflate the robust spacing and
+            // let the same outlier pass its continuity test.
+            if (dx < 1 && nx + 1 < aligned_points.cols) {
+                cv::Vec3f right;
+                if (valid_aligned_point(aligned_points, confidence, nx + 1, ny, right)) {
+                    spacing.push_back(vector_norm(right - neighbor));
+                }
+            }
+            if (dy < 1 && ny + 1 < aligned_points.rows) {
+                cv::Vec3f below;
+                if (valid_aligned_point(aligned_points, confidence, nx, ny + 1, below)) {
+                    spacing.push_back(vector_norm(below - neighbor));
+                }
+            }
+        }
+    }
+    if (neighbors.size() < 3U || spacing.size() < 2U) {
+        return false;
+    }
+    const cv::Vec3f local_median = componentwise_median(neighbors);
+    const float local_distance = vector_norm(point - local_median);
+    const float local_spacing = median_value(std::move(spacing));
+    if (!std::isfinite(local_distance) || !std::isfinite(local_spacing)
+        || local_spacing <= kNumericEpsilon || !std::isfinite(scene_scale)) {
+        return false;
+    }
+    const float threshold = std::max(4.0f * local_spacing, 0.015f * scene_scale);
+    return std::isfinite(threshold) && local_distance <= threshold;
+}
+
+bool floor_neighborhood_consistent(
+    const cv::Mat& aligned_points,
+    const cv::Mat& confidence,
+    const int x,
+    const int y,
+    const cv::Vec3f& plane_origin,
+    const cv::Vec3f& plane_normal,
+    const float floor_band) {
+    std::vector<float> absolute_heights;
+    absolute_heights.reserve(9U);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            cv::Vec3f point;
+            if (!valid_aligned_point(aligned_points, confidence, x + dx, y + dy, point)) {
+                continue;
+            }
+            absolute_heights.push_back(std::abs(
+                plane_normal.dot(point - plane_origin)));
+        }
+    }
+    return absolute_heights.size() >= 3U
+        && median_value(std::move(absolute_heights)) <= 1.5f * floor_band;
+}
+
+int distinct_view_count(const HeightCluster& cluster) {
+    std::array<bool, 3> seen{false, false, false};
+    for (const ObjectSample& sample : cluster.samples) {
+        if (sample.view >= 0 && sample.view < 3) {
+            seen[static_cast<std::size_t>(sample.view)] = true;
+        }
+    }
+    return static_cast<int>(std::count(seen.begin(), seen.end(), true));
 }
 
 float weighted_median_height(const std::vector<ObjectSample>& samples) {
@@ -570,6 +717,7 @@ void GroupWorldFusion::reset() {
     scene_scale_ = 1.0f;
     floor_band_ = 0.01f;
     max_object_height_ = 1.0f;
+    global_color_gain_ = 1.0f;
     color_gain_ = {{
         {{1.0f, 1.0f, 1.0f}},
         {{1.0f, 1.0f, 1.0f}},
@@ -733,31 +881,73 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             return reject("reference floor second axis is degenerate");
         }
 
-        std::vector<float> floor_u;
-        std::vector<float> floor_v;
-        floor_u.reserve(inliers.size());
-        floor_v.reserve(inliers.size());
-        for (const CandidatePoint& candidate : candidates) {
+        // Atlas bounds are estimated only from the RANSAC-refined floor
+        // inliers.  A small number of remote point-head rays must not turn
+        // the fixed canvas into a giant sparse rectangle.
+        std::vector<FloorUVSample> floor_uv;
+        floor_uv.reserve(inliers.size());
+        for (const int index : inliers) {
+            const CandidatePoint& candidate = candidates[static_cast<std::size_t>(index)];
+            if (!std::isfinite(candidate.confidence)) {
+                continue;
+            }
             const cv::Vec3f delta = candidate.point - inlier_center;
             const float height = plane.normal.dot(delta);
             if (std::abs(height) <= floor_band) {
-                floor_u.push_back(axis_x.dot(delta));
-                floor_v.push_back(axis_y.dot(delta));
+                floor_uv.push_back(FloorUVSample{
+                    axis_x.dot(delta), axis_y.dot(delta)});
             }
         }
-        if (floor_u.size() < 3U || floor_v.size() < 3U) {
+        if (floor_uv.size() < 3U) {
             return reject("reference floor has too few finite XY samples");
         }
-        const float u_one = percentile_value(floor_u, 0.01f);
-        const float u_ninety_nine = percentile_value(floor_u, 0.99f);
-        const float v_one = percentile_value(floor_v, 0.01f);
-        const float v_ninety_nine = percentile_value(floor_v, 0.99f);
-        const float raw_u_span = std::max(u_ninety_nine - u_one, 0.01f * scene_scale);
-        const float raw_v_span = std::max(v_ninety_nine - v_one, 0.01f * scene_scale);
-        const float u_min = u_one - 0.15f * raw_u_span;
-        const float u_max = u_ninety_nine + 0.15f * raw_u_span;
-        const float v_min = v_one - 0.15f * raw_v_span;
-        const float v_max = v_ninety_nine + 0.15f * raw_v_span;
+        std::vector<float> floor_u;
+        std::vector<float> floor_v;
+        floor_u.reserve(floor_uv.size());
+        floor_v.reserve(floor_uv.size());
+        for (const FloorUVSample& sample : floor_uv) {
+            floor_u.push_back(sample.u);
+            floor_v.push_back(sample.v);
+        }
+        const float uv_center_u = median_value(floor_u);
+        const float uv_center_v = median_value(floor_v);
+        std::vector<float> uv_radii;
+        uv_radii.reserve(floor_uv.size());
+        for (const FloorUVSample& sample : floor_uv) {
+            uv_radii.push_back(std::hypot(sample.u - uv_center_u, sample.v - uv_center_v));
+        }
+        const float radius_median = median_value(uv_radii);
+        std::vector<float> radius_deviations;
+        radius_deviations.reserve(uv_radii.size());
+        for (const float radius : uv_radii) {
+            radius_deviations.push_back(std::abs(radius - radius_median));
+        }
+        const float radius_mad = median_value(radius_deviations);
+        const float radius_limit = radius_median + 4.0f * 1.4826f
+            * std::max(radius_mad, kNumericEpsilon);
+        std::vector<float> robust_floor_u;
+        std::vector<float> robust_floor_v;
+        robust_floor_u.reserve(floor_uv.size());
+        robust_floor_v.reserve(floor_uv.size());
+        for (std::size_t index = 0; index < floor_uv.size(); ++index) {
+            if (uv_radii[index] <= radius_limit) {
+                robust_floor_u.push_back(floor_uv[index].u);
+                robust_floor_v.push_back(floor_uv[index].v);
+            }
+        }
+        if (robust_floor_u.size() < 3U || robust_floor_v.size() < 3U) {
+            return reject("reference floor robust XY support is too small");
+        }
+        const float u_two = percentile_value(robust_floor_u, 0.02f);
+        const float u_ninety_eight = percentile_value(robust_floor_u, 0.98f);
+        const float v_two = percentile_value(robust_floor_v, 0.02f);
+        const float v_ninety_eight = percentile_value(robust_floor_v, 0.98f);
+        const float raw_u_span = std::max(u_ninety_eight - u_two, 0.01f * scene_scale);
+        const float raw_v_span = std::max(v_ninety_eight - v_two, 0.01f * scene_scale);
+        const float u_min = u_two - 0.08f * raw_u_span;
+        const float u_max = u_ninety_eight + 0.08f * raw_u_span;
+        const float v_min = v_two - 0.08f * raw_v_span;
+        const float v_max = v_ninety_eight + 0.08f * raw_v_span;
 
         reference_initialized_ = true;
         reference_centers_ = current_centers;
@@ -767,7 +957,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         axis_y_ = axis_y;
         scene_scale_ = scene_scale;
         floor_band_ = floor_band;
-        max_object_height_ = 1.1f * reference_camera_height;
+        max_object_height_ = 0.90f * reference_camera_height;
         u_min_ = u_min;
         u_max_ = u_max;
         v_min_ = v_min;
@@ -825,6 +1015,29 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     const float confidence_lower = percentile_value(confidence_values, 0.10f);
     const float confidence_upper = percentile_value(confidence_values, 0.90f);
 
+    // Materialize the three aligned point-head maps once.  The local object
+    // continuity test below must compare points in the same (reference)
+    // world frame as the final floor/object classification.
+    std::array<cv::Mat, 3> aligned_world_points;
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        const GroupWorldView& view = views[static_cast<std::size_t>(view_index)];
+        aligned_world_points[static_cast<std::size_t>(view_index)] = cv::Mat(
+            view.world_points.rows, view.world_points.cols, CV_32FC3);
+        const Sim3& transform = transforms[static_cast<std::size_t>(view_index)];
+        for (int y = 0; y < view.world_points.rows; ++y) {
+            for (int x = 0; x < view.world_points.cols; ++x) {
+                const cv::Vec3f source = view.world_points.at<cv::Vec3f>(y, x);
+                aligned_world_points[static_cast<std::size_t>(view_index)].at<cv::Vec3f>(y, x) =
+                    finite_vec(source)
+                    ? apply_sim3(transform, source)
+                    : cv::Vec3f(
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN());
+            }
+        }
+    }
+
     const float gui_scale = static_cast<float>(std::max(canvas_width_, canvas_height_));
     const auto world_to_cell = [&](const float u, const float v, int& logical_x, int& logical_y) {
         if (!std::isfinite(u) || !std::isfinite(v)
@@ -863,14 +1076,12 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
 
     std::vector<FloorSample> floor_best(cell_count * 3U);
     std::vector<std::vector<ObjectSample>> object_samples(cell_count);
-    std::vector<std::uint8_t> object_occupancy(cell_count, 0U);
     for (int view_index = 0; view_index < 3; ++view_index) {
         const GroupWorldView& view = views[static_cast<std::size_t>(view_index)];
-        const Sim3& transform = transforms[static_cast<std::size_t>(view_index)];
+        const cv::Mat& aligned_points = aligned_world_points[static_cast<std::size_t>(view_index)];
         for (int y = 0; y < view.world_points.rows; ++y) {
             for (int x = 0; x < view.world_points.cols; ++x) {
-                const cv::Vec3f point = apply_sim3(
-                    transform, view.world_points.at<cv::Vec3f>(y, x));
+                const cv::Vec3f point = aligned_points.at<cv::Vec3f>(y, x);
                 const float confidence = view.world_confidence.at<float>(y, x);
                 if (!finite_vec(point) || !std::isfinite(confidence)) {
                     continue;
@@ -892,6 +1103,11 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 const float weight = normalized * border_weight(
                     x, y, view.world_points.cols, view.world_points.rows);
                 if (std::abs(height) <= floor_band_) {
+                    if (!floor_neighborhood_consistent(
+                            aligned_points, view.world_confidence, x, y,
+                            plane_origin_, plane_normal_, floor_band_)) {
+                        continue;
+                    }
                     FloorSample& best = floor_best[
                         static_cast<std::size_t>(view_index) * cell_count + cell];
                     if (!best.valid || weight > best.weight) {
@@ -900,15 +1116,16 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                         best.weight = weight;
                         best.valid = true;
                     }
-                } else if (height >= 1.5f * floor_band_
-                    && height <= max_object_height_) {
+                } else if (height > 1.5f * floor_band_
+                    && height < max_object_height_
+                    && local_object_continuity(
+                        aligned_points, view.world_confidence, x, y, point, scene_scale_)) {
                     object_samples[cell].push_back(ObjectSample{
                         height,
                         normalized,
                         std::max(weight, 1e-4f),
                         view.rgb.at<cv::Vec3f>(y, x),
                         view_index});
-                    object_occupancy[cell] = 1U;
                 }
                 // The transition band and points below the plane are
                 // intentionally ignored. Neither decision uses RGB.
@@ -1030,40 +1247,17 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
-    // Quantize object points to the same logical XY cells, then retain at
-    // most three height clusters per cell. Geometry, not image brightness,
-    // defines occupancy and component filtering.
-    cv::Mat occupancy(logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
-    for (std::size_t cell = 0; cell < cell_count; ++cell) {
-        if (object_occupancy[cell] != 0U) {
-            const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
-            const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
-            occupancy.at<std::uint8_t>(y, x) = 255U;
-        }
-    }
-    cv::Mat labels;
-    cv::Mat stats;
-    cv::Mat centroids;
-    const int component_count = cv::connectedComponentsWithStats(
-        occupancy, labels, stats, centroids, 8, CV_32S);
-    std::vector<std::uint8_t> component_keep(cell_count, 0U);
-    for (int y = 0; y < logical_height_; ++y) {
-        for (int x = 0; x < logical_width_; ++x) {
-            const int component = labels.at<int>(y, x);
-            if (component > 0 && component < component_count
-                && stats.at<int>(component, cv::CC_STAT_AREA) >= 4) {
-                component_keep[static_cast<std::size_t>(y) * logical_width_ + x] = 1U;
-            }
-        }
-    }
+    // Quantize object points to the same logical XY cells. Production keeps
+    // one dominant object surface per cell; layer 2/3 remain reserved by the
+    // 2x2 layout for compatibility but are intentionally not written here.
     const float cluster_tolerance = std::max(2.0f * floor_band_, 0.01f * scene_scale_);
-    const float max_association_distance = 3.0f * cluster_tolerance / display_scale_;
+    std::vector<HeightCluster> selected_clusters(cell_count);
+    std::vector<std::uint8_t> selected_valid(cell_count, 0U);
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
-        if (component_keep[cell] == 0U) {
-            object_samples[cell].clear();
+        auto& samples = object_samples[cell];
+        if (samples.empty()) {
             continue;
         }
-        auto& samples = object_samples[cell];
         std::sort(samples.begin(), samples.end(), [](const ObjectSample& lhs, const ObjectSample& rhs) {
             return lhs.height < rhs.height;
         });
@@ -1083,85 +1277,133 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 cluster.height = weighted_median_height(cluster.samples);
             }
         }
-        if (clusters.size() > 3U) {
-            std::sort(clusters.begin(), clusters.end(), [](const HeightCluster& lhs, const HeightCluster& rhs) {
-                if (lhs.total_weight != rhs.total_weight) {
-                    return lhs.total_weight > rhs.total_weight;
-                }
-                if (lhs.samples.size() != rhs.samples.size()) {
-                    return lhs.samples.size() > rhs.samples.size();
-                }
-                return lhs.height < rhs.height;
-            });
-            clusters.resize(3U);
-            std::sort(clusters.begin(), clusters.end(), [](const HeightCluster& lhs, const HeightCluster& rhs) {
-                return lhs.height < rhs.height;
-            });
+        if (clusters.empty()) {
+            continue;
         }
+        std::size_t selected_index = 0U;
+        float selected_score = -1.0f;
+        for (std::size_t index = 0; index < clusters.size(); ++index) {
+            const HeightCluster& cluster = clusters[index];
+            const float score = cluster.total_weight
+                * std::sqrt(static_cast<float>(cluster.samples.size()));
+            if (score > selected_score
+                || (score == selected_score && cluster.samples.size()
+                    > clusters[selected_index].samples.size())
+                || (score == selected_score
+                    && cluster.samples.size() == clusters[selected_index].samples.size()
+                    && cluster.height < clusters[selected_index].height)) {
+                selected_index = index;
+                selected_score = score;
+            }
+        }
+        selected_clusters[cell] = std::move(clusters[selected_index]);
+        selected_valid[cell] = 1U;
+    }
 
-        std::array<int, 3> cluster_for_layer{-1, -1, -1};
-        std::array<bool, 3> cluster_used{false, false, false};
+    cv::Mat occupancy(logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (selected_valid[cell] != 0U) {
+            const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
+            const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
+            occupancy.at<std::uint8_t>(y, x) = 255U;
+        }
+    }
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count = cv::connectedComponentsWithStats(
+        occupancy, labels, stats, centroids, 8, CV_32S);
+    for (int y = 0; y < logical_height_; ++y) {
+        for (int x = 0; x < logical_width_; ++x) {
+            const int component = labels.at<int>(y, x);
+            const std::size_t cell = static_cast<std::size_t>(y) * logical_width_ + x;
+            if (selected_valid[cell] != 0U
+                && (component <= 0 || component >= component_count
+                    || stats.at<int>(component, cv::CC_STAT_AREA) < 8)) {
+                selected_valid[cell] = 0U;
+            }
+        }
+    }
+
+    const float height_neighbor_threshold = std::max(
+        4.0f * floor_band_, 0.03f * scene_scale_);
+    for (int y = 0; y < logical_height_; ++y) {
+        for (int x = 0; x < logical_width_; ++x) {
+            const std::size_t cell = static_cast<std::size_t>(y) * logical_width_ + x;
+            if (selected_valid[cell] == 0U
+                || distinct_view_count(selected_clusters[cell]) != 1) {
+                continue;
+            }
+            std::vector<float> neighbor_heights;
+            neighbor_heights.reserve(8U);
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const int nx = x + dx;
+                    const int ny = y + dy;
+                    if (nx < 0 || nx >= logical_width_ || ny < 0 || ny >= logical_height_) {
+                        continue;
+                    }
+                    const std::size_t neighbor_cell =
+                        static_cast<std::size_t>(ny) * logical_width_ + nx;
+                    if (selected_valid[neighbor_cell] != 0U) {
+                        neighbor_heights.push_back(selected_clusters[neighbor_cell].height);
+                    }
+                }
+            }
+            if (!neighbor_heights.empty()
+                && std::abs(selected_clusters[cell].height
+                    - median_value(std::move(neighbor_heights))) > height_neighbor_threshold) {
+                selected_valid[cell] = 0U;
+            }
+        }
+    }
+
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (selected_valid[cell] == 0U) {
+            continue;
+        }
         const int logical_x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
         const int logical_y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
-        for (int layer = 1; layer <= 3; ++layer) {
-            const std::uint32_t old_slot = slot_for(logical_x, logical_y, layer);
-            if (!state.shape_valid() || old_slot >= state.slot_count()
-                || state.valid[old_slot] == 0U) {
-                continue;
-            }
-            const float old_height = state.depth[old_slot] * display_scale_;
-            int best_cluster = -1;
-            float best_distance = std::numeric_limits<float>::max();
-            for (std::size_t cluster_index = 0; cluster_index < clusters.size(); ++cluster_index) {
-                if (cluster_used[cluster_index]) {
-                    continue;
-                }
-                const float distance = std::abs(clusters[cluster_index].height - old_height);
-                if (distance < best_distance) {
-                    best_distance = distance;
-                    best_cluster = static_cast<int>(cluster_index);
-                }
-            }
-            if (best_cluster >= 0 && best_distance <= max_association_distance) {
-                cluster_for_layer[static_cast<std::size_t>(layer - 1)] = best_cluster;
-                cluster_used[static_cast<std::size_t>(best_cluster)] = true;
-            }
+        float confidence = 0.0f;
+        const cv::Vec3f color = weighted_color(
+            selected_clusters[cell].samples, color_gain_, confidence);
+        const std::uint32_t slot_id = slot_for(logical_x, logical_y, 1);
+        if (slot_id == std::numeric_limits<std::uint32_t>::max()) {
+            continue;
         }
-        for (std::size_t cluster_index = 0; cluster_index < clusters.size(); ++cluster_index) {
-            if (cluster_used[cluster_index]) {
-                continue;
-            }
-            for (std::size_t layer_index = 0; layer_index < cluster_for_layer.size(); ++layer_index) {
-                if (cluster_for_layer[layer_index] < 0) {
-                    cluster_for_layer[layer_index] = static_cast<int>(cluster_index);
-                    cluster_used[cluster_index] = true;
-                    break;
-                }
-            }
+        result.slots.push_back(FusedSlot{
+            slot_id,
+            selected_clusters[cell].height / display_scale_,
+            confidence,
+            color_to_rgba(color),
+            false});
+        result.occupied_slots.push_back(slot_id);
+    }
+
+    // Brightness is a display-only correction. Geometry and all of the
+    // floor/object decisions above have already completed without consulting
+    // RGB. Keep the persistent floor cache in pre-gain colour space so a
+    // cell that is temporarily occluded is not multiplied again next frame.
+    std::vector<float> luminances;
+    luminances.reserve(result.slots.size());
+    for (const FusedSlot& slot : result.slots) {
+        const auto channels = unpack_rgba(slot.rgba);
+        if (channels[0] != 0U || channels[1] != 0U || channels[2] != 0U) {
+            luminances.push_back(rgba_luminance(slot.rgba));
         }
-        for (int layer = 1; layer <= 3; ++layer) {
-            const int cluster_index = cluster_for_layer[static_cast<std::size_t>(layer - 1)];
-            if (cluster_index < 0) {
-                continue;
-            }
-            float confidence = 0.0f;
-            const cv::Vec3f color = weighted_color(
-                clusters[static_cast<std::size_t>(cluster_index)].samples,
-                color_gain_,
-                confidence);
-            const std::uint32_t slot_id = slot_for(logical_x, logical_y, layer);
-            if (slot_id == std::numeric_limits<std::uint32_t>::max()) {
-                continue;
-            }
-            const FusedSlot object_slot{
-                slot_id,
-                clusters[static_cast<std::size_t>(cluster_index)].height / display_scale_,
-                confidence,
-                color_to_rgba(color),
-                false};
-            result.slots.push_back(object_slot);
-            result.occupied_slots.push_back(slot_id);
+    }
+    if (!luminances.empty()) {
+        const float median_luminance = median_value(luminances);
+        if (std::isfinite(median_luminance) && median_luminance > kNumericEpsilon) {
+            global_color_gain_ = std::clamp(
+                0.25f / median_luminance, 1.0f, 1.8f);
         }
+    }
+    for (FusedSlot& slot : result.slots) {
+        slot.rgba = apply_global_color_gain(slot.rgba, global_color_gain_);
     }
 
     result.accepted = true;

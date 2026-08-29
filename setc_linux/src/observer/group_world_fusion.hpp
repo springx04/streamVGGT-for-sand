@@ -73,6 +73,7 @@ private:
     float scene_scale_ = 1.0f;
     float floor_band_ = 0.01f;
     float max_object_height_ = 1.0f;
+    float global_color_gain_ = 1.0f;
     // Indexed by model view, then RGB channel. View 1 is the fixed anchor.
     std::array<std::array<float, 3>, 3> color_gain_{{
         {{1.0f, 1.0f, 1.0f}},
