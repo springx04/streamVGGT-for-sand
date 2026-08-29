@@ -2173,6 +2173,48 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         object_best[cell] = std::move(fallback_best[cell]);
     }
 
+    // Tier 3 is deliberately limited to the Phase-A-supported case: a
+    // two-view atlas candidate with no reprojection Support and no
+    // Contradict relation. It is built from the same robust per-view
+    // observations and pair proposals as the first two tiers. The independent
+    // best array ensures Tier 3 can only fill a cell left empty by Tier 1/2.
+    std::vector<ObjectSurfaceCandidate> atlas_consensus_best(cell_count);
+    for (const ObjectPairProposal& proposal : pair_proposals) {
+        const bool first_support = proposal.first_to_second.relation
+            == ReprojectionRelation::Support;
+        const bool second_support = proposal.second_to_first.relation
+            == ReprojectionRelation::Support;
+        const bool first_contradict = proposal.first_to_second.relation
+            == ReprojectionRelation::Contradict;
+        const bool second_contradict = proposal.second_to_first.relation
+            == ReprojectionRelation::Contradict;
+        if (first_support || second_support || first_contradict || second_contradict) {
+            continue;
+        }
+        ObjectSurfaceCandidate atlas_candidate = make_pair_candidate(proposal);
+        if (!atlas_candidate.valid
+            || atlas_candidate.logical_x < 0
+            || atlas_candidate.logical_x >= logical_width_
+            || atlas_candidate.logical_y < 0
+            || atlas_candidate.logical_y >= logical_height_
+            || support_count(atlas_candidate.view_mask) != 2) {
+            continue;
+        }
+        const std::size_t cell = static_cast<std::size_t>(atlas_candidate.logical_y)
+            * static_cast<std::size_t>(logical_width_)
+            + static_cast<std::size_t>(atlas_candidate.logical_x);
+        ObjectSurfaceCandidate& current = atlas_consensus_best[cell];
+        if (!current.valid || object_candidate_is_better(atlas_candidate, current)) {
+            current = std::move(atlas_candidate);
+        }
+    }
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (object_best[cell].valid || !atlas_consensus_best[cell].valid) {
+            continue;
+        }
+        object_best[cell] = std::move(atlas_consensus_best[cell]);
+    }
+
     std::vector<std::uint8_t> single_support_cells(cell_count, 0U);
     for (int view_index = 0; view_index < 3; ++view_index) {
         const auto& observations = object_observations_by_view[
