@@ -346,6 +346,174 @@ bool calculate_sim3(
     return std::isfinite(aligned_rms);
 }
 
+enum class ReprojectionRelation {
+    Support,
+    Occluded,
+    Contradict,
+    Outside,
+    Invalid,
+};
+
+struct ReprojectionResult {
+    ReprojectionRelation relation = ReprojectionRelation::Invalid;
+    float world_error = std::numeric_limits<float>::infinity();
+    float depth_error = std::numeric_limits<float>::infinity();
+    float pixel_x = 0.0f;
+    float pixel_y = 0.0f;
+};
+
+struct ReprojectionStats {
+    std::size_t atlas_pair = 0U;
+    std::size_t bidir_support = 0U;
+    std::size_t oneway_support = 0U;
+    std::size_t occluded = 0U;
+    std::size_t contradict = 0U;
+    std::size_t outside = 0U;
+    std::size_t invalid = 0U;
+};
+
+cv::Vec3f inverse_sim3_point(const Sim3& current_to_reference,
+    const cv::Vec3f& reference_point) {
+    if (!finite_vec(reference_point)
+        || !std::isfinite(current_to_reference.scale)
+        || current_to_reference.scale <= kNumericEpsilon) {
+        return cv::Vec3f(
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN(),
+            std::numeric_limits<float>::quiet_NaN());
+    }
+    return current_to_reference.rotation.t()
+        * (reference_point - current_to_reference.translation)
+        / current_to_reference.scale;
+}
+
+ReprojectionResult project_world_point_to_view(
+    const cv::Vec3f& point_reference,
+    const Sim3& current_to_reference,
+    const GroupWorldView& target_view,
+    const float world_tolerance,
+    const float depth_tolerance) {
+    ReprojectionResult result;
+    const cv::Vec3f point_current = inverse_sim3_point(
+        current_to_reference, point_reference);
+    if (!finite_vec(point_current) || !target_view.has_pose
+        || !finite_vec(target_view.translation)
+        || !finite_quaternion(target_view.quaternion)
+        || !std::isfinite(target_view.fov_h) || !std::isfinite(target_view.fov_w)
+        || target_view.fov_h <= 0.01f || target_view.fov_w <= 0.01f
+        || target_view.fov_h >= 3.13f || target_view.fov_w >= 3.13f
+        || target_view.world_points.empty()) {
+        return result;
+    }
+
+    cv::Matx33f rotation;
+    if (!rotation_from_quaternion(target_view.quaternion, rotation)) {
+        return result;
+    }
+    const cv::Vec3f camera_point = rotation * point_current + target_view.translation;
+    if (!finite_vec(camera_point) || camera_point[2] <= kNumericEpsilon) {
+        return result;
+    }
+
+    const float tan_half_fov_w = std::tan(0.5f * target_view.fov_w);
+    const float tan_half_fov_h = std::tan(0.5f * target_view.fov_h);
+    if (!std::isfinite(tan_half_fov_w) || !std::isfinite(tan_half_fov_h)
+        || tan_half_fov_w <= kNumericEpsilon || tan_half_fov_h <= kNumericEpsilon) {
+        return result;
+    }
+    const float width = static_cast<float>(target_view.world_points.cols);
+    const float height = static_cast<float>(target_view.world_points.rows);
+    const float fx = 0.5f * width / tan_half_fov_w;
+    const float fy = 0.5f * height / tan_half_fov_h;
+    const float cx = 0.5f * (width - 1.0f);
+    const float cy = 0.5f * (height - 1.0f);
+    result.pixel_x = fx * camera_point[0] / camera_point[2] + cx;
+    result.pixel_y = fy * camera_point[1] / camera_point[2] + cy;
+    if (!std::isfinite(result.pixel_x) || !std::isfinite(result.pixel_y)) {
+        return result;
+    }
+    if (result.pixel_x < 0.0f || result.pixel_x > width - 1.0f
+        || result.pixel_y < 0.0f || result.pixel_y > height - 1.0f) {
+        result.relation = ReprojectionRelation::Outside;
+        return result;
+    }
+
+    const int center_x = static_cast<int>(std::lround(result.pixel_x));
+    const int center_y = static_cast<int>(std::lround(result.pixel_y));
+    bool has_target_point = false;
+    bool all_target_points_are_closer = true;
+    bool has_support = false;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            const int x = center_x + dx;
+            const int y = center_y + dy;
+            if (x < 0 || y < 0 || x >= target_view.world_points.cols
+                || y >= target_view.world_points.rows) {
+                continue;
+            }
+            const cv::Vec3f target_point = target_view.world_points.at<cv::Vec3f>(y, x);
+            if (!finite_vec(target_point)) {
+                continue;
+            }
+            const float target_confidence =
+                target_view.world_confidence.at<float>(y, x);
+            if (!std::isfinite(target_confidence)) {
+                continue;
+            }
+            const cv::Vec3f target_camera_point =
+                rotation * target_point + target_view.translation;
+            if (!finite_vec(target_camera_point)
+                || target_camera_point[2] <= kNumericEpsilon) {
+                continue;
+            }
+            has_target_point = true;
+            const float world_error = vector_norm(target_point - point_current);
+            const float depth_error =
+                std::abs(target_camera_point[2] - camera_point[2]);
+            if (std::isfinite(world_error) && std::isfinite(depth_error)) {
+                result.world_error = std::min(result.world_error, world_error);
+                result.depth_error = std::min(result.depth_error, depth_error);
+                if (world_error <= world_tolerance && depth_error <= depth_tolerance) {
+                    has_support = true;
+                }
+            }
+            if (!(target_camera_point[2] < camera_point[2] - depth_tolerance)) {
+                all_target_points_are_closer = false;
+            }
+        }
+    }
+    if (has_support) {
+        result.relation = ReprojectionRelation::Support;
+    } else if (!has_target_point) {
+        result.relation = ReprojectionRelation::Invalid;
+    } else if (all_target_points_are_closer) {
+        result.relation = ReprojectionRelation::Occluded;
+    } else {
+        result.relation = ReprojectionRelation::Contradict;
+    }
+    return result;
+}
+
+void record_failed_reprojection(const ReprojectionRelation relation,
+    ReprojectionStats& stats) {
+    switch (relation) {
+    case ReprojectionRelation::Support:
+        break;
+    case ReprojectionRelation::Occluded:
+        ++stats.occluded;
+        break;
+    case ReprojectionRelation::Contradict:
+        ++stats.contradict;
+        break;
+    case ReprojectionRelation::Outside:
+        ++stats.outside;
+        break;
+    case ReprojectionRelation::Invalid:
+        ++stats.invalid;
+        break;
+    }
+}
+
 bool plane_from_three_points(
     const cv::Vec3f& first,
     const cv::Vec3f& second,
@@ -1672,12 +1840,20 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
 
     const float object_cross_view_height_tolerance = std::max(
         3.0f * floor_band_, 0.02f * scene_scale_);
+    const float reprojection_world_tolerance = std::max(
+        3.0f * floor_band_, 0.012f * scene_scale_);
+    const float reprojection_depth_tolerance = std::max(
+        3.0f * floor_band_, 0.015f * scene_scale_);
+
     std::vector<ObjectSurfaceCandidate> object_best(cell_count);
     std::array<std::vector<std::uint8_t>, 3> object_matched_by_view;
     for (int view_index = 0; view_index < 3; ++view_index) {
         object_matched_by_view[static_cast<std::size_t>(view_index)].assign(
             cell_count, 0U);
     }
+    std::vector<std::uint8_t> atlas_support2_cells(cell_count, 0U);
+    std::vector<std::uint8_t> atlas_support3_cells(cell_count, 0U);
+    ReprojectionStats reprojection_stats;
 
     const auto object_candidate_is_better = [](const ObjectSurfaceCandidate& candidate,
         const ObjectSurfaceCandidate& current) {
@@ -1760,12 +1936,28 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         object_matched_by_view[static_cast<std::size_t>(observation.view_id)][cell] = 1U;
     };
 
-    // Enumerate every unordered view pair. A third view is added only when
-    // it is in the intersection of both +/-1 neighborhoods and has a
-    // compatible floor-relative height. No camera is used as an owner.
+    const auto representative_reference_point = [&](const ViewObjectObservation& observation) {
+        return plane_origin_
+            + axis_x_ * observation.u
+            + axis_y_ * observation.v
+            + plane_normal_ * observation.height;
+    };
+
+    struct ObjectPairProposal {
+        int first_view = -1;
+        int second_view = -1;
+        const ViewObjectObservation* first = nullptr;
+        const ViewObjectObservation* second = nullptr;
+        ReprojectionResult first_to_second;
+        ReprojectionResult second_to_first;
+        bool bidirectional_support = false;
+    };
+
+    // Atlas proximity is only a proposal.  Each compatible observation pair
+    // is evaluated once in both directions against the target point head.
+    std::vector<ObjectPairProposal> pair_proposals;
     for (int first_view = 0; first_view < 3; ++first_view) {
         for (int second_view = first_view + 1; second_view < 3; ++second_view) {
-            const int third_view = 3 - first_view - second_view;
             for (const ViewObjectObservation& first : object_observations_by_view[
                     static_cast<std::size_t>(first_view)]) {
                 for (int dy = -1; dy <= 1; ++dy) {
@@ -1778,64 +1970,209 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                             continue;
                         }
 
-                        ObjectSurfaceCandidate pair;
-                        pair.valid = true;
-                        pair.logical_x = consensus_coordinate({
-                            first.logical_x, second->logical_x});
-                        pair.logical_y = consensus_coordinate({
-                            first.logical_y, second->logical_y});
-                        pair.view_mask = static_cast<std::uint8_t>(
-                            (static_cast<std::uint8_t>(1U) << first_view)
-                            | (static_cast<std::uint8_t>(1U) << second_view));
-                        pair.observations[static_cast<std::size_t>(first_view)] = first;
-                        pair.observations[static_cast<std::size_t>(second_view)] = *second;
-                        finalize_object_candidate(pair);
+                        ObjectPairProposal proposal;
+                        proposal.first_view = first_view;
+                        proposal.second_view = second_view;
+                        proposal.first = &first;
+                        proposal.second = second;
+                        proposal.first_to_second = project_world_point_to_view(
+                            representative_reference_point(first),
+                            transforms[static_cast<std::size_t>(first_view)],
+                            views[static_cast<std::size_t>(second_view)],
+                            reprojection_world_tolerance,
+                            reprojection_depth_tolerance);
+                        proposal.second_to_first = project_world_point_to_view(
+                            representative_reference_point(*second),
+                            transforms[static_cast<std::size_t>(second_view)],
+                            views[static_cast<std::size_t>(first_view)],
+                            reprojection_world_tolerance,
+                            reprojection_depth_tolerance);
+                        const bool first_support = proposal.first_to_second.relation
+                            == ReprojectionRelation::Support;
+                        const bool second_support = proposal.second_to_first.relation
+                            == ReprojectionRelation::Support;
+                        proposal.bidirectional_support = first_support && second_support;
+                        ++reprojection_stats.atlas_pair;
+                        if (proposal.bidirectional_support) {
+                            ++reprojection_stats.bidir_support;
+                        } else {
+                            if (first_support != second_support) {
+                                ++reprojection_stats.oneway_support;
+                            }
+                            record_failed_reprojection(
+                                proposal.first_to_second.relation, reprojection_stats);
+                            record_failed_reprojection(
+                                proposal.second_to_first.relation, reprojection_stats);
+                        }
+                        atlas_support2_cells[static_cast<std::size_t>(
+                            consensus_coordinate({first.logical_x, second->logical_x})
+                            + logical_width_ * consensus_coordinate({
+                                first.logical_y, second->logical_y}))] = 1U;
                         mark_object_matched(first);
                         mark_object_matched(*second);
-                        consider_object_candidate(std::move(pair));
-
-                        const int min_x = std::max(first.logical_x - 1, second->logical_x - 1);
-                        const int max_x = std::min(first.logical_x + 1, second->logical_x + 1);
-                        const int min_y = std::max(first.logical_y - 1, second->logical_y - 1);
-                        const int max_y = std::min(first.logical_y + 1, second->logical_y + 1);
-                        const ViewObjectObservation* best_third = nullptr;
-                        float best_height_delta = std::numeric_limits<float>::max();
-                        for (int third_y = min_y; third_y <= max_y; ++third_y) {
-                            for (int third_x = min_x; third_x <= max_x; ++third_x) {
-                                const ViewObjectObservation* third = find_object_observation(
-                                    third_view, third_x, third_y);
-                                if (third == nullptr) {
-                                    continue;
-                                }
-                                const float height_delta = std::abs(
-                                    third->height - pair.height);
-                                if (height_delta > object_cross_view_height_tolerance
-                                    || (best_third != nullptr
-                                        && (height_delta > best_height_delta
-                                            || (height_delta == best_height_delta
-                                                && third->weight <= best_third->weight)))) {
-                                    continue;
-                                }
-                                best_third = third;
-                                best_height_delta = height_delta;
-                            }
-                        }
-                        if (best_third != nullptr) {
-                            ObjectSurfaceCandidate triple = pair;
-                            triple.logical_x = -1;
-                            triple.logical_y = -1;
-                            triple.view_mask |= static_cast<std::uint8_t>(
-                                static_cast<std::uint8_t>(1U) << third_view);
-                            triple.observations[static_cast<std::size_t>(third_view)] = *best_third;
-                            finalize_object_candidate(triple);
-                            mark_object_matched(*best_third);
-                            consider_object_candidate(std::move(triple));
-                        }
+                        pair_proposals.push_back(std::move(proposal));
                     }
                 }
             }
         }
     }
+
+    const auto find_pair_proposal = [&](const int first_view,
+        const ViewObjectObservation& first, const int second_view,
+        const ViewObjectObservation& second) -> const ObjectPairProposal* {
+        const int low_view = std::min(first_view, second_view);
+        const int high_view = std::max(first_view, second_view);
+        const ViewObjectObservation* low_observation = first_view == low_view
+            ? &first : &second;
+        const ViewObjectObservation* high_observation = first_view == low_view
+            ? &second : &first;
+        for (const ObjectPairProposal& proposal : pair_proposals) {
+            if (proposal.first_view == low_view && proposal.second_view == high_view
+                && proposal.first != nullptr && proposal.second != nullptr
+                && proposal.first->logical_x == low_observation->logical_x
+                && proposal.first->logical_y == low_observation->logical_y
+                && proposal.second->logical_x == high_observation->logical_x
+                && proposal.second->logical_y == high_observation->logical_y) {
+                return &proposal;
+            }
+        }
+        return nullptr;
+    };
+
+    const auto make_pair_candidate = [](const ObjectPairProposal& proposal) {
+        ObjectSurfaceCandidate pair;
+        pair.valid = true;
+        pair.logical_x = consensus_coordinate({
+            proposal.first->logical_x, proposal.second->logical_x});
+        pair.logical_y = consensus_coordinate({
+            proposal.first->logical_y, proposal.second->logical_y});
+        pair.view_mask = static_cast<std::uint8_t>(
+            (static_cast<std::uint8_t>(1U) << proposal.first_view)
+            | (static_cast<std::uint8_t>(1U) << proposal.second_view));
+        pair.observations[static_cast<std::size_t>(proposal.first_view)] = *proposal.first;
+        pair.observations[static_cast<std::size_t>(proposal.second_view)] = *proposal.second;
+        finalize_object_candidate(pair);
+        return pair;
+    };
+
+    // A three-view candidate is accepted only when the base pair and at
+    // least one of its two edges to the third view are both bidirectional
+    // Support.  The pair is kept local until all third-view checks finish.
+    for (const ObjectPairProposal& proposal : pair_proposals) {
+        if (!proposal.bidirectional_support) {
+            continue;
+        }
+        ObjectSurfaceCandidate pair = make_pair_candidate(proposal);
+        const int third_view = 3 - proposal.first_view - proposal.second_view;
+        const int min_x = std::max(
+            proposal.first->logical_x - 1, proposal.second->logical_x - 1);
+        const int max_x = std::min(
+            proposal.first->logical_x + 1, proposal.second->logical_x + 1);
+        const int min_y = std::max(
+            proposal.first->logical_y - 1, proposal.second->logical_y - 1);
+        const int max_y = std::min(
+            proposal.first->logical_y + 1, proposal.second->logical_y + 1);
+        const ViewObjectObservation* best_third = nullptr;
+        int best_edge_count = 1;
+        float best_third_score = -std::numeric_limits<float>::infinity();
+        for (int third_y = min_y; third_y <= max_y; ++third_y) {
+            for (int third_x = min_x; third_x <= max_x; ++third_x) {
+                const ViewObjectObservation* third = find_object_observation(
+                    third_view, third_x, third_y);
+                if (third == nullptr
+                    || std::abs(third->height - pair.height)
+                        > object_cross_view_height_tolerance) {
+                    continue;
+                }
+                const ObjectPairProposal* first_third = find_pair_proposal(
+                    proposal.first_view, *proposal.first, third_view, *third);
+                const ObjectPairProposal* second_third = find_pair_proposal(
+                    proposal.second_view, *proposal.second, third_view, *third);
+                const int edge_count = 1
+                    + (first_third != nullptr && first_third->bidirectional_support ? 1 : 0)
+                    + (second_third != nullptr && second_third->bidirectional_support ? 1 : 0);
+                if (edge_count < 2) {
+                    continue;
+                }
+                const float third_score = third->weight
+                    + 0.001f * static_cast<float>(third->sample_count);
+                if (best_third == nullptr || edge_count > best_edge_count
+                    || (edge_count == best_edge_count && third_score > best_third_score)) {
+                    best_third = third;
+                    best_edge_count = edge_count;
+                    best_third_score = third_score;
+                }
+            }
+        }
+
+        if (best_third != nullptr) {
+            ObjectSurfaceCandidate triple = pair;
+            triple.logical_x = -1;
+            triple.logical_y = -1;
+            triple.view_mask |= static_cast<std::uint8_t>(
+                static_cast<std::uint8_t>(1U) << third_view);
+            triple.observations[static_cast<std::size_t>(third_view)] = *best_third;
+            finalize_object_candidate(triple);
+            const std::size_t triple_cell = static_cast<std::size_t>(triple.logical_y)
+                * static_cast<std::size_t>(logical_width_)
+                + static_cast<std::size_t>(triple.logical_x);
+            if (triple_cell < cell_count) {
+                atlas_support3_cells[triple_cell] = 1U;
+            }
+            mark_object_matched(*best_third);
+            consider_object_candidate(std::move(triple));
+        } else {
+            // No third view was needed to validate this strict pair.  The
+            // candidate is moved only after all optional third-view work.
+            consider_object_candidate(std::move(pair));
+        }
+    }
+
+    // Fallback candidates use the same pair proposals as the strict pass.
+    // Only a one-way reprojection Support paired with Occluded is accepted;
+    // all other relations remain rejected.  The fallback is kept separate
+    // from the strict result and can only fill cells that strict left empty.
+    std::vector<ObjectSurfaceCandidate> fallback_best(cell_count);
+    for (const ObjectPairProposal& proposal : pair_proposals) {
+        const bool first_support = proposal.first_to_second.relation
+            == ReprojectionRelation::Support;
+        const bool second_support = proposal.second_to_first.relation
+            == ReprojectionRelation::Support;
+        const bool first_occluded = proposal.first_to_second.relation
+            == ReprojectionRelation::Occluded;
+        const bool second_occluded = proposal.second_to_first.relation
+            == ReprojectionRelation::Occluded;
+        if (!((first_support && second_occluded)
+                || (second_support && first_occluded))) {
+            continue;
+        }
+        ObjectSurfaceCandidate fallback = make_pair_candidate(proposal);
+        if (!fallback.valid
+            || fallback.logical_x < 0 || fallback.logical_x >= logical_width_
+            || fallback.logical_y < 0 || fallback.logical_y >= logical_height_
+            || support_count(fallback.view_mask) != 2) {
+            continue;
+        }
+        const std::size_t cell = static_cast<std::size_t>(fallback.logical_y)
+            * static_cast<std::size_t>(logical_width_)
+            + static_cast<std::size_t>(fallback.logical_x);
+        if (cell >= cell_count || object_best[cell].valid) {
+            continue;
+        }
+        ObjectSurfaceCandidate& current = fallback_best[cell];
+        if (!current.valid || object_candidate_is_better(fallback, current)) {
+            current = std::move(fallback);
+        }
+    }
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (object_best[cell].valid || !fallback_best[cell].valid) {
+            continue;
+        }
+        object_best[cell] = std::move(fallback_best[cell]);
+    }
+
+    // The fallback above is pair-supported, so the existing single-support
+    // height-neighbour rejection below is inert for candidates it creates.
 
     std::vector<std::uint8_t> single_support_cells(cell_count, 0U);
     for (int view_index = 0; view_index < 3; ++view_index) {
@@ -1851,27 +2188,31 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             }
         }
     }
-    const std::size_t object_support1 = static_cast<std::size_t>(std::count(
+    const std::size_t atlas_support1 = static_cast<std::size_t>(std::count(
         single_support_cells.begin(), single_support_cells.end(), static_cast<std::uint8_t>(1U)));
-    std::size_t object_support2 = 0U;
-    std::size_t object_support3 = 0U;
+    const std::size_t atlas_support2 = static_cast<std::size_t>(std::count(
+        atlas_support2_cells.begin(), atlas_support2_cells.end(), static_cast<std::uint8_t>(1U)));
+    const std::size_t atlas_support3 = static_cast<std::size_t>(std::count(
+        atlas_support3_cells.begin(), atlas_support3_cells.end(), static_cast<std::uint8_t>(1U)));
+    std::size_t reprojection_support2 = 0U;
+    std::size_t reprojection_support3 = 0U;
     for (const ObjectSurfaceCandidate& candidate : object_best) {
         if (!candidate.valid) {
             continue;
         }
         if (support_count(candidate.view_mask) == 2) {
-            ++object_support2;
+            ++reprojection_support2;
         } else if (support_count(candidate.view_mask) == 3) {
-            ++object_support3;
+            ++reprojection_support3;
         }
     }
 
-    // Connected components run after cross-view matching. The existing
-    // minimum of eight logical cells is retained; support-1 observations are
-    // never put into this occupancy map in the first place.
+    // Connected components run after cross-view matching and the reprojection-
+    // aware fallback. The existing minimum of eight logical cells is retained
+    // to reject isolated noise.
     cv::Mat occupancy(logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
-        if (object_best[cell].valid && support_count(object_best[cell].view_mask) >= 2) {
+        if (object_best[cell].valid) {
             const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
             const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
             occupancy.at<std::uint8_t>(y, x) = 255U;
@@ -1894,11 +2235,47 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
+    const float height_neighbor_threshold = std::max(
+        4.0f * floor_band_, 0.03f * scene_scale_);
+    for (int y = 0; y < logical_height_; ++y) {
+        for (int x = 0; x < logical_width_; ++x) {
+            const std::size_t cell = static_cast<std::size_t>(y) * logical_width_ + x;
+            if (!object_best[cell].valid
+                || support_count(object_best[cell].view_mask) != 1) {
+                continue;
+            }
+            std::vector<float> neighbor_heights;
+            neighbor_heights.reserve(8U);
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const int nx = x + dx;
+                    const int ny = y + dy;
+                    if (nx < 0 || nx >= logical_width_ || ny < 0 || ny >= logical_height_) {
+                        continue;
+                    }
+                    const std::size_t neighbor_cell =
+                        static_cast<std::size_t>(ny) * logical_width_ + nx;
+                    if (object_best[neighbor_cell].valid) {
+                        neighbor_heights.push_back(object_best[neighbor_cell].height);
+                    }
+                }
+            }
+            if (!neighbor_heights.empty()
+                && std::abs(object_best[cell].height
+                    - median_value(std::move(neighbor_heights))) > height_neighbor_threshold) {
+                object_best[cell].valid = false;
+            }
+        }
+    }
+
     std::vector<float> final_object_heights;
     std::size_t object_final = 0U;
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
         const ObjectSurfaceCandidate& candidate = object_best[cell];
-        if (!candidate.valid || support_count(candidate.view_mask) < 2) {
+        if (!candidate.valid) {
             continue;
         }
         const std::uint32_t slot_id = slot_for(candidate.logical_x, candidate.logical_y, 1);
@@ -1956,14 +2333,26 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             floor_cell_valid_.begin(), floor_cell_valid_.end(), static_cast<std::uint8_t>(1U)));
         std::clog << "[INFO] world_fusion_stats: floor_cells=" << floor_cell_count
                   << " object_pre_consistency=" << object_pre_consistency
-                  << " object_support1=" << object_support1
-                  << " object_support2=" << object_support2
-                  << " object_support3=" << object_support3
+                  << " object_support1=" << atlas_support1
+                  << " atlas_support2=" << atlas_support2
+                  << " atlas_support3=" << atlas_support3
+                  << " reprojection_support2=" << reprojection_support2
+                  << " reprojection_support3=" << reprojection_support3
                   << " object_final=" << object_final
                   << " object_h50=" << object_h50
                   << " object_h90=" << object_h90
                   << " object_h99=" << object_h99
-                  << '\n';
+                  << std::endl;
+        std::clog << "[INFO] world_reprojection_stats: atlas_pair="
+                  << reprojection_stats.atlas_pair
+                  << " bidir_support=" << reprojection_stats.bidir_support
+                  << " oneway_support=" << reprojection_stats.oneway_support
+                  << " occluded=" << reprojection_stats.occluded
+                  << " contradict=" << reprojection_stats.contradict
+                  << " outside=" << reprojection_stats.outside
+                  << " invalid=" << reprojection_stats.invalid
+                  << " object_final=" << object_final
+                  << std::endl;
     }
 
     result.accepted = true;
