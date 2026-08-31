@@ -1,5 +1,8 @@
 #include "group_world_fusion.hpp"
 
+#if defined(_WIN32)
+#include <opencv2/imgcodecs.hpp>
+#endif
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
@@ -1322,6 +1325,16 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         transforms = {current_to_reference, current_to_reference, current_to_reference};
     }
 
+    std::array<cv::Vec3f, 3> reference_camera_centers{};
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        reference_camera_centers[static_cast<std::size_t>(view_index)] = apply_sim3(
+            transforms[static_cast<std::size_t>(view_index)],
+            current_centers[static_cast<std::size_t>(view_index)]);
+        if (!finite_vec(reference_camera_centers[static_cast<std::size_t>(view_index)])) {
+            return reject("reference-frame camera center is invalid");
+        }
+    }
+
     result.scene_scale = scene_scale_;
     result.floor_band = floor_band_;
     const std::size_t cell_count = static_cast<std::size_t>(logical_width_)
@@ -2633,26 +2646,39 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
-    // F3 geometry has an occlusion explanation but no directly visible floor
-    // RGB. Propagate colour only from current-group observed floor cells, and only
-    // through F3 cells that already passed the geometry gate. This is a
-    // texture approximation; it never creates new geometry candidates.
-    std::vector<int> f3_color_source(cell_count, -1);
-    std::vector<std::size_t> f3_color_queue;
-    f3_color_queue.reserve(cell_count);
+    // Completion geometry is already accepted above. Texture lookup is a
+    // separate pass: find the nearest observed floor source over the entire
+    // logical grid, without using the lookup to create geometry.
+    std::vector<int> nearest_floor_source(cell_count, -1);
+    std::vector<std::size_t> nearest_floor_queue;
+    nearest_floor_queue.reserve(cell_count);
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
-        if (current_observed_floor_mask[cell] == 0U) {
+        if (current_observed_floor_mask[cell] == 0U
+            || floor_cell_valid_[cell] == 0U) {
             continue;
         }
         const auto channels = unpack_rgba(floor_cells_[cell].rgba);
         if (channels[0] == 0U && channels[1] == 0U && channels[2] == 0U) {
             continue;
         }
-        f3_color_source[cell] = static_cast<int>(cell);
-        f3_color_queue.push_back(cell);
+        nearest_floor_source[cell] = static_cast<int>(cell);
+        nearest_floor_queue.push_back(cell);
     }
-    for (std::size_t queue_index = 0U; queue_index < f3_color_queue.size(); ++queue_index) {
-        const std::size_t cell = f3_color_queue[queue_index];
+    if (nearest_floor_queue.empty()) {
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            if (floor_cell_valid_[cell] == 0U) {
+                continue;
+            }
+            const auto channels = unpack_rgba(floor_cells_[cell].rgba);
+            if (channels[0] == 0U && channels[1] == 0U && channels[2] == 0U) {
+                continue;
+            }
+            nearest_floor_source[cell] = static_cast<int>(cell);
+            nearest_floor_queue.push_back(cell);
+        }
+    }
+    for (std::size_t queue_index = 0U; queue_index < nearest_floor_queue.size(); ++queue_index) {
+        const std::size_t cell = nearest_floor_queue[queue_index];
         const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
         const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
         for (int dy = -1; dy <= 1; ++dy) {
@@ -2667,12 +2693,11 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 }
                 const std::size_t neighbor =
                     static_cast<std::size_t>(ny) * logical_width_ + nx;
-                if (floor_completion_tier[neighbor] != 3U
-                    || f3_color_source[neighbor] >= 0) {
+                if (nearest_floor_source[neighbor] >= 0) {
                     continue;
                 }
-                f3_color_source[neighbor] = f3_color_source[cell];
-                f3_color_queue.push_back(neighbor);
+                nearest_floor_source[neighbor] = nearest_floor_source[cell];
+                nearest_floor_queue.push_back(neighbor);
             }
         }
     }
@@ -2683,6 +2708,8 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     std::size_t completion_f1_added = 0U;
     std::size_t completion_f2_added = 0U;
     std::size_t completion_f3_added = 0U;
+    std::size_t completion_geometry_without_direct_rgb = 0U;
+    std::size_t completion_geometry_dropped_due_rgb = 0U;
 #endif
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
         const std::uint8_t tier = floor_completion_tier[cell];
@@ -2691,20 +2718,29 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
         std::uint32_t rgba = 0U;
         float confidence = 0.0f;
+        const bool has_direct_color = (tier == 1U || tier == 2U)
+            && floor_completion_color_valid[cell] != 0U;
         if (tier == 1U || tier == 2U) {
-            if (floor_completion_color_valid[cell] == 0U) {
-                continue;
+            if (has_direct_color) {
+                rgba = color_to_rgba(floor_completion_colors[cell]);
+                confidence = floor_completion_confidences[cell];
+            } else if (nearest_floor_source[cell] >= 0) {
+                const std::size_t source = static_cast<std::size_t>(nearest_floor_source[cell]);
+                rgba = floor_cells_[source].rgba;
+                confidence = floor_cells_[source].confidence;
             }
-            rgba = color_to_rgba(floor_completion_colors[cell]);
-            confidence = floor_completion_confidences[cell];
         } else {
-            const int source = f3_color_source[cell];
-            if (source < 0) {
-                continue;
+            if (nearest_floor_source[cell] >= 0) {
+                const std::size_t source = static_cast<std::size_t>(nearest_floor_source[cell]);
+                rgba = floor_cells_[source].rgba;
+                confidence = floor_cells_[source].confidence;
             }
-            rgba = floor_cells_[static_cast<std::size_t>(source)].rgba;
-            confidence = floor_cells_[static_cast<std::size_t>(source)].confidence;
         }
+#if defined(_WIN32)
+        if (!has_direct_color) {
+            ++completion_geometry_without_direct_rgb;
+        }
+#endif
         const int logical_x = static_cast<int>(
             cell % static_cast<std::size_t>(logical_width_));
         const int logical_y = static_cast<int>(
@@ -2769,6 +2805,365 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << " rejected_outside_invalid="
                   << completion_rejected_outside_invalid
                   << " rejected_gate=" << completion_rejected_gate << std::endl;
+    }
+#endif
+
+    struct RayPlaneCellSupport {
+        std::array<std::size_t, 3> support_pixels{};
+        std::array<std::size_t, 3> contradict_pixels{};
+        std::array<cv::Vec3f, 3> direct_floor_color_sum{};
+        std::array<float, 3> direct_floor_color_weight{};
+        std::array<float, 3> direct_floor_confidence_sum{};
+    };
+    std::vector<RayPlaneCellSupport> ray_plane_support(cell_count);
+#if defined(_WIN32)
+    std::size_t ray_valid_pixels = 0U;
+    std::size_t ray_plane_intersections = 0U;
+    std::size_t ray_physical_gate_rejected = 0U;
+    std::size_t ray_intersections_outside_atlas = 0U;
+    std::size_t ray_support_pixels = 0U;
+    std::size_t ray_contradict_pixels = 0U;
+#endif
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        const GroupWorldView& view = views[static_cast<std::size_t>(view_index)];
+        const cv::Mat& aligned_points = aligned_world_points[static_cast<std::size_t>(view_index)];
+        const cv::Vec3f camera = reference_camera_centers[static_cast<std::size_t>(view_index)];
+        for (int y = 0; y < view.world_points.rows; ++y) {
+            for (int x = 0; x < view.world_points.cols; ++x) {
+                const cv::Vec3f point = aligned_points.at<cv::Vec3f>(y, x);
+                if (!finite_vec(point) || !finite_vec(camera)) {
+                    continue;
+                }
+                const cv::Vec3f ray = point - camera;
+                const float ray_length = vector_norm(ray);
+                if (!std::isfinite(ray_length) || ray_length <= kNumericEpsilon) {
+                    continue;
+                }
+#if defined(_WIN32)
+                ++ray_valid_pixels;
+#endif
+                const float denominator = plane_normal_.dot(ray);
+                const float numerator = plane_normal_.dot(plane_origin_ - camera);
+                if (!std::isfinite(denominator) || !std::isfinite(numerator)
+                    || std::abs(denominator) <= kNumericEpsilon) {
+                    continue;
+                }
+                const float t_plane = numerator / denominator;
+                if (!std::isfinite(t_plane) || t_plane <= 0.0f) {
+                    continue;
+                }
+                const cv::Vec3f plane_point = camera + ray * t_plane;
+                if (!finite_vec(plane_point)) {
+                    continue;
+                }
+#if defined(_WIN32)
+                ++ray_plane_intersections;
+#endif
+                const cv::Vec3f point_delta = point - plane_origin_;
+                const float height = plane_normal_.dot(point_delta);
+                if (!std::isfinite(height)
+                    || height < -2.5f * floor_band_
+                    || height >= max_object_height_) {
+#if defined(_WIN32)
+                    ++ray_physical_gate_rejected;
+#endif
+                    continue;
+                }
+                const cv::Vec3f plane_delta = plane_point - plane_origin_;
+                const float plane_u = axis_x_.dot(plane_delta);
+                const float plane_v = axis_y_.dot(plane_delta);
+                int logical_x = 0;
+                int logical_y = 0;
+                if (!world_to_cell(plane_u, plane_v, logical_x, logical_y)) {
+#if defined(_WIN32)
+                    ++ray_intersections_outside_atlas;
+#endif
+                    continue;
+                }
+                const float observed_distance = vector_norm(point - camera);
+                const float plane_distance = vector_norm(plane_point - camera);
+                if (!std::isfinite(observed_distance) || !std::isfinite(plane_distance)) {
+                    continue;
+                }
+                const std::size_t cell = static_cast<std::size_t>(logical_y)
+                    * static_cast<std::size_t>(logical_width_)
+                    + static_cast<std::size_t>(logical_x);
+                RayPlaneCellSupport& support = ray_plane_support[cell];
+                const bool is_support = plane_distance
+                    >= observed_distance - reprojection_depth_tolerance;
+                if (is_support) {
+                    ++support.support_pixels[static_cast<std::size_t>(view_index)];
+#if defined(_WIN32)
+                    ++ray_support_pixels;
+#endif
+                } else {
+                    ++support.contradict_pixels[static_cast<std::size_t>(view_index)];
+#if defined(_WIN32)
+                    ++ray_contradict_pixels;
+#endif
+                    continue;
+                }
+
+                const float confidence = view.world_confidence.at<float>(y, x);
+                const cv::Vec3f sample_color = view.rgb.at<cv::Vec3f>(y, x);
+                if (std::abs(height) <= 2.5f * floor_band_
+                    && std::isfinite(confidence) && finite_vec(sample_color)) {
+                    const ConfidenceStats& confidence_range =
+                        confidence_stats[static_cast<std::size_t>(view_index)];
+                    const float normalized = normalized_confidence(
+                        confidence, confidence_range.q10, confidence_range.q90);
+                    const float weight = std::max(
+                        normalized * border_weight(
+                            x, y, view.rgb.cols, view.rgb.rows),
+                        1e-4f);
+                    const auto& gain = color_gain_[static_cast<std::size_t>(view_index)];
+                    const cv::Vec3f corrected(
+                        std::clamp(sample_color[0] * gain[0], 0.0f, 1.0f),
+                        std::clamp(sample_color[1] * gain[1], 0.0f, 1.0f),
+                        std::clamp(sample_color[2] * gain[2], 0.0f, 1.0f));
+                    if (finite_vec(corrected)) {
+                        support.direct_floor_color_sum[static_cast<std::size_t>(view_index)]
+                            += corrected * weight;
+                        support.direct_floor_color_weight[static_cast<std::size_t>(view_index)]
+                            += weight;
+                        support.direct_floor_confidence_sum[static_cast<std::size_t>(view_index)]
+                            += normalized * weight;
+                    }
+                }
+            }
+        }
+    }
+
+#if defined(_WIN32)
+    if (accepted_fuse_count_ == 0U) {
+        std::array<std::size_t, 3> ray_support_cells{};
+        std::size_t ray_support_cells_overlap_observed_floor = 0U;
+        std::size_t ray_support_cells_empty = 0U;
+        std::array<std::size_t, 4> empty_support_view_counts{};
+        std::size_t ray_r1_candidates = 0U;
+        std::size_t ray_r2_candidates = 0U;
+        cv::Mat support_views2_mask(logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+        cv::Mat ray_candidates_mask(logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+        for (int y = 0; y < logical_height_; ++y) {
+            for (int x = 0; x < logical_width_; ++x) {
+                const std::size_t cell = static_cast<std::size_t>(y)
+                    * static_cast<std::size_t>(logical_width_)
+                    + static_cast<std::size_t>(x);
+                const RayPlaneCellSupport& support = ray_plane_support[cell];
+                std::size_t support_views = 0U;
+                std::size_t contradict_views = 0U;
+                for (int view_index = 0; view_index < 3; ++view_index) {
+                    const std::size_t view = static_cast<std::size_t>(view_index);
+                    if (support.support_pixels[view] > support.contradict_pixels[view]
+                        && support.support_pixels[view] > 0U) {
+                        ++support_views;
+                        ++ray_support_cells[view];
+                    } else if (support.contradict_pixels[view]
+                        > support.support_pixels[view]
+                        && support.contradict_pixels[view] > 0U) {
+                        ++contradict_views;
+                    }
+                }
+                if (support_views >= 2U) {
+                    support_views2_mask.at<std::uint8_t>(y, x) = 255U;
+                }
+                if (support_views > 0U && current_observed_floor_mask[cell] != 0U) {
+                    ++ray_support_cells_overlap_observed_floor;
+                }
+                if (support_views > 0U && floor_cell_valid_[cell] == 0U) {
+                    ++ray_support_cells_empty;
+                }
+                if (floor_cell_valid_[cell] != 0U) {
+                    continue;
+                }
+                ++empty_support_view_counts[std::min<std::size_t>(support_views, 3U)];
+                const bool interior_hole = exterior_empty[cell] == 0U;
+                const bool no_contradiction = contradict_views == 0U;
+                const bool r1 = no_contradiction && support_views >= 2U;
+                const bool r2 = no_contradiction && support_views == 1U
+                    && (final_object_mask[cell] != 0U || interior_hole);
+                if (r1) {
+                    ++ray_r1_candidates;
+                }
+                if (r2) {
+                    ++ray_r2_candidates;
+                }
+                if (r1 || r2) {
+                    ray_candidates_mask.at<std::uint8_t>(y, x) = 255U;
+                }
+            }
+        }
+        cv::Mat support_views2_visual;
+        cv::Mat ray_candidates_visual;
+        cv::resize(support_views2_mask, support_views2_visual,
+            cv::Size(canvas_width_, canvas_height_), 0.0, 0.0, cv::INTER_NEAREST);
+        cv::resize(ray_candidates_mask, ray_candidates_visual,
+            cv::Size(canvas_width_, canvas_height_), 0.0, 0.0, cv::INTER_NEAREST);
+        try {
+            cv::imwrite("tmp/ray_plane_support_views2.png", support_views2_visual);
+            cv::imwrite("tmp/ray_plane_R1_R2_candidates.png", ray_candidates_visual);
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_RAY_PLANE_MASK] write_failed=1" << std::endl;
+        }
+        std::clog << "[WINDOWS_RAY_PLANE_DIAG] valid_ray_pixels="
+                  << ray_valid_pixels
+                  << " plane_intersections=" << ray_plane_intersections
+                  << " physical_gate_rejected=" << ray_physical_gate_rejected
+                  << " support_pixels=" << ray_support_pixels
+                  << " contradict_pixels=" << ray_contradict_pixels
+                  << " intersections_outside_atlas="
+                  << ray_intersections_outside_atlas << std::endl;
+        std::clog << "[WINDOWS_RAY_PLANE_CELLS] support_view0=" << ray_support_cells[0]
+                  << " support_view1=" << ray_support_cells[1]
+                  << " support_view2=" << ray_support_cells[2]
+                  << " overlap_observed_floor="
+                  << ray_support_cells_overlap_observed_floor
+                  << " support_empty=" << ray_support_cells_empty << std::endl;
+        std::clog << "[WINDOWS_RAY_PLANE_EMPTY] support_views0="
+                  << empty_support_view_counts[0]
+                  << " support_views1=" << empty_support_view_counts[1]
+                  << " support_views2=" << empty_support_view_counts[2]
+                  << " support_views3=" << empty_support_view_counts[3] << std::endl;
+        std::clog << "[WINDOWS_RAY_PLANE_CANDIDATES] R1=" << ray_r1_candidates
+                  << " R2=" << ray_r2_candidates << std::endl;
+    }
+#endif
+
+    std::vector<std::uint8_t> ray_completion_tier(cell_count, 0U);
+    std::vector<cv::Vec3f> ray_completion_colors(
+        cell_count, cv::Vec3f(0.0f, 0.0f, 0.0f));
+    std::vector<float> ray_completion_confidences(cell_count, 0.0f);
+    std::vector<std::uint8_t> ray_completion_color_valid(cell_count, 0U);
+    std::size_t ray_r1_candidate_count = 0U;
+    std::size_t ray_r2_candidate_count = 0U;
+    for (int y = 0; y < logical_height_; ++y) {
+        for (int x = 0; x < logical_width_; ++x) {
+            const std::size_t cell = static_cast<std::size_t>(y)
+                * static_cast<std::size_t>(logical_width_)
+                + static_cast<std::size_t>(x);
+            if (floor_cell_valid_[cell] != 0U) {
+                continue;
+            }
+            const RayPlaneCellSupport& support = ray_plane_support[cell];
+            std::size_t support_views = 0U;
+            std::size_t contradict_views = 0U;
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                const std::size_t view = static_cast<std::size_t>(view_index);
+                if (support.support_pixels[view] > support.contradict_pixels[view]
+                    && support.support_pixels[view] > 0U) {
+                    ++support_views;
+                } else if (support.contradict_pixels[view]
+                    > support.support_pixels[view]
+                    && support.contradict_pixels[view] > 0U) {
+                    ++contradict_views;
+                }
+            }
+            const bool no_contradiction = contradict_views == 0U;
+            const bool interior_hole = exterior_empty[cell] == 0U;
+            const bool r1 = no_contradiction && support_views >= 2U;
+            const bool r2 = no_contradiction && support_views == 1U
+                && (final_object_mask[cell] != 0U || interior_hole);
+            if (r1) {
+                ray_completion_tier[cell] = 1U;
+                ++ray_r1_candidate_count;
+            } else if (r2) {
+                ray_completion_tier[cell] = 2U;
+                ++ray_r2_candidate_count;
+            } else {
+                continue;
+            }
+
+            cv::Vec3f color(0.0f, 0.0f, 0.0f);
+            float color_weight = 0.0f;
+            float confidence_weight = 0.0f;
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                const std::size_t view = static_cast<std::size_t>(view_index);
+                if (!(support.support_pixels[view] > support.contradict_pixels[view]
+                    && support.support_pixels[view] > 0U)) {
+                    continue;
+                }
+                const float weight = support.direct_floor_color_weight[view];
+                if (!std::isfinite(weight) || weight <= kNumericEpsilon) {
+                    continue;
+                }
+                color += support.direct_floor_color_sum[view];
+                color_weight += weight;
+                confidence_weight += support.direct_floor_confidence_sum[view];
+            }
+            if (color_weight > kNumericEpsilon && finite_vec(color)) {
+                ray_completion_colors[cell] = color * (1.0f / color_weight);
+                ray_completion_confidences[cell] = std::clamp(
+                    confidence_weight / color_weight, 0.0f, 1.0f);
+                ray_completion_color_valid[cell] = 1U;
+            }
+        }
+    }
+
+    std::size_t ray_r1_added = 0U;
+    std::size_t ray_r2_added = 0U;
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        const std::uint8_t tier = ray_completion_tier[cell];
+        if (tier == 0U || floor_cell_valid_[cell] != 0U) {
+            continue;
+        }
+        std::uint32_t rgba = 0U;
+        float confidence = 0.0f;
+        const bool has_direct_color = ray_completion_color_valid[cell] != 0U;
+        if (has_direct_color) {
+            rgba = color_to_rgba(ray_completion_colors[cell]);
+            confidence = ray_completion_confidences[cell];
+        } else if (nearest_floor_source[cell] >= 0) {
+            const std::size_t source = static_cast<std::size_t>(nearest_floor_source[cell]);
+            rgba = floor_cells_[source].rgba;
+            confidence = floor_cells_[source].confidence;
+        }
+#if defined(_WIN32)
+        if (!has_direct_color) {
+            ++completion_geometry_without_direct_rgb;
+        }
+#endif
+        const int logical_x = static_cast<int>(
+            cell % static_cast<std::size_t>(logical_width_));
+        const int logical_y = static_cast<int>(
+            cell / static_cast<std::size_t>(logical_width_));
+        const std::uint32_t slot_id = slot_for(logical_x, logical_y, 0);
+        if (slot_id == std::numeric_limits<std::uint32_t>::max()) {
+            continue;
+        }
+        FusedSlot next = floor_cells_[cell];
+        next.slot_id = slot_id;
+        next.depth = 0.0f;
+        next.confidence = confidence;
+        next.rgba = rgba;
+        next.floor = true;
+        floor_cells_[cell] = next;
+        floor_cell_valid_[cell] = 1U;
+        result.slots.push_back(next);
+        result.occupied_slots.push_back(slot_id);
+        if (tier == 1U) {
+            ++ray_r1_added;
+        } else {
+            ++ray_r2_added;
+        }
+    }
+#if defined(_WIN32)
+    if (accepted_fuse_count_ == 0U) {
+        std::size_t remaining_interior_holes = 0U;
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            if (floor_cell_valid_[cell] == 0U && exterior_empty[cell] == 0U) {
+                ++remaining_interior_holes;
+            }
+        }
+        std::clog << "[WINDOWS_RAY_PLANE_RESULT] R1_candidates="
+                  << ray_r1_candidate_count
+                  << " R1_added=" << ray_r1_added
+                  << " R2_candidates=" << ray_r2_candidate_count
+                  << " R2_added=" << ray_r2_added
+                  << " remaining_interior_holes=" << remaining_interior_holes
+                  << " geometry_without_direct_rgb="
+                  << completion_geometry_without_direct_rgb
+                  << " geometry_dropped_due_rgb="
+                  << completion_geometry_dropped_due_rgb << std::endl;
     }
 #endif
 
