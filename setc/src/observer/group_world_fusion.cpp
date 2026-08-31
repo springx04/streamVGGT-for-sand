@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -2196,6 +2197,13 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     // single-view curtain look like a supported surface.
     std::array<std::vector<ViewObjectObservation>, 3> object_observations_by_view;
     std::array<std::vector<int>, 3> object_observation_index_by_view;
+#if defined(_WIN32)
+    std::array<cv::Mat, 3> object_raw_masks;
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        object_raw_masks[static_cast<std::size_t>(view_index)] = cv::Mat(
+            logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+    }
+#endif
     std::size_t object_pre_consistency = 0U;
     for (int view_index = 0; view_index < 3; ++view_index) {
         object_observation_index_by_view[static_cast<std::size_t>(view_index)].assign(
@@ -2249,6 +2257,11 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             object_observation_index_by_view[static_cast<std::size_t>(view_index)][cell] =
                 static_cast<int>(observations.size());
             observations.push_back(std::move(observation));
+#if defined(_WIN32)
+            object_raw_masks[static_cast<std::size_t>(view_index)].at<std::uint8_t>(
+                static_cast<int>(cell / static_cast<std::size_t>(logical_width_)),
+                static_cast<int>(cell % static_cast<std::size_t>(logical_width_))) = 255U;
+#endif
             ++object_pre_consistency;
         }
     }
@@ -2713,8 +2726,200 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
+    // Keep the post-component Tier1/2/3 result as the only trusted seed set.
+    // Tier4 candidates may touch this snapshot, but they must never use one
+    // another as a seed while the connected components are being expanded.
+    std::vector<std::uint8_t> trusted_object_seed_mask(cell_count, 0U);
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (object_best[cell].valid) {
+            trusted_object_seed_mask[cell] = 1U;
+        }
+    }
+
     const float height_neighbor_threshold = std::max(
         4.0f * floor_band_, 0.03f * scene_scale_);
+    std::array<cv::Mat, 3> tier4_raw_masks;
+    for (int source_view = 0; source_view < 3; ++source_view) {
+        tier4_raw_masks[static_cast<std::size_t>(source_view)] = cv::Mat(
+            logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+    }
+    std::vector<ObjectSurfaceCandidate> tier4_best(cell_count);
+#if defined(_WIN32)
+    std::size_t tier4_rejected_contradict = 0U;
+    std::size_t tier4_rejected_no_other_view_relation = 0U;
+    std::array<std::size_t, 3> tier4_component_counts{};
+    std::array<std::size_t, 3> tier4_touching_component_counts{};
+    std::size_t tier4_rejected_disconnected = 0U;
+    std::size_t tier4_accepted_before_height_neighbor = 0U;
+#endif
+
+    const auto make_tier4_candidate = [&](const int source_view,
+        const int logical_x, const int logical_y) {
+        ObjectSurfaceCandidate candidate;
+        const ViewObjectObservation* observation = find_object_observation(
+            source_view, logical_x, logical_y);
+        if (observation == nullptr) {
+            return candidate;
+        }
+        candidate.valid = true;
+        candidate.logical_x = logical_x;
+        candidate.logical_y = logical_y;
+        candidate.view_mask = static_cast<std::uint8_t>(1U) << source_view;
+        candidate.observations[static_cast<std::size_t>(source_view)] = *observation;
+        finalize_object_candidate(candidate);
+        return candidate;
+    };
+
+    // Construct raw Tier4 candidates only from observations that survived the
+    // existing per-view object classifier. The two other views provide the
+    // unchanged reprojection gate; this is not a new view matcher.
+    for (int source_view = 0; source_view < 3; ++source_view) {
+        const auto& observations = object_observations_by_view[
+            static_cast<std::size_t>(source_view)];
+        for (const ViewObjectObservation& observation : observations) {
+            const std::size_t cell = static_cast<std::size_t>(observation.logical_y)
+                * static_cast<std::size_t>(logical_width_)
+                + static_cast<std::size_t>(observation.logical_x);
+            if (cell >= cell_count || object_best[cell].valid) {
+                continue;
+            }
+            const cv::Vec3f point_reference = representative_reference_point(observation);
+            bool has_other_view_relation = false;
+            bool has_contradict = false;
+            for (int target_view = 0; target_view < 3; ++target_view) {
+                if (target_view == source_view) {
+                    continue;
+                }
+                const ReprojectionResult reprojection = project_world_point_to_view(
+                    point_reference,
+                    transforms[static_cast<std::size_t>(source_view)],
+                    views[static_cast<std::size_t>(target_view)],
+                    reprojection_world_tolerance,
+                    reprojection_depth_tolerance);
+                if (reprojection.relation == ReprojectionRelation::Contradict) {
+                    has_contradict = true;
+                } else if (reprojection.relation == ReprojectionRelation::Support
+                    || reprojection.relation == ReprojectionRelation::Occluded) {
+                    has_other_view_relation = true;
+                }
+            }
+            if (has_contradict) {
+#if defined(_WIN32)
+                ++tier4_rejected_contradict;
+#endif
+                continue;
+            }
+            if (!has_other_view_relation) {
+#if defined(_WIN32)
+                ++tier4_rejected_no_other_view_relation;
+#endif
+                continue;
+            }
+            tier4_raw_masks[static_cast<std::size_t>(source_view)].at<std::uint8_t>(
+                observation.logical_y, observation.logical_x) = 255U;
+        }
+    }
+
+    // Evaluate each source-view mask independently. A component is trusted
+    // only if one of its cells is 8-neighbor adjacent to the frozen seed set
+    // and the contact height passes the existing height-neighbor threshold.
+    for (int source_view = 0; source_view < 3; ++source_view) {
+        cv::Mat labels;
+        cv::Mat stats;
+        cv::Mat centroids;
+        const int component_count = cv::connectedComponentsWithStats(
+            tier4_raw_masks[static_cast<std::size_t>(source_view)],
+            labels, stats, centroids, 8, CV_32S);
+#if defined(_WIN32)
+        tier4_component_counts[static_cast<std::size_t>(source_view)] =
+            component_count > 0 ? static_cast<std::size_t>(component_count - 1) : 0U;
+#endif
+        for (int component = 1; component < component_count; ++component) {
+            bool touches_trusted_seed = false;
+            for (int y = 0; y < logical_height_ && !touches_trusted_seed; ++y) {
+                for (int x = 0; x < logical_width_ && !touches_trusted_seed; ++x) {
+                    if (labels.at<int>(y, x) != component) {
+                        continue;
+                    }
+                    const ViewObjectObservation* observation = find_object_observation(
+                        source_view, x, y);
+                    if (observation == nullptr) {
+                        continue;
+                    }
+                    for (int dy = -1; dy <= 1 && !touches_trusted_seed; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            if (dx == 0 && dy == 0) {
+                                continue;
+                            }
+                            const int nx = x + dx;
+                            const int ny = y + dy;
+                            if (nx < 0 || nx >= logical_width_
+                                || ny < 0 || ny >= logical_height_) {
+                                continue;
+                            }
+                            const std::size_t neighbor_cell =
+                                static_cast<std::size_t>(ny) * logical_width_ + nx;
+                            if (trusted_object_seed_mask[neighbor_cell] == 0U) {
+                                continue;
+                            }
+                            if (std::abs(observation->height
+                                    - object_best[neighbor_cell].height)
+                                <= height_neighbor_threshold) {
+                                touches_trusted_seed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!touches_trusted_seed) {
+#if defined(_WIN32)
+                ++tier4_rejected_disconnected;
+#endif
+                continue;
+            }
+#if defined(_WIN32)
+            ++tier4_touching_component_counts[static_cast<std::size_t>(source_view)];
+#endif
+            for (int y = 0; y < logical_height_; ++y) {
+                for (int x = 0; x < logical_width_; ++x) {
+                    if (labels.at<int>(y, x) != component) {
+                        continue;
+                    }
+                    const std::size_t cell = static_cast<std::size_t>(y)
+                        * static_cast<std::size_t>(logical_width_)
+                        + static_cast<std::size_t>(x);
+                    if (object_best[cell].valid) {
+                        continue;
+                    }
+                    ObjectSurfaceCandidate candidate = make_tier4_candidate(
+                        source_view, x, y);
+                    if (!candidate.valid || (candidate.view_mask &
+                            (static_cast<std::uint8_t>(1U) << source_view)) == 0U) {
+                        continue;
+                    }
+                    if (!tier4_best[cell].valid
+                        || object_candidate_is_better(candidate, tier4_best[cell])) {
+                        tier4_best[cell] = std::move(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    // Tier4 only fills cells still empty after the frozen tiers. No Tier4
+    // candidate is exposed as a trusted seed during this pass.
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (object_best[cell].valid || !tier4_best[cell].valid) {
+            continue;
+        }
+        object_best[cell] = std::move(tier4_best[cell]);
+#if defined(_WIN32)
+        object_tier_provenance[cell] = 4U;
+        ++tier4_accepted_before_height_neighbor;
+#endif
+    }
+
     for (int y = 0; y < logical_height_; ++y) {
         for (int x = 0; x < logical_width_; ++x) {
             const std::size_t cell = static_cast<std::size_t>(y) * logical_width_ + x;
@@ -2736,7 +2941,8 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     }
                     const std::size_t neighbor_cell =
                         static_cast<std::size_t>(ny) * logical_width_ + nx;
-                    if (object_best[neighbor_cell].valid) {
+                    if (trusted_object_seed_mask[neighbor_cell] != 0U
+                        && object_best[neighbor_cell].valid) {
                         neighbor_heights.push_back(object_best[neighbor_cell].height);
                     }
                 }
@@ -2748,6 +2954,140 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             }
         }
     }
+
+#if defined(_WIN32)
+    if (accepted_fuse_count_ == 0U) {
+        cv::Mat final_seed_mask(logical_height_, logical_width_, CV_8UC1,
+            cv::Scalar(0));
+        std::array<std::size_t, 3> raw_object_counts{};
+        std::size_t final_seed_count = 0U;
+        for (int y = 0; y < logical_height_; ++y) {
+            for (int x = 0; x < logical_width_; ++x) {
+                const std::size_t cell = static_cast<std::size_t>(y)
+                    * static_cast<std::size_t>(logical_width_) + static_cast<std::size_t>(x);
+                for (int view_index = 0; view_index < 3; ++view_index) {
+                    if (object_raw_masks[static_cast<std::size_t>(view_index)].at<
+                            std::uint8_t>(y, x) != 0U) {
+                        ++raw_object_counts[static_cast<std::size_t>(view_index)];
+                    }
+                }
+                if (trusted_object_seed_mask[cell] != 0U) {
+                    final_seed_mask.at<std::uint8_t>(y, x) = 255U;
+                    ++final_seed_count;
+                }
+            }
+        }
+        try {
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                const std::string path = "tmp/object_raw_view"
+                    + std::to_string(view_index) + ".png";
+                if (!cv::imwrite(path, object_raw_masks[
+                        static_cast<std::size_t>(view_index)])) {
+                    std::clog << "[WINDOWS_OBJECT_PROVENANCE_MASK] write_failed=1"
+                              << std::endl;
+                }
+            }
+            if (!cv::imwrite("tmp/object_final_seed.png", final_seed_mask)) {
+                std::clog << "[WINDOWS_OBJECT_PROVENANCE_MASK] write_failed=1"
+                          << std::endl;
+            }
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_OBJECT_PROVENANCE_MASK] write_failed=1"
+                      << std::endl;
+        }
+        std::clog << "[WINDOWS_OBJECT_PROVENANCE] raw_view0="
+                  << raw_object_counts[0]
+                  << " raw_view1=" << raw_object_counts[1]
+                  << " raw_view2=" << raw_object_counts[2]
+                  << " final_seed=" << final_seed_count << std::endl;
+    }
+#endif
+
+#if defined(_WIN32)
+    if (accepted_fuse_count_ == 0U) {
+        std::array<cv::Mat, 3> tier4_final_masks;
+        std::array<std::size_t, 3> tier4_raw_counts{};
+        std::array<std::size_t, 3> tier4_final_counts{};
+        std::size_t tier4_final_count = 0U;
+        for (int view_index = 0; view_index < 3; ++view_index) {
+            tier4_final_masks[static_cast<std::size_t>(view_index)] = cv::Mat(
+                logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+            tier4_raw_counts[static_cast<std::size_t>(view_index)] = static_cast<std::size_t>(
+                cv::countNonZero(tier4_raw_masks[static_cast<std::size_t>(view_index)]));
+        }
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            if (!object_best[cell].valid || object_tier_provenance[cell] != 4U) {
+                continue;
+            }
+            ++tier4_final_count;
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                const std::uint8_t bit = static_cast<std::uint8_t>(1U) << view_index;
+                if ((object_best[cell].view_mask & bit) == 0U) {
+                    continue;
+                }
+                const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
+                const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
+                tier4_final_masks[static_cast<std::size_t>(view_index)].at<
+                    std::uint8_t>(y, x) = 255U;
+                ++tier4_final_counts[static_cast<std::size_t>(view_index)];
+                break;
+            }
+        }
+        const auto make_tier4_visual = [&](const std::array<cv::Mat, 3>& masks) {
+            cv::Mat visual(logical_height_, logical_width_, CV_8UC3,
+                cv::Scalar(0, 0, 0));
+            for (int y = 0; y < logical_height_; ++y) {
+                for (int x = 0; x < logical_width_; ++x) {
+                    cv::Vec3b& pixel = visual.at<cv::Vec3b>(y, x);
+                    if (masks[0].at<std::uint8_t>(y, x) != 0U) {
+                        pixel[2] = 255U; // view0 = red
+                    }
+                    if (masks[1].at<std::uint8_t>(y, x) != 0U) {
+                        pixel[1] = 255U; // view1 = green
+                    }
+                    if (masks[2].at<std::uint8_t>(y, x) != 0U) {
+                        pixel[0] = 255U; // view2 = blue
+                    }
+                }
+            }
+            cv::Mat resized;
+            cv::resize(visual, resized, cv::Size(canvas_width_, canvas_height_),
+                0.0, 0.0, cv::INTER_NEAREST);
+            return resized;
+        };
+        try {
+            if (!cv::imwrite("tmp/object_tier4_raw.png", make_tier4_visual(
+                    tier4_raw_masks))
+                || !cv::imwrite("tmp/object_tier4_accepted.png", make_tier4_visual(
+                    tier4_final_masks))) {
+                std::clog << "[WINDOWS_OBJECT_TIER4_MASK] write_failed=1"
+                          << std::endl;
+            }
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_OBJECT_TIER4_MASK] write_failed=1"
+                      << std::endl;
+        }
+        std::clog << "[WINDOWS_OBJECT_TIER4] raw_view0=" << tier4_raw_counts[0]
+                  << " raw_view1=" << tier4_raw_counts[1]
+                  << " raw_view2=" << tier4_raw_counts[2]
+                  << " components_view0=" << tier4_component_counts[0]
+                  << " components_view1=" << tier4_component_counts[1]
+                  << " components_view2=" << tier4_component_counts[2]
+                  << " touching_view0=" << tier4_touching_component_counts[0]
+                  << " touching_view1=" << tier4_touching_component_counts[1]
+                  << " touching_view2=" << tier4_touching_component_counts[2]
+                  << " rejected_contradict=" << tier4_rejected_contradict
+                  << " rejected_no_other_view_relation="
+                  << tier4_rejected_no_other_view_relation
+                  << " rejected_disconnected=" << tier4_rejected_disconnected
+                  << " accepted_before_height_neighbor="
+                  << tier4_accepted_before_height_neighbor
+                  << " accepted_final=" << tier4_final_count
+                  << " final_view0=" << tier4_final_counts[0]
+                  << " final_view1=" << tier4_final_counts[1]
+                  << " final_view2=" << tier4_final_counts[2] << std::endl;
+    }
+#endif
 
     // Complete only empty floor cells after the final object filtering. The
     // fitted plane supplies geometry, while the existing multi-view
@@ -3955,7 +4295,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     }
 #if defined(_WIN32)
     if (accepted_fuse_count_ == 0U) {
-        std::array<std::size_t, 4> object_tier_counts{};
+        std::array<std::size_t, 5> object_tier_counts{};
         float object_world_hmax = 0.0f;
         float object_render_zmax = 0.0f;
         for (std::size_t cell = 0; cell < cell_count; ++cell) {
@@ -3966,7 +4306,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             object_render_zmax = std::max(
                 object_render_zmax, object_best[cell].height / display_scale_);
             const std::uint8_t tier = object_tier_provenance[cell];
-            if (tier >= 1U && tier <= 3U) {
+            if (tier >= 1U && tier <= 4U) {
                 ++object_tier_counts[tier];
             } else {
                 ++object_tier_counts[0];
@@ -3976,6 +4316,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << object_tier_counts[1]
                   << " tier2=" << object_tier_counts[2]
                   << " tier3=" << object_tier_counts[3]
+                  << " tier4=" << object_tier_counts[4]
                   << " unclassified=" << object_tier_counts[0]
                   << " final=" << object_final
                   << " object_world_hmax=" << object_world_hmax

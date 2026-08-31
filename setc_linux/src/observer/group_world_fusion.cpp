@@ -2416,8 +2416,169 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
+    // Keep the post-component Tier1/2/3 result as the only trusted seed set.
+    // Tier4 candidates may touch this snapshot, but they must never use one
+    // another as a seed while the connected components are being expanded.
+    std::vector<std::uint8_t> trusted_object_seed_mask(cell_count, 0U);
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (object_best[cell].valid) {
+            trusted_object_seed_mask[cell] = 1U;
+        }
+    }
+
     const float height_neighbor_threshold = std::max(
         4.0f * floor_band_, 0.03f * scene_scale_);
+    std::array<cv::Mat, 3> tier4_raw_masks;
+    for (int source_view = 0; source_view < 3; ++source_view) {
+        tier4_raw_masks[static_cast<std::size_t>(source_view)] = cv::Mat(
+            logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+    }
+    std::vector<ObjectSurfaceCandidate> tier4_best(cell_count);
+
+    const auto make_tier4_candidate = [&](const int source_view,
+        const int logical_x, const int logical_y) {
+        ObjectSurfaceCandidate candidate;
+        const ViewObjectObservation* observation = find_object_observation(
+            source_view, logical_x, logical_y);
+        if (observation == nullptr) {
+            return candidate;
+        }
+        candidate.valid = true;
+        candidate.logical_x = logical_x;
+        candidate.logical_y = logical_y;
+        candidate.view_mask = static_cast<std::uint8_t>(1U) << source_view;
+        candidate.observations[static_cast<std::size_t>(source_view)] = *observation;
+        finalize_object_candidate(candidate);
+        return candidate;
+    };
+
+    // Construct raw Tier4 candidates only from observations that survived the
+    // existing per-view object classifier. The two other views provide the
+    // unchanged reprojection gate; this is not a new view matcher.
+    for (int source_view = 0; source_view < 3; ++source_view) {
+        const auto& observations = object_observations_by_view[
+            static_cast<std::size_t>(source_view)];
+        for (const ViewObjectObservation& observation : observations) {
+            const std::size_t cell = static_cast<std::size_t>(observation.logical_y)
+                * static_cast<std::size_t>(logical_width_)
+                + static_cast<std::size_t>(observation.logical_x);
+            if (cell >= cell_count || object_best[cell].valid) {
+                continue;
+            }
+            const cv::Vec3f point_reference = representative_reference_point(observation);
+            bool has_other_view_relation = false;
+            bool has_contradict = false;
+            for (int target_view = 0; target_view < 3; ++target_view) {
+                if (target_view == source_view) {
+                    continue;
+                }
+                const ReprojectionResult reprojection = project_world_point_to_view(
+                    point_reference,
+                    transforms[static_cast<std::size_t>(source_view)],
+                    views[static_cast<std::size_t>(target_view)],
+                    reprojection_world_tolerance,
+                    reprojection_depth_tolerance);
+                if (reprojection.relation == ReprojectionRelation::Contradict) {
+                    has_contradict = true;
+                } else if (reprojection.relation == ReprojectionRelation::Support
+                    || reprojection.relation == ReprojectionRelation::Occluded) {
+                    has_other_view_relation = true;
+                }
+            }
+            if (has_contradict || !has_other_view_relation) {
+                continue;
+            }
+            tier4_raw_masks[static_cast<std::size_t>(source_view)].at<std::uint8_t>(
+                observation.logical_y, observation.logical_x) = 255U;
+        }
+    }
+
+    // Evaluate each source-view mask independently. A component is trusted
+    // only if one of its cells is 8-neighbor adjacent to the frozen seed set
+    // and the contact height passes the existing height-neighbor threshold.
+    for (int source_view = 0; source_view < 3; ++source_view) {
+        cv::Mat labels;
+        cv::Mat stats;
+        cv::Mat centroids;
+        const int component_count = cv::connectedComponentsWithStats(
+            tier4_raw_masks[static_cast<std::size_t>(source_view)],
+            labels, stats, centroids, 8, CV_32S);
+        for (int component = 1; component < component_count; ++component) {
+            bool touches_trusted_seed = false;
+            for (int y = 0; y < logical_height_ && !touches_trusted_seed; ++y) {
+                for (int x = 0; x < logical_width_ && !touches_trusted_seed; ++x) {
+                    if (labels.at<int>(y, x) != component) {
+                        continue;
+                    }
+                    const ViewObjectObservation* observation = find_object_observation(
+                        source_view, x, y);
+                    if (observation == nullptr) {
+                        continue;
+                    }
+                    for (int dy = -1; dy <= 1 && !touches_trusted_seed; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            if (dx == 0 && dy == 0) {
+                                continue;
+                            }
+                            const int nx = x + dx;
+                            const int ny = y + dy;
+                            if (nx < 0 || nx >= logical_width_
+                                || ny < 0 || ny >= logical_height_) {
+                                continue;
+                            }
+                            const std::size_t neighbor_cell =
+                                static_cast<std::size_t>(ny) * logical_width_ + nx;
+                            if (trusted_object_seed_mask[neighbor_cell] == 0U) {
+                                continue;
+                            }
+                            if (std::abs(observation->height
+                                    - object_best[neighbor_cell].height)
+                                <= height_neighbor_threshold) {
+                                touches_trusted_seed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!touches_trusted_seed) {
+                continue;
+            }
+            for (int y = 0; y < logical_height_; ++y) {
+                for (int x = 0; x < logical_width_; ++x) {
+                    if (labels.at<int>(y, x) != component) {
+                        continue;
+                    }
+                    const std::size_t cell = static_cast<std::size_t>(y)
+                        * static_cast<std::size_t>(logical_width_)
+                        + static_cast<std::size_t>(x);
+                    if (object_best[cell].valid) {
+                        continue;
+                    }
+                    ObjectSurfaceCandidate candidate = make_tier4_candidate(
+                        source_view, x, y);
+                    if (!candidate.valid || (candidate.view_mask &
+                            (static_cast<std::uint8_t>(1U) << source_view)) == 0U) {
+                        continue;
+                    }
+                    if (!tier4_best[cell].valid
+                        || object_candidate_is_better(candidate, tier4_best[cell])) {
+                        tier4_best[cell] = std::move(candidate);
+                    }
+                }
+            }
+        }
+    }
+
+    // Tier4 only fills cells still empty after the frozen tiers. No Tier4
+    // candidate is exposed as a trusted seed during this pass.
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (object_best[cell].valid || !tier4_best[cell].valid) {
+            continue;
+        }
+        object_best[cell] = std::move(tier4_best[cell]);
+    }
+
     for (int y = 0; y < logical_height_; ++y) {
         for (int x = 0; x < logical_width_; ++x) {
             const std::size_t cell = static_cast<std::size_t>(y) * logical_width_ + x;
@@ -2439,7 +2600,8 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     }
                     const std::size_t neighbor_cell =
                         static_cast<std::size_t>(ny) * logical_width_ + nx;
-                    if (object_best[neighbor_cell].valid) {
+                    if (trusted_object_seed_mask[neighbor_cell] != 0U
+                        && object_best[neighbor_cell].valid) {
                         neighbor_heights.push_back(object_best[neighbor_cell].height);
                     }
                 }
