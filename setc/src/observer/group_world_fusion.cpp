@@ -66,6 +66,7 @@ struct ObjectSample {
     float weight = 0.0f;
     cv::Vec3f color = cv::Vec3f(0.0f, 0.0f, 0.0f);
     int view = 0;
+    bool direct_margin = false;
 };
 
 struct ViewObjectObservation {
@@ -80,6 +81,7 @@ struct ViewObjectObservation {
     float weight = 0.0f;
     cv::Vec3f color = cv::Vec3f(0.0f, 0.0f, 0.0f);
     int sample_count = 0;
+    bool direct_margin = false;
 };
 
 struct FloorObservation {
@@ -1557,14 +1559,10 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
     const float gui_scale = static_cast<float>(std::max(canvas_width_, canvas_height_));
-    const auto world_to_cell = [&](const float u, const float v, int& logical_x, int& logical_y) {
-        if (!std::isfinite(u) || !std::isfinite(v)
-            || u < u_min_ || u > u_max_ || v < v_min_ || v > v_max_) {
+    const auto physical_uv_to_cell = [&](const float u, const float v, int& logical_x, int& logical_y) {
+        if (!std::isfinite(u) || !std::isfinite(v)) {
             return false;
         }
-        // This is the exact GUI point_from_slot() convention translated back
-        // to a physical pixel. The logical cell is the even-origin 2x2 block
-        // so all four layers share one GUI-derived XY neighborhood.
         const float physical_x = canvas_width_ * 0.5f
             + (u - center_u_) / display_scale_ * gui_scale;
         const float physical_y = canvas_height_ * 0.5f
@@ -1579,6 +1577,16 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         logical_y = rounded_y / 2;
         return logical_x >= 0 && logical_x < logical_width_
             && logical_y >= 0 && logical_y < logical_height_;
+    };
+    const auto world_to_cell = [&](const float u, const float v, int& logical_x, int& logical_y) {
+        if (!std::isfinite(u) || !std::isfinite(v)
+            || u < u_min_ || u > u_max_ || v < v_min_ || v > v_max_) {
+            return false;
+        }
+        // This is the exact GUI point_from_slot() convention translated back
+        // to a physical pixel. The logical cell is the even-origin 2x2 block
+        // so all four layers share one GUI-derived XY neighborhood.
+        return physical_uv_to_cell(u, v, logical_x, logical_y);
     };
 #if defined(_WIN32)
     // Diagnostic-only mirror of world_to_cell(): retain the production
@@ -1675,6 +1683,23 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     std::array<std::size_t, 3> reliable_strict_uv_reject_by_view{};
     std::array<std::size_t, 3> reliable_near_uv_reject_by_view{};
     std::array<std::size_t, 3> reliable_object_uv_reject_by_view{};
+    std::array<std::size_t, 3> reliable_strict_representable_margin_by_view{};
+    std::array<std::size_t, 3> reliable_strict_physical_outside_by_view{};
+    std::array<std::size_t, 3> reliable_near_representable_margin_by_view{};
+    std::array<std::size_t, 3> reliable_near_physical_outside_by_view{};
+    std::array<std::size_t, 3> reliable_object_representable_margin_by_view{};
+    std::array<std::size_t, 3> reliable_object_physical_outside_by_view{};
+    std::array<std::vector<std::uint8_t>, 3> direct_margin_strict_floor_by_view;
+    std::array<std::vector<std::uint8_t>, 3> direct_margin_near_floor_by_view;
+    std::array<std::vector<std::uint8_t>, 3> direct_margin_object_by_view;
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        direct_margin_strict_floor_by_view[static_cast<std::size_t>(view_index)].assign(
+            cell_count, 0U);
+        direct_margin_near_floor_by_view[static_cast<std::size_t>(view_index)].assign(
+            cell_count, 0U);
+        direct_margin_object_by_view[static_cast<std::size_t>(view_index)].assign(
+            cell_count, 0U);
+    }
 #endif
     for (int view_index = 0; view_index < 3; ++view_index) {
         const GroupWorldView& view = views[static_cast<std::size_t>(view_index)];
@@ -1691,9 +1716,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 const float v = axis_y_.dot(delta);
                 const float height = plane_normal_.dot(delta);
                 const float abs_height = std::abs(height);
-#if defined(_WIN32)
                 const bool strict_plane_band = abs_height <= floor_band_;
                 const bool near_plane_band = abs_height <= 2.5f * floor_band_;
+#if defined(_WIN32)
                 if (strict_plane_band) {
                     ++raw_strict_plane_band_total;
                 } else if (near_plane_band) {
@@ -1702,16 +1727,53 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
 #endif
                 int logical_x = 0;
                 int logical_y = 0;
+                int direct_margin_x = 0;
+                int direct_margin_y = 0;
+                int direct_margin_kind = 0;
                 if (!world_to_cell(u, v, logical_x, logical_y)) {
+                    const bool uv_bounds_reject = std::isfinite(u) && std::isfinite(v)
+                        && (u < u_min_ || u > u_max_ || v < v_min_ || v > v_max_);
+                    bool strict_neighborhood_ok = false;
+                    bool near_neighborhood_ok = false;
+                    bool object_continuity_ok = false;
+                    if (uv_bounds_reject) {
+                        if (strict_plane_band) {
+                            strict_neighborhood_ok = floor_neighborhood_consistent(
+                                aligned_points, view.world_confidence, x, y,
+                                plane_origin_, plane_normal_, floor_band_);
+                        } else if (near_plane_band) {
+                            near_neighborhood_ok = floor_neighborhood_consistent(
+                                aligned_points, view.world_confidence, x, y,
+                                plane_origin_, plane_normal_, floor_band_);
+                        } else if (height > 1.5f * floor_band_
+                            && height < max_object_height_) {
+                            object_continuity_ok = local_object_continuity(
+                                aligned_points, view.world_confidence, x, y, point, scene_scale_);
+                        }
+                        if (physical_uv_to_cell(u, v, direct_margin_x, direct_margin_y)) {
+                            if (strict_neighborhood_ok) {
+                                direct_margin_kind = 1;
+                            } else if (near_neighborhood_ok) {
+                                direct_margin_kind = 2;
+                            } else if (object_continuity_ok) {
+                                direct_margin_kind = 3;
+                            }
+                        }
+                    }
 #if defined(_WIN32)
+                    const int reject_reason = world_to_cell_reject_reason(u, v);
                     if (strict_plane_band) {
-                        if (floor_neighborhood_consistent(
-                            aligned_points, view.world_confidence, x, y,
-                            plane_origin_, plane_normal_, floor_band_)) {
+                        if (strict_neighborhood_ok && reject_reason == 1) {
                             ++reliable_strict_uv_reject_by_view[
                                 static_cast<std::size_t>(view_index)];
+                            if (physical_uv_to_cell(u, v, direct_margin_x, direct_margin_y)) {
+                                ++reliable_strict_representable_margin_by_view[
+                                    static_cast<std::size_t>(view_index)];
+                            } else {
+                                ++reliable_strict_physical_outside_by_view[
+                                    static_cast<std::size_t>(view_index)];
+                            }
                         }
-                        const int reject_reason = world_to_cell_reject_reason(u, v);
                         if (reject_reason == 1) {
                             ++raw_strict_uv_reject;
                             const int flags = world_to_cell_uv_reject_flags(u, v);
@@ -1733,13 +1795,17 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                             ++raw_strict_pixel_y_reject;
                         }
                     } else if (near_plane_band) {
-                        if (floor_neighborhood_consistent(
-                            aligned_points, view.world_confidence, x, y,
-                            plane_origin_, plane_normal_, floor_band_)) {
+                        if (near_neighborhood_ok && reject_reason == 1) {
                             ++reliable_near_uv_reject_by_view[
                                 static_cast<std::size_t>(view_index)];
+                            if (physical_uv_to_cell(u, v, direct_margin_x, direct_margin_y)) {
+                                ++reliable_near_representable_margin_by_view[
+                                    static_cast<std::size_t>(view_index)];
+                            } else {
+                                ++reliable_near_physical_outside_by_view[
+                                    static_cast<std::size_t>(view_index)];
+                            }
                         }
-                        const int reject_reason = world_to_cell_reject_reason(u, v);
                         if (reject_reason == 1) {
                             ++raw_near_uv_reject;
                             const int flags = world_to_cell_uv_reject_flags(u, v);
@@ -1764,15 +1830,37 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                         && height < max_object_height_
                         && local_object_continuity(
                             aligned_points, view.world_confidence, x, y, point, scene_scale_)) {
-                        ++reliable_object_uv_reject_by_view[
-                            static_cast<std::size_t>(view_index)];
+                        if (object_continuity_ok && reject_reason == 1) {
+                            ++reliable_object_uv_reject_by_view[
+                                static_cast<std::size_t>(view_index)];
+                            if (physical_uv_to_cell(u, v, direct_margin_x, direct_margin_y)) {
+                                ++reliable_object_representable_margin_by_view[
+                                    static_cast<std::size_t>(view_index)];
+                            } else {
+                                ++reliable_object_physical_outside_by_view[
+                                    static_cast<std::size_t>(view_index)];
+                            }
+                        }
                     }
 #endif
-                    continue;
+                    if (direct_margin_kind == 0) {
+                        continue;
+                    }
+                    logical_x = direct_margin_x;
+                    logical_y = direct_margin_y;
                 }
                 const std::size_t cell = static_cast<std::size_t>(logical_y)
                     * static_cast<std::size_t>(logical_width_)
                     + static_cast<std::size_t>(logical_x);
+#if defined(_WIN32)
+                if (direct_margin_kind == 1) {
+                    direct_margin_strict_floor_by_view[static_cast<std::size_t>(view_index)][cell] = 1U;
+                } else if (direct_margin_kind == 2) {
+                    direct_margin_near_floor_by_view[static_cast<std::size_t>(view_index)][cell] = 1U;
+                } else if (direct_margin_kind == 3) {
+                    direct_margin_object_by_view[static_cast<std::size_t>(view_index)][cell] = 1U;
+                }
+#endif
                 const ConfidenceStats& confidence_range =
                     confidence_stats[static_cast<std::size_t>(view_index)];
                 const float normalized = normalized_confidence(
@@ -1780,7 +1868,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 const float weight = normalized * border_weight(
                     x, y, view.world_points.cols, view.world_points.rows);
                 if (abs_height <= floor_band_) {
-                    if (!floor_neighborhood_consistent(
+                    if (direct_margin_kind != 1 && !floor_neighborhood_consistent(
                         aligned_points, view.world_confidence, x, y,
                         plane_origin_, plane_normal_, floor_band_)) {
 #if defined(_WIN32)
@@ -1798,7 +1886,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                         best.valid = true;
                     }
                 } else if (abs_height <= 2.5f * floor_band_) {
-                    if (!floor_neighborhood_consistent(
+                    if (direct_margin_kind != 2 && !floor_neighborhood_consistent(
                         aligned_points, view.world_confidence, x, y,
                         plane_origin_, plane_normal_, floor_band_)) {
 #if defined(_WIN32)
@@ -1818,7 +1906,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 } else if (height > 1.5f * floor_band_
                     && height < max_object_height_
                     ) {
-                    if (local_object_continuity(
+                    if (direct_margin_kind == 3 || local_object_continuity(
                         aligned_points, view.world_confidence, x, y, point, scene_scale_)) {
                         object_samples_by_view[static_cast<std::size_t>(view_index)][cell].push_back(
                             ObjectSample{
@@ -1828,7 +1916,8 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                             normalized,
                             std::max(weight, 1e-4f),
                             view.rgb.at<cv::Vec3f>(y, x),
-                            view_index});
+                            view_index,
+                            direct_margin_kind == 3});
                     }
                 }
                 // Points outside the strict/near-floor bands and positive
@@ -1878,7 +1967,43 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << " reliable_object_view1="
                   << reliable_object_uv_reject_by_view[1]
                   << " reliable_object_view2="
-                  << reliable_object_uv_reject_by_view[2] << std::endl;
+                  << reliable_object_uv_reject_by_view[2]
+                  << " strict_representable_margin_view0="
+                  << reliable_strict_representable_margin_by_view[0]
+                  << " strict_representable_margin_view1="
+                  << reliable_strict_representable_margin_by_view[1]
+                  << " strict_representable_margin_view2="
+                  << reliable_strict_representable_margin_by_view[2]
+                  << " strict_physical_outside_view0="
+                  << reliable_strict_physical_outside_by_view[0]
+                  << " strict_physical_outside_view1="
+                  << reliable_strict_physical_outside_by_view[1]
+                  << " strict_physical_outside_view2="
+                  << reliable_strict_physical_outside_by_view[2]
+                  << " near_representable_margin_view0="
+                  << reliable_near_representable_margin_by_view[0]
+                  << " near_representable_margin_view1="
+                  << reliable_near_representable_margin_by_view[1]
+                  << " near_representable_margin_view2="
+                  << reliable_near_representable_margin_by_view[2]
+                  << " near_physical_outside_view0="
+                  << reliable_near_physical_outside_by_view[0]
+                  << " near_physical_outside_view1="
+                  << reliable_near_physical_outside_by_view[1]
+                  << " near_physical_outside_view2="
+                  << reliable_near_physical_outside_by_view[2]
+                  << " object_representable_margin_view0="
+                  << reliable_object_representable_margin_by_view[0]
+                  << " object_representable_margin_view1="
+                  << reliable_object_representable_margin_by_view[1]
+                  << " object_representable_margin_view2="
+                  << reliable_object_representable_margin_by_view[2]
+                  << " object_physical_outside_view0="
+                  << reliable_object_physical_outside_by_view[0]
+                  << " object_physical_outside_view1="
+                  << reliable_object_physical_outside_by_view[1]
+                  << " object_physical_outside_view2="
+                  << reliable_object_physical_outside_by_view[2] << std::endl;
     }
 #endif
 
@@ -2197,6 +2322,64 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         return resize_logical_mask(visual);
     };
     if (accepted_fuse_count_ == 0U) {
+        std::array<cv::Mat, 3> direct_margin_floor_masks;
+        std::array<cv::Mat, 3> direct_margin_object_masks;
+        std::array<std::size_t, 3> direct_margin_strict_counts{};
+        std::array<std::size_t, 3> direct_margin_near_counts{};
+        std::array<std::size_t, 3> direct_margin_object_counts{};
+        for (int view_index = 0; view_index < 3; ++view_index) {
+            const std::size_t view = static_cast<std::size_t>(view_index);
+            direct_margin_strict_counts[view] = static_cast<std::size_t>(std::count(
+                direct_margin_strict_floor_by_view[view].begin(),
+                direct_margin_strict_floor_by_view[view].end(),
+                static_cast<std::uint8_t>(1U)));
+            direct_margin_near_counts[view] = static_cast<std::size_t>(std::count(
+                direct_margin_near_floor_by_view[view].begin(),
+                direct_margin_near_floor_by_view[view].end(),
+                static_cast<std::uint8_t>(1U)));
+            direct_margin_object_counts[view] = static_cast<std::size_t>(std::count(
+                direct_margin_object_by_view[view].begin(),
+                direct_margin_object_by_view[view].end(),
+                static_cast<std::uint8_t>(1U)));
+            const cv::Mat strict_mask(logical_height_, logical_width_, CV_8UC1,
+                direct_margin_strict_floor_by_view[view].data());
+            const cv::Mat near_mask(logical_height_, logical_width_, CV_8UC1,
+                direct_margin_near_floor_by_view[view].data());
+            cv::bitwise_or(strict_mask, near_mask, direct_margin_floor_masks[view]);
+            direct_margin_object_masks[view] = cv::Mat(
+                logical_height_, logical_width_, CV_8UC1,
+                direct_margin_object_by_view[view].data()).clone();
+        }
+        try {
+            if (!cv::imwrite("tmp/direct_margin_floor.png",
+                    make_view_mask_visual(direct_margin_floor_masks))
+                || !cv::imwrite("tmp/direct_margin_object.png",
+                    make_view_mask_visual(direct_margin_object_masks))) {
+                std::clog << "[WINDOWS_DIRECT_MARGIN_MASK] write_failed=1" << std::endl;
+            }
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_DIRECT_MARGIN_MASK] write_failed=1" << std::endl;
+        }
+        std::clog << "[WINDOWS_DIRECT_MARGIN] strict_view0="
+                  << direct_margin_strict_counts[0]
+                  << " strict_view1=" << direct_margin_strict_counts[1]
+                  << " strict_view2=" << direct_margin_strict_counts[2]
+                  << " near_view0=" << direct_margin_near_counts[0]
+                  << " near_view1=" << direct_margin_near_counts[1]
+                  << " near_view2=" << direct_margin_near_counts[2]
+                  << " object_view0=" << direct_margin_object_counts[0]
+                  << " object_view1=" << direct_margin_object_counts[1]
+                  << " object_view2=" << direct_margin_object_counts[2]
+                  << " strict_total=" << direct_margin_strict_counts[0]
+                        + direct_margin_strict_counts[1]
+                        + direct_margin_strict_counts[2]
+                  << " near_total=" << direct_margin_near_counts[0]
+                        + direct_margin_near_counts[1]
+                        + direct_margin_near_counts[2]
+                  << " object_total=" << direct_margin_object_counts[0]
+                        + direct_margin_object_counts[1]
+                        + direct_margin_object_counts[2]
+                  << std::endl;
         std::array<cv::Mat, 3> direct_floor_masks;
         std::array<std::size_t, 3> strict_counts{};
         std::array<std::size_t, 3> near_counts{};
@@ -2342,7 +2525,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             const float v = axis_y_.dot(delta);
             int mapped_x = 0;
             int mapped_y = 0;
-            if (!world_to_cell(u, v, mapped_x, mapped_y)) {
+            if (!physical_uv_to_cell(u, v, mapped_x, mapped_y)) {
                 ++roundtrip_failures;
                 continue;
             }
@@ -2583,11 +2766,13 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             v_values.reserve(samples.size());
             confidence_values.reserve(samples.size());
             observation.weight = 0.0f;
+            observation.direct_margin = false;
             for (const ObjectSample& sample : samples) {
                 u_values.push_back(sample.u);
                 v_values.push_back(sample.v);
                 confidence_values.push_back(sample.normalized_confidence);
                 observation.weight += std::max(sample.weight, 1e-4f);
+                observation.direct_margin = observation.direct_margin || sample.direct_margin;
             }
             observation.u = median_value(std::move(u_values));
             observation.v = median_value(std::move(v_values));
@@ -2640,6 +2825,183 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
 
     const float object_cross_view_height_tolerance = std::max(
         3.0f * floor_band_, 0.02f * scene_scale_);
+
+#if defined(_WIN32)
+    // Audit every reduced single-view object observation against both other
+    // point heads.  This is diagnostic-only: the existing relation rules and
+    // Contradict vetoes below remain unchanged.
+    std::array<std::array<std::size_t, 25>, 3> object_relation_pattern_counts{};
+    std::array<std::array<std::size_t, 3>, 3> object_contradict_counts_by_target{};
+    std::size_t object_contradict_total = 0U;
+    std::array<std::vector<float>, 9> object_contradict_world_errors;
+    std::array<std::vector<float>, 9> object_contradict_depth_errors;
+    std::vector<float> object_contradict_world_errors_all;
+    std::vector<float> object_contradict_depth_errors_all;
+    std::array<cv::Mat, 3> object_contradict_masks;
+    std::array<cv::Mat, 3> object_noncontradict_masks;
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        object_contradict_masks[static_cast<std::size_t>(view_index)] = cv::Mat(
+            logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+        object_noncontradict_masks[static_cast<std::size_t>(view_index)] = cv::Mat(
+            logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+        const auto& observations = object_observations_by_view[
+            static_cast<std::size_t>(view_index)];
+        for (const ViewObjectObservation& observation : observations) {
+            const cv::Vec3f point_reference = plane_origin_
+                + axis_x_ * observation.u
+                + axis_y_ * observation.v
+                + plane_normal_ * observation.height;
+            std::array<int, 2> relation_codes{};
+            bool has_contradict = false;
+            int relation_slot = 0;
+            for (int target_view = 0; target_view < 3; ++target_view) {
+                if (target_view == view_index) {
+                    continue;
+                }
+                const ReprojectionResult reprojection = project_world_point_to_view(
+                    point_reference,
+                    transforms[static_cast<std::size_t>(view_index)],
+                    views[static_cast<std::size_t>(target_view)],
+                    reprojection_world_tolerance,
+                    reprojection_depth_tolerance);
+                int relation_code = 2; // Invalid
+                switch (reprojection.relation) {
+                case ReprojectionRelation::Support:
+                    relation_code = 0;
+                    break;
+                case ReprojectionRelation::Occluded:
+                    relation_code = 1;
+                    break;
+                case ReprojectionRelation::Invalid:
+                    relation_code = 2;
+                    break;
+                case ReprojectionRelation::Outside:
+                    relation_code = 3;
+                    break;
+                case ReprojectionRelation::Contradict:
+                    relation_code = 4;
+                    has_contradict = true;
+                    ++object_contradict_total;
+                    ++object_contradict_counts_by_target[
+                        static_cast<std::size_t>(view_index)][
+                            static_cast<std::size_t>(target_view)];
+                    if (std::isfinite(reprojection.world_error)) {
+                        object_contradict_world_errors[static_cast<std::size_t>(
+                            view_index * 3 + target_view)].push_back(
+                            reprojection.world_error);
+                        object_contradict_world_errors_all.push_back(
+                            reprojection.world_error);
+                    }
+                    if (std::isfinite(reprojection.depth_error)) {
+                        object_contradict_depth_errors[static_cast<std::size_t>(
+                            view_index * 3 + target_view)].push_back(
+                            reprojection.depth_error);
+                        object_contradict_depth_errors_all.push_back(
+                            reprojection.depth_error);
+                    }
+                    break;
+                }
+                relation_codes[static_cast<std::size_t>(relation_slot)] = relation_code;
+                ++relation_slot;
+            }
+            const int first_relation = std::min(relation_codes[0], relation_codes[1]);
+            const int second_relation = std::max(relation_codes[0], relation_codes[1]);
+            ++object_relation_pattern_counts[static_cast<std::size_t>(view_index)][
+                first_relation * 5 + second_relation];
+            const int x = observation.logical_x;
+            const int y = observation.logical_y;
+            if (has_contradict) {
+                object_contradict_masks[static_cast<std::size_t>(view_index)].at<
+                    std::uint8_t>(y, x) = 255U;
+            } else {
+                object_noncontradict_masks[static_cast<std::size_t>(view_index)].at<
+                    std::uint8_t>(y, x) = 255U;
+            }
+        }
+    }
+    const auto relation_label = [](const int relation) {
+        constexpr std::array<const char*, 5> labels{{"S", "O", "I", "X", "C"}};
+        return labels[static_cast<std::size_t>(relation)];
+    };
+    const auto log_quantiles = [](const char* prefix, const std::vector<float>& values) {
+        std::clog << prefix << "_n=" << values.size()
+                  << "_q10=" << percentile_value(values, 0.10f)
+                  << "_q50=" << percentile_value(values, 0.50f)
+                  << "_q90=" << percentile_value(values, 0.90f)
+                  << "_q99=" << percentile_value(values, 0.99f);
+    };
+    if (accepted_fuse_count_ == 0U) {
+        for (int view_index = 0; view_index < 3; ++view_index) {
+            std::clog << "[WINDOWS_OBJECT_RELATIONS] source_view=" << view_index;
+            for (int first_relation = 0; first_relation < 5; ++first_relation) {
+                for (int second_relation = first_relation; second_relation < 5;
+                    ++second_relation) {
+                    const std::size_t count = object_relation_pattern_counts[
+                        static_cast<std::size_t>(view_index)][first_relation * 5
+                        + second_relation];
+                    std::clog << " " << relation_label(first_relation)
+                              << relation_label(second_relation) << "=" << count;
+                }
+            }
+            std::clog << std::endl;
+        }
+        std::clog << "[WINDOWS_OBJECT_CONTRADICT] source_view0="
+                  << object_contradict_counts_by_target[0][1]
+                        + object_contradict_counts_by_target[0][2]
+                  << " source_view1="
+                  << object_contradict_counts_by_target[1][0]
+                        + object_contradict_counts_by_target[1][2]
+                  << " source_view2="
+                  << object_contradict_counts_by_target[2][0]
+                        + object_contradict_counts_by_target[2][1]
+                  << " total=" << object_contradict_total
+                  << " target_0_to_1=" << object_contradict_counts_by_target[0][1]
+                  << " target_0_to_2=" << object_contradict_counts_by_target[0][2]
+                  << " target_1_to_0=" << object_contradict_counts_by_target[1][0]
+                  << " target_1_to_2=" << object_contradict_counts_by_target[1][2]
+                  << " target_2_to_0=" << object_contradict_counts_by_target[2][0]
+                  << " target_2_to_1=" << object_contradict_counts_by_target[2][1]
+                  << std::endl;
+        std::clog << "[WINDOWS_OBJECT_CONTRADICT_ERROR] aggregate ";
+        log_quantiles("world_error", object_contradict_world_errors_all);
+        std::clog << " ";
+        log_quantiles("depth_error", object_contradict_depth_errors_all);
+        std::clog << std::endl;
+        for (int source_view = 0; source_view < 3; ++source_view) {
+            for (int target_view = 0; target_view < 3; ++target_view) {
+                if (source_view == target_view) {
+                    continue;
+                }
+                const std::size_t pair = static_cast<std::size_t>(
+                    source_view * 3 + target_view);
+                std::clog << "[WINDOWS_OBJECT_CONTRADICT_ERROR] pair_"
+                          << source_view << "_to_" << target_view << " ";
+                log_quantiles("world_error", object_contradict_world_errors[pair]);
+                std::clog << " ";
+                log_quantiles("depth_error", object_contradict_depth_errors[pair]);
+                std::clog << std::endl;
+            }
+        }
+        try {
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                const std::string contradict_path = "tmp/object_contradict_view"
+                    + std::to_string(view_index) + ".png";
+                const std::string noncontradict_path = "tmp/object_noncontradict_view"
+                    + std::to_string(view_index) + ".png";
+                if (!cv::imwrite(contradict_path, resize_logical_mask(
+                        object_contradict_masks[static_cast<std::size_t>(view_index)]))
+                    || !cv::imwrite(noncontradict_path, resize_logical_mask(
+                        object_noncontradict_masks[static_cast<std::size_t>(view_index)]))) {
+                    std::clog << "[WINDOWS_OBJECT_CONTRADICT_MASK] write_failed=1"
+                              << std::endl;
+                }
+            }
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_OBJECT_CONTRADICT_MASK] write_failed=1"
+                      << std::endl;
+        }
+    }
+#endif
 
     std::vector<ObjectSurfaceCandidate> object_best(cell_count);
 #if defined(_WIN32)
@@ -3359,6 +3721,12 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     if (accepted_fuse_count_ == 0U) {
         cv::Mat final_seed_mask(logical_height_, logical_width_, CV_8UC1,
             cv::Scalar(0));
+        std::array<cv::Mat, 3> direct_margin_final_masks;
+        std::array<std::size_t, 3> direct_margin_final_counts{};
+        for (int view_index = 0; view_index < 3; ++view_index) {
+            direct_margin_final_masks[static_cast<std::size_t>(view_index)] = cv::Mat(
+                logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+        }
         std::array<std::size_t, 3> raw_object_counts{};
         std::size_t final_seed_count = 0U;
         for (int y = 0; y < logical_height_; ++y) {
@@ -3374,6 +3742,20 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 if (trusted_object_seed_mask[cell] != 0U) {
                     final_seed_mask.at<std::uint8_t>(y, x) = 255U;
                     ++final_seed_count;
+                }
+                if (!object_best[cell].valid) {
+                    continue;
+                }
+                for (int view_index = 0; view_index < 3; ++view_index) {
+                    const std::uint8_t bit = static_cast<std::uint8_t>(1U) << view_index;
+                    if ((object_best[cell].view_mask & bit) == 0U
+                        || !object_best[cell].observations[
+                            static_cast<std::size_t>(view_index)].direct_margin) {
+                        continue;
+                    }
+                    direct_margin_final_masks[static_cast<std::size_t>(view_index)].at<
+                        std::uint8_t>(y, x) = 255U;
+                    ++direct_margin_final_counts[static_cast<std::size_t>(view_index)];
                 }
             }
         }
@@ -3391,6 +3773,11 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 std::clog << "[WINDOWS_OBJECT_PROVENANCE_MASK] write_failed=1"
                           << std::endl;
             }
+            if (!cv::imwrite("tmp/direct_margin_final_object.png",
+                    make_view_mask_visual(direct_margin_final_masks))) {
+                std::clog << "[WINDOWS_DIRECT_MARGIN_MASK] write_failed=1"
+                          << std::endl;
+            }
         } catch (const cv::Exception&) {
             std::clog << "[WINDOWS_OBJECT_PROVENANCE_MASK] write_failed=1"
                       << std::endl;
@@ -3400,6 +3787,14 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << " raw_view1=" << raw_object_counts[1]
                   << " raw_view2=" << raw_object_counts[2]
                   << " final_seed=" << final_seed_count << std::endl;
+        std::clog << "[WINDOWS_DIRECT_MARGIN_FINAL] object_view0="
+                  << direct_margin_final_counts[0]
+                  << " object_view1=" << direct_margin_final_counts[1]
+                  << " object_view2=" << direct_margin_final_counts[2]
+                  << " object_total=" << direct_margin_final_counts[0]
+                        + direct_margin_final_counts[1]
+                        + direct_margin_final_counts[2]
+                  << std::endl;
     }
 #endif
 
@@ -3560,10 +3955,10 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 ++lost_direct_count;
             }
         }
-        std::clog << "[WINDOWS_DIRECT_OBJECT] view0=" << direct_object_counts[0]
+        std::clog << "[WINDOWS_DIRECT_OBJECT_CANDIDATE] view0=" << direct_object_counts[0]
                   << " view1=" << direct_object_counts[1]
                   << " view2=" << direct_object_counts[2]
-                  << " union=" << direct_union_count
+                  << " candidate_union=" << direct_union_count
                   << " only_view0=" << direct_object_only_counts[0]
                   << " only_view1=" << direct_object_only_counts[1]
                   << " only_view2=" << direct_object_only_counts[2]
@@ -3573,7 +3968,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << " only_view0_lost=" << direct_object_only_lost_counts[0]
                   << " only_view1_lost=" << direct_object_only_lost_counts[1]
                   << " only_view2_lost=" << direct_object_only_lost_counts[2]
-                  << " lost_after_tier4_v2=" << lost_direct_count
+                  << " candidate_not_selected_final=" << lost_direct_count
                   << " pattern1=" << direct_object_pattern_counts[1]
                   << " pattern2=" << direct_object_pattern_counts[2]
                   << " pattern3=" << direct_object_pattern_counts[3]
@@ -4841,9 +5236,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         std::array<std::size_t, 3> object_only_kept_after{};
         std::array<std::size_t, 3> object_only_lost_after{};
         std::size_t direct_floor_total = 0U;
-        std::size_t direct_object_total = 0U;
-        std::size_t lost_floor_after = 0U;
-        std::size_t lost_object_after = 0U;
+        std::size_t direct_object_candidate_union = 0U;
+        std::size_t final_empty_on_direct_floor_union = 0U;
+        std::size_t object_candidate_not_selected_final = 0U;
         std::size_t inferred_floor_total = 0U;
         cv::Mat direct_union_vs_final(logical_height_, logical_width_, CV_8UC3,
             cv::Scalar(0, 0, 0));
@@ -4877,11 +5272,11 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     }
                 }
                 if (floor_cell_valid_[cell] == 0U) {
-                    ++lost_floor_after;
+                    ++final_empty_on_direct_floor_union;
                 }
             }
             if (direct_object) {
-                ++direct_object_total;
+                ++direct_object_candidate_union;
                 if (support_count(object_pattern) == 1) {
                     const int view_index = object_pattern == 1U ? 0
                         : (object_pattern == 2U ? 1 : 2);
@@ -4892,7 +5287,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     }
                 }
                 if (!object_best[cell].valid) {
-                    ++lost_object_after;
+                    ++object_candidate_not_selected_final;
                 }
             }
             if (!direct_floor && !direct_object
@@ -4916,10 +5311,13 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             }
         }
         std::clog << "[WINDOWS_DIRECT_FINAL] direct_floor=" << direct_floor_total
-                  << " direct_object=" << direct_object_total
-                  << " lost_floor_after=" << lost_floor_after
-                  << " lost_object_after=" << lost_object_after
-                  << " inferred_floor=" << inferred_floor_total
+                  << " direct_object_candidate_union=" << direct_object_candidate_union
+                  << " direct_floor_lost_after_F4_is_reported_above=1"
+                  << " final_empty_on_direct_floor_union_after_inferred="
+                        << final_empty_on_direct_floor_union
+                  << " object_candidate_not_selected_final="
+                        << object_candidate_not_selected_final
+                  << " inferred_only_floor=" << inferred_floor_total
                   << " floor_only_view0_kept=" << floor_only_kept_after[0]
                   << " floor_only_view1_kept=" << floor_only_kept_after[1]
                   << " floor_only_view2_kept=" << floor_only_kept_after[2]

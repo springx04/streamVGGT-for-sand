@@ -60,6 +60,7 @@ struct ObjectSample {
     float weight = 0.0f;
     cv::Vec3f color = cv::Vec3f(0.0f, 0.0f, 0.0f);
     int view = 0;
+    bool direct_margin = false;
 };
 
 struct ViewObjectObservation {
@@ -74,6 +75,7 @@ struct ViewObjectObservation {
     float weight = 0.0f;
     cv::Vec3f color = cv::Vec3f(0.0f, 0.0f, 0.0f);
     int sample_count = 0;
+    bool direct_margin = false;
 };
 
 struct FloorObservation {
@@ -1503,14 +1505,10 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     }
 
     const float gui_scale = static_cast<float>(std::max(canvas_width_, canvas_height_));
-    const auto world_to_cell = [&](const float u, const float v, int& logical_x, int& logical_y) {
-        if (!std::isfinite(u) || !std::isfinite(v)
-            || u < u_min_ || u > u_max_ || v < v_min_ || v > v_max_) {
+    const auto physical_uv_to_cell = [&](const float u, const float v, int& logical_x, int& logical_y) {
+        if (!std::isfinite(u) || !std::isfinite(v)) {
             return false;
         }
-        // This is the exact GUI point_from_slot() convention translated back
-        // to a physical pixel. The logical cell is the even-origin 2x2 block
-        // so all four layers share one GUI-derived XY neighborhood.
         const float physical_x = canvas_width_ * 0.5f
             + (u - center_u_) / display_scale_ * gui_scale;
         const float physical_y = canvas_height_ * 0.5f
@@ -1525,6 +1523,16 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         logical_y = rounded_y / 2;
         return logical_x >= 0 && logical_x < logical_width_
             && logical_y >= 0 && logical_y < logical_height_;
+    };
+    const auto world_to_cell = [&](const float u, const float v, int& logical_x, int& logical_y) {
+        if (!std::isfinite(u) || !std::isfinite(v)
+            || u < u_min_ || u > u_max_ || v < v_min_ || v > v_max_) {
+            return false;
+        }
+        // This is the exact GUI point_from_slot() convention translated back
+        // to a physical pixel. The logical cell is the even-origin 2x2 block
+        // so all four layers share one GUI-derived XY neighborhood.
+        return physical_uv_to_cell(u, v, logical_x, logical_y);
     };
     const auto cell_to_reference_floor_point = [&](const int logical_x, const int logical_y) {
         const float physical_x = static_cast<float>(logical_x * 2) + 0.5f;
@@ -1569,10 +1577,49 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 const float u = axis_x_.dot(delta);
                 const float v = axis_y_.dot(delta);
                 const float height = plane_normal_.dot(delta);
+                const float abs_height = std::abs(height);
+                const bool strict_plane_band = abs_height <= floor_band_;
+                const bool near_plane_band = abs_height <= 2.5f * floor_band_;
                 int logical_x = 0;
                 int logical_y = 0;
+                int direct_margin_x = 0;
+                int direct_margin_y = 0;
+                int direct_margin_kind = 0;
                 if (!world_to_cell(u, v, logical_x, logical_y)) {
-                    continue;
+                    const bool uv_bounds_reject = std::isfinite(u) && std::isfinite(v)
+                        && (u < u_min_ || u > u_max_ || v < v_min_ || v > v_max_);
+                    bool strict_neighborhood_ok = false;
+                    bool near_neighborhood_ok = false;
+                    bool object_continuity_ok = false;
+                    if (uv_bounds_reject) {
+                        if (strict_plane_band) {
+                            strict_neighborhood_ok = floor_neighborhood_consistent(
+                                aligned_points, view.world_confidence, x, y,
+                                plane_origin_, plane_normal_, floor_band_);
+                        } else if (near_plane_band) {
+                            near_neighborhood_ok = floor_neighborhood_consistent(
+                                aligned_points, view.world_confidence, x, y,
+                                plane_origin_, plane_normal_, floor_band_);
+                        } else if (height > 1.5f * floor_band_
+                            && height < max_object_height_) {
+                            object_continuity_ok = local_object_continuity(
+                                aligned_points, view.world_confidence, x, y, point, scene_scale_);
+                        }
+                        if (physical_uv_to_cell(u, v, direct_margin_x, direct_margin_y)) {
+                            if (strict_neighborhood_ok) {
+                                direct_margin_kind = 1;
+                            } else if (near_neighborhood_ok) {
+                                direct_margin_kind = 2;
+                            } else if (object_continuity_ok) {
+                                direct_margin_kind = 3;
+                            }
+                        }
+                    }
+                    if (direct_margin_kind == 0) {
+                        continue;
+                    }
+                    logical_x = direct_margin_x;
+                    logical_y = direct_margin_y;
                 }
                 const std::size_t cell = static_cast<std::size_t>(logical_y)
                     * static_cast<std::size_t>(logical_width_)
@@ -1583,9 +1630,8 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     confidence, confidence_range.q10, confidence_range.q90);
                 const float weight = normalized * border_weight(
                     x, y, view.world_points.cols, view.world_points.rows);
-                const float abs_height = std::abs(height);
                 if (abs_height <= floor_band_) {
-                    if (!floor_neighborhood_consistent(
+                    if (direct_margin_kind != 1 && !floor_neighborhood_consistent(
                             aligned_points, view.world_confidence, x, y,
                             plane_origin_, plane_normal_, floor_band_)) {
                         continue;
@@ -1600,7 +1646,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                         best.valid = true;
                     }
                 } else if (abs_height <= 2.5f * floor_band_) {
-                    if (!floor_neighborhood_consistent(
+                    if (direct_margin_kind != 2 && !floor_neighborhood_consistent(
                             aligned_points, view.world_confidence, x, y,
                             plane_origin_, plane_normal_, floor_band_)) {
                         continue;
@@ -1616,8 +1662,8 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     }
                 } else if (height > 1.5f * floor_band_
                     && height < max_object_height_
-                    && local_object_continuity(
-                        aligned_points, view.world_confidence, x, y, point, scene_scale_)) {
+                    && (direct_margin_kind == 3 || local_object_continuity(
+                        aligned_points, view.world_confidence, x, y, point, scene_scale_))) {
                     object_samples_by_view[static_cast<std::size_t>(view_index)][cell].push_back(
                         ObjectSample{
                         u,
@@ -1626,7 +1672,8 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                         normalized,
                         std::max(weight, 1e-4f),
                         view.rgb.at<cv::Vec3f>(y, x),
-                        view_index});
+                        view_index,
+                        direct_margin_kind == 3});
                 }
                 // Points outside the strict/near-floor bands and positive
                 // object band are intentionally ignored. Neither decision
@@ -2045,11 +2092,13 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             v_values.reserve(samples.size());
             confidence_values.reserve(samples.size());
             observation.weight = 0.0f;
+            observation.direct_margin = false;
             for (const ObjectSample& sample : samples) {
                 u_values.push_back(sample.u);
                 v_values.push_back(sample.v);
                 confidence_values.push_back(sample.normalized_confidence);
                 observation.weight += std::max(sample.weight, 1e-4f);
+                observation.direct_margin = observation.direct_margin || sample.direct_margin;
             }
             observation.u = median_value(std::move(u_values));
             observation.v = median_value(std::move(v_values));
