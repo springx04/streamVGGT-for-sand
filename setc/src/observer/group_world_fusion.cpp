@@ -1481,6 +1481,26 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
         return 0;
     };
+    const auto world_to_cell_uv_reject_flags = [&](const float u, const float v) {
+        int flags = 0;
+        if (std::isfinite(u)) {
+            if (u < u_min_) {
+                flags |= 1; // u_low
+            }
+            if (u > u_max_) {
+                flags |= 2; // u_high
+            }
+        }
+        if (std::isfinite(v)) {
+            if (v < v_min_) {
+                flags |= 4; // v_low
+            }
+            if (v > v_max_) {
+                flags |= 8; // v_high
+            }
+        }
+        return flags;
+    };
 #endif
     const auto cell_to_reference_floor_point = [&](const int logical_x, const int logical_y) {
         const float physical_x = static_cast<float>(logical_x * 2) + 0.5f;
@@ -1516,10 +1536,12 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     std::size_t raw_strict_uv_reject = 0U;
     std::size_t raw_strict_pixel_x_reject = 0U;
     std::size_t raw_strict_pixel_y_reject = 0U;
+    std::array<std::size_t, 4> raw_strict_uv_directional{};
     std::size_t raw_near_plane_total = 0U;
     std::size_t raw_near_uv_reject = 0U;
     std::size_t raw_near_pixel_x_reject = 0U;
     std::size_t raw_near_pixel_y_reject = 0U;
+    std::array<std::size_t, 4> raw_near_uv_directional{};
     std::size_t raw_strict_neighborhood_rejected = 0U;
     std::size_t raw_near_neighborhood_rejected = 0U;
 #endif
@@ -1555,6 +1577,19 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                         const int reject_reason = world_to_cell_reject_reason(u, v);
                         if (reject_reason == 1) {
                             ++raw_strict_uv_reject;
+                            const int flags = world_to_cell_uv_reject_flags(u, v);
+                            if ((flags & 1) != 0) {
+                                ++raw_strict_uv_directional[0];
+                            }
+                            if ((flags & 2) != 0) {
+                                ++raw_strict_uv_directional[1];
+                            }
+                            if ((flags & 4) != 0) {
+                                ++raw_strict_uv_directional[2];
+                            }
+                            if ((flags & 8) != 0) {
+                                ++raw_strict_uv_directional[3];
+                            }
                         } else if (reject_reason == 2) {
                             ++raw_strict_pixel_x_reject;
                         } else if (reject_reason == 3) {
@@ -1564,6 +1599,19 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                         const int reject_reason = world_to_cell_reject_reason(u, v);
                         if (reject_reason == 1) {
                             ++raw_near_uv_reject;
+                            const int flags = world_to_cell_uv_reject_flags(u, v);
+                            if ((flags & 1) != 0) {
+                                ++raw_near_uv_directional[0];
+                            }
+                            if ((flags & 2) != 0) {
+                                ++raw_near_uv_directional[1];
+                            }
+                            if ((flags & 4) != 0) {
+                                ++raw_near_uv_directional[2];
+                            }
+                            if ((flags & 8) != 0) {
+                                ++raw_near_uv_directional[3];
+                            }
                         } else if (reject_reason == 2) {
                             ++raw_near_pixel_x_reject;
                         } else if (reject_reason == 3) {
@@ -1646,10 +1694,18 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         std::clog << "[WINDOWS_FLOOR_EDGE_DIAG] strict_plane_band_total="
                   << raw_strict_plane_band_total
                   << " strict_uv_reject=" << raw_strict_uv_reject
+                  << " strict_uv_u_low=" << raw_strict_uv_directional[0]
+                  << " strict_uv_u_high=" << raw_strict_uv_directional[1]
+                  << " strict_uv_v_low=" << raw_strict_uv_directional[2]
+                  << " strict_uv_v_high=" << raw_strict_uv_directional[3]
                   << " strict_pixel_x_reject=" << raw_strict_pixel_x_reject
                   << " strict_pixel_y_reject=" << raw_strict_pixel_y_reject
                   << " near_plane_total=" << raw_near_plane_total
                   << " near_uv_reject=" << raw_near_uv_reject
+                  << " near_uv_u_low=" << raw_near_uv_directional[0]
+                  << " near_uv_u_high=" << raw_near_uv_directional[1]
+                  << " near_uv_v_low=" << raw_near_uv_directional[2]
+                  << " near_uv_v_high=" << raw_near_uv_directional[3]
                   << " near_pixel_x_reject=" << raw_near_pixel_x_reject
                   << " near_pixel_y_reject=" << raw_near_pixel_y_reject
                   << " strict_neighborhood_rejected="
@@ -3016,6 +3072,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     std::size_t ray_uv_reject = 0U;
     std::size_t ray_pixel_x_reject = 0U;
     std::size_t ray_pixel_y_reject = 0U;
+    std::array<std::size_t, 4> ray_uv_directional{};
     std::size_t ray_support_pixels = 0U;
     std::size_t ray_contradict_pixels = 0U;
 #endif
@@ -3074,6 +3131,19 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     const int reject_reason = world_to_cell_reject_reason(plane_u, plane_v);
                     if (reject_reason == 1) {
                         ++ray_uv_reject;
+                        const int flags = world_to_cell_uv_reject_flags(plane_u, plane_v);
+                        if ((flags & 1) != 0) {
+                            ++ray_uv_directional[0];
+                        }
+                        if ((flags & 2) != 0) {
+                            ++ray_uv_directional[1];
+                        }
+                        if ((flags & 4) != 0) {
+                            ++ray_uv_directional[2];
+                        }
+                        if ((flags & 8) != 0) {
+                            ++ray_uv_directional[3];
+                        }
                     } else if (reject_reason == 2) {
                         ++ray_pixel_x_reject;
                     } else if (reject_reason == 3) {
@@ -3136,12 +3206,40 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
+    struct RayCellClassification {
+        std::size_t support_views = 0U;
+        std::size_t contradict_views = 0U;
+        int sole_support_view = -1;
+    };
+    const auto classify_ray_cell = [](const RayPlaneCellSupport& support) {
+        RayCellClassification classification;
+        for (int view_index = 0; view_index < 3; ++view_index) {
+            const std::size_t view = static_cast<std::size_t>(view_index);
+            if (support.support_pixels[view] > support.contradict_pixels[view]
+                && support.support_pixels[view] > 0U) {
+                ++classification.support_views;
+                classification.sole_support_view = view_index;
+            } else if (support.contradict_pixels[view]
+                > support.support_pixels[view]
+                && support.contradict_pixels[view] > 0U) {
+                ++classification.contradict_views;
+            }
+        }
+        if (classification.support_views != 1U) {
+            classification.sole_support_view = -1;
+        }
+        return classification;
+    };
+
 #if defined(_WIN32)
     if (accepted_fuse_count_ == 0U) {
         std::array<std::size_t, 3> ray_support_cells{};
         std::size_t ray_support_cells_overlap_observed_floor = 0U;
         std::size_t ray_support_cells_empty = 0U;
         std::array<std::size_t, 4> empty_support_view_counts{};
+        std::size_t single_view_empty_total = 0U;
+        std::size_t single_view_direct_floor_total = 0U;
+        std::size_t single_view_no_direct_floor_total = 0U;
         std::size_t ray_r1_candidates = 0U;
         std::size_t ray_r2_candidates = 0U;
         cv::Mat support_views2_mask(logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
@@ -3152,18 +3250,14 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     * static_cast<std::size_t>(logical_width_)
                     + static_cast<std::size_t>(x);
                 const RayPlaneCellSupport& support = ray_plane_support[cell];
-                std::size_t support_views = 0U;
-                std::size_t contradict_views = 0U;
+                const RayCellClassification classification = classify_ray_cell(support);
+                const std::size_t support_views = classification.support_views;
+                const std::size_t contradict_views = classification.contradict_views;
                 for (int view_index = 0; view_index < 3; ++view_index) {
                     const std::size_t view = static_cast<std::size_t>(view_index);
                     if (support.support_pixels[view] > support.contradict_pixels[view]
                         && support.support_pixels[view] > 0U) {
-                        ++support_views;
                         ++ray_support_cells[view];
-                    } else if (support.contradict_pixels[view]
-                        > support.support_pixels[view]
-                        && support.contradict_pixels[view] > 0U) {
-                        ++contradict_views;
                     }
                 }
                 if (support_views >= 2U) {
@@ -3179,6 +3273,17 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     continue;
                 }
                 ++empty_support_view_counts[std::min<std::size_t>(support_views, 3U)];
+                if (support_views == 1U) {
+                    ++single_view_empty_total;
+                    const std::size_t sole_view = static_cast<std::size_t>(
+                        classification.sole_support_view);
+                    if (support.direct_floor_color_weight[sole_view]
+                        > kNumericEpsilon) {
+                        ++single_view_direct_floor_total;
+                    } else {
+                        ++single_view_no_direct_floor_total;
+                    }
+                }
                 const bool interior_hole = exterior_empty[cell] == 0U;
                 const bool no_contradiction = contradict_views == 0U;
                 const bool r1 = no_contradiction && support_views >= 2U;
@@ -3214,6 +3319,10 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << " support_pixels=" << ray_support_pixels
                   << " contradict_pixels=" << ray_contradict_pixels
                   << " ray_uv_reject=" << ray_uv_reject
+                  << " ray_uv_u_low=" << ray_uv_directional[0]
+                  << " ray_uv_u_high=" << ray_uv_directional[1]
+                  << " ray_uv_v_low=" << ray_uv_directional[2]
+                  << " ray_uv_v_high=" << ray_uv_directional[3]
                   << " ray_pixel_x_reject=" << ray_pixel_x_reject
                   << " ray_pixel_y_reject=" << ray_pixel_y_reject
                   << " intersections_outside_atlas="
@@ -3232,6 +3341,11 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << " support_views3=" << empty_support_view_counts[3] << std::endl;
         std::clog << "[WINDOWS_RAY_PLANE_CANDIDATES] R1=" << ray_r1_candidates
                   << " R2=" << ray_r2_candidates << std::endl;
+        std::clog << "[WINDOWS_RAY_R3_PROVENANCE] single_view_empty_total="
+                  << single_view_empty_total
+                  << " direct_floor_total=" << single_view_direct_floor_total
+                  << " no_direct_floor_total="
+                  << single_view_no_direct_floor_total << std::endl;
     }
 #endif
 
@@ -3251,19 +3365,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 continue;
             }
             const RayPlaneCellSupport& support = ray_plane_support[cell];
-            std::size_t support_views = 0U;
-            std::size_t contradict_views = 0U;
-            for (int view_index = 0; view_index < 3; ++view_index) {
-                const std::size_t view = static_cast<std::size_t>(view_index);
-                if (support.support_pixels[view] > support.contradict_pixels[view]
-                    && support.support_pixels[view] > 0U) {
-                    ++support_views;
-                } else if (support.contradict_pixels[view]
-                    > support.support_pixels[view]
-                    && support.contradict_pixels[view] > 0U) {
-                    ++contradict_views;
-                }
-            }
+            const RayCellClassification classification = classify_ray_cell(support);
+            const std::size_t support_views = classification.support_views;
+            const std::size_t contradict_views = classification.contradict_views;
             const bool no_contradiction = contradict_views == 0U;
             const bool interior_hole = exterior_empty[cell] == 0U;
             const bool r1 = no_contradiction && support_views >= 2U;
@@ -3305,11 +3409,21 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
+#if defined(_WIN32)
+    std::array<std::size_t, 3> ray_r3_raw_view_counts{};
+    std::array<std::size_t, 3> ray_r3_accepted_view_counts{};
+    std::array<std::size_t, 3> ray_r3_component_counts{};
+    std::array<std::size_t, 3> ray_r3_touching_component_counts{};
+    std::array<std::size_t, 3> ray_r3_disconnected_component_counts{};
+    std::size_t ray_r3_candidate_count = 0U;
+    std::size_t ray_r3_added = 0U;
+    std::size_t ray_r3_missing_direct_rgb = 0U;
+#endif
     std::size_t ray_r1_added = 0U;
     std::size_t ray_r2_added = 0U;
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
         const std::uint8_t tier = ray_completion_tier[cell];
-        if (tier == 0U || floor_cell_valid_[cell] != 0U) {
+        if (tier == 0U || tier == 3U || floor_cell_valid_[cell] != 0U) {
             continue;
         }
         std::uint32_t rgba = 0U;
@@ -3361,20 +3475,289 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             ++ray_r2_added;
         }
     }
+
+    // Ray-R3 is intentionally a separate completion tier. It uses only
+    // single-view ray support that also has a direct near-floor sample, then
+    // requires that the same source view's component touches a trusted
+    // current-group floor seed. R1/R2 and their tolerances are unchanged.
+#if defined(_WIN32)
+    const std::size_t ray_floor_before_r3 = static_cast<std::size_t>(std::count(
+        floor_cell_valid_.begin(), floor_cell_valid_.end(), static_cast<std::uint8_t>(1U)));
+    const float ray_logical_cell_world_size =
+        2.0f * display_scale_ / gui_scale;
+    const float ray_floor_world_area_before =
+        static_cast<float>(ray_floor_before_r3)
+        * ray_logical_cell_world_size * ray_logical_cell_world_size;
+#endif
+    std::vector<std::uint8_t> trusted_floor_seed_mask(cell_count, 0U);
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (current_observed_floor_mask[cell] != 0U
+            || floor_completion_tier[cell] != 0U
+            || ray_completion_tier[cell] == 1U) {
+            trusted_floor_seed_mask[cell] = 1U;
+        }
+    }
+
+    std::array<cv::Mat, 3> r3_raw_masks;
+    for (cv::Mat& mask : r3_raw_masks) {
+        mask = cv::Mat(logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+    }
+    std::vector<std::uint8_t> r3_source_view(cell_count, 255U);
+    for (int y = 0; y < logical_height_; ++y) {
+        for (int x = 0; x < logical_width_; ++x) {
+            const std::size_t cell = static_cast<std::size_t>(y)
+                * static_cast<std::size_t>(logical_width_)
+                + static_cast<std::size_t>(x);
+            if (floor_cell_valid_[cell] != 0U
+                || ray_completion_tier[cell] != 0U) {
+                continue;
+            }
+            const RayPlaneCellSupport& support = ray_plane_support[cell];
+            const RayCellClassification classification = classify_ray_cell(support);
+            if (classification.support_views != 1U
+                || classification.contradict_views != 0U
+                || classification.sole_support_view < 0) {
+                continue;
+            }
+            const std::size_t sole_view = static_cast<std::size_t>(
+                classification.sole_support_view);
+            const float direct_weight = support.direct_floor_color_weight[sole_view];
+            if (!std::isfinite(direct_weight) || direct_weight <= kNumericEpsilon) {
+                continue;
+            }
+            r3_raw_masks[sole_view].at<std::uint8_t>(y, x) = 255U;
+            r3_source_view[cell] = static_cast<std::uint8_t>(sole_view);
+#if defined(_WIN32)
+            ++ray_r3_raw_view_counts[sole_view];
+#endif
+        }
+    }
+
+    std::array<cv::Mat, 3> r3_accepted_masks;
+    for (cv::Mat& mask : r3_accepted_masks) {
+        mask = cv::Mat(logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+    }
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        cv::Mat labels;
+        cv::Mat stats;
+        cv::Mat centroids;
+        const int component_count = cv::connectedComponentsWithStats(
+            r3_raw_masks[static_cast<std::size_t>(view_index)], labels, stats,
+            centroids, 8, CV_32S);
+        std::vector<std::uint8_t> component_touches_seed(
+            static_cast<std::size_t>(std::max(component_count, 0)), 0U);
+        for (int y = 0; y < logical_height_; ++y) {
+            for (int x = 0; x < logical_width_; ++x) {
+                const int component = labels.at<int>(y, x);
+                if (component <= 0
+                    || component >= component_count
+                    || component_touches_seed[static_cast<std::size_t>(component)] != 0U) {
+                    continue;
+                }
+                bool touches_seed = false;
+                for (int dy = -1; dy <= 1 && !touches_seed; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) {
+                            continue;
+                        }
+                        const int nx = x + dx;
+                        const int ny = y + dy;
+                        if (nx < 0 || nx >= logical_width_
+                            || ny < 0 || ny >= logical_height_) {
+                            continue;
+                        }
+                        const std::size_t neighbor = static_cast<std::size_t>(ny)
+                            * static_cast<std::size_t>(logical_width_)
+                            + static_cast<std::size_t>(nx);
+                        if (trusted_floor_seed_mask[neighbor] != 0U) {
+                            touches_seed = true;
+                            break;
+                        }
+                    }
+                }
+                if (touches_seed) {
+                    component_touches_seed[static_cast<std::size_t>(component)] = 1U;
+                }
+            }
+        }
+
+#if defined(_WIN32)
+        const std::size_t component_total = component_count > 0
+            ? static_cast<std::size_t>(component_count - 1) : 0U;
+        ray_r3_component_counts[static_cast<std::size_t>(view_index)] = component_total;
+        for (std::size_t component = 1U; component < component_touches_seed.size();
+             ++component) {
+            if (component_touches_seed[component] != 0U) {
+                ++ray_r3_touching_component_counts[static_cast<std::size_t>(view_index)];
+            } else {
+                ++ray_r3_disconnected_component_counts[static_cast<std::size_t>(view_index)];
+            }
+        }
+#endif
+        for (int y = 0; y < logical_height_; ++y) {
+            for (int x = 0; x < logical_width_; ++x) {
+                const int component = labels.at<int>(y, x);
+                if (component <= 0
+                    || component >= component_count
+                    || component_touches_seed[static_cast<std::size_t>(component)] == 0U) {
+                    continue;
+                }
+                const std::size_t cell = static_cast<std::size_t>(y)
+                    * static_cast<std::size_t>(logical_width_)
+                    + static_cast<std::size_t>(x);
+                const std::size_t sole_view = static_cast<std::size_t>(
+                    r3_source_view[cell]);
+                if (sole_view >= 3U) {
+                    continue;
+                }
+                ray_completion_tier[cell] = 3U;
+                const float direct_weight =
+                    ray_plane_support[cell].direct_floor_color_weight[sole_view];
+                const cv::Vec3f direct_color_sum =
+                    ray_plane_support[cell].direct_floor_color_sum[sole_view];
+                const float direct_confidence_sum =
+                    ray_plane_support[cell].direct_floor_confidence_sum[sole_view];
+                if (std::isfinite(direct_weight)
+                    && direct_weight > kNumericEpsilon
+                    && finite_vec(direct_color_sum)
+                    && std::isfinite(direct_confidence_sum)) {
+                    ray_completion_colors[cell] = direct_color_sum
+                        * (1.0f / direct_weight);
+                    ray_completion_confidences[cell] = std::clamp(
+                        direct_confidence_sum / direct_weight, 0.0f, 1.0f);
+                    ray_completion_color_valid[cell] = 1U;
+                }
+                r3_accepted_masks[static_cast<std::size_t>(view_index)].at<
+                    std::uint8_t>(y, x) = 255U;
+#if defined(_WIN32)
+                ++ray_r3_candidate_count;
+                ++ray_r3_accepted_view_counts[static_cast<std::size_t>(view_index)];
+#endif
+            }
+        }
+    }
+
+#if defined(_WIN32)
+    if (accepted_fuse_count_ == 0U) {
+        const auto make_r3_visual = [&](const std::array<cv::Mat, 3>& masks) {
+            cv::Mat visual(logical_height_, logical_width_, CV_8UC3,
+                cv::Scalar(0, 0, 0));
+            for (int y = 0; y < logical_height_; ++y) {
+                for (int x = 0; x < logical_width_; ++x) {
+                    cv::Vec3b& pixel = visual.at<cv::Vec3b>(y, x);
+                    if (masks[0].at<std::uint8_t>(y, x) != 0U) {
+                        pixel[2] = 255U; // view0 = red
+                    }
+                    if (masks[1].at<std::uint8_t>(y, x) != 0U) {
+                        pixel[1] = 255U; // view1 = green
+                    }
+                    if (masks[2].at<std::uint8_t>(y, x) != 0U) {
+                        pixel[0] = 255U; // view2 = blue
+                    }
+                }
+            }
+            cv::Mat resized;
+            cv::resize(visual, resized, cv::Size(canvas_width_, canvas_height_),
+                0.0, 0.0, cv::INTER_NEAREST);
+            return resized;
+        };
+        const cv::Mat raw_visual = make_r3_visual(r3_raw_masks);
+        const cv::Mat accepted_visual = make_r3_visual(r3_accepted_masks);
+        try {
+            if (!cv::imwrite("tmp/ray_R3_raw_direct_floor.png", raw_visual)
+                || !cv::imwrite("tmp/ray_R3_accepted.png", accepted_visual)) {
+                std::clog << "[WINDOWS_RAY_R3_MASK] write_failed=1" << std::endl;
+            }
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_RAY_R3_MASK] write_failed=1" << std::endl;
+        }
+        std::clog << "[WINDOWS_RAY_R3] raw_view0=" << ray_r3_raw_view_counts[0]
+                  << " raw_view1=" << ray_r3_raw_view_counts[1]
+                  << " raw_view2=" << ray_r3_raw_view_counts[2]
+                  << " candidates=" << ray_r3_candidate_count << std::endl;
+        std::clog << "[WINDOWS_RAY_R3_COMPONENTS] view0="
+                  << ray_r3_component_counts[0]
+                  << " view1=" << ray_r3_component_counts[1]
+                  << " view2=" << ray_r3_component_counts[2]
+                  << " touching_view0=" << ray_r3_touching_component_counts[0]
+                  << " touching_view1=" << ray_r3_touching_component_counts[1]
+                  << " touching_view2=" << ray_r3_touching_component_counts[2]
+                  << " disconnected_view0="
+                  << ray_r3_disconnected_component_counts[0]
+                  << " disconnected_view1="
+                  << ray_r3_disconnected_component_counts[1]
+                  << " disconnected_view2="
+                  << ray_r3_disconnected_component_counts[2] << std::endl;
+    }
+#endif
+
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        const std::uint8_t tier = ray_completion_tier[cell];
+        if (tier != 3U || floor_cell_valid_[cell] != 0U) {
+            continue;
+        }
+        if (ray_completion_color_valid[cell] == 0U) {
+#if defined(_WIN32)
+            ++ray_r3_missing_direct_rgb;
+#endif
+            continue;
+        }
+        const int logical_x = static_cast<int>(
+            cell % static_cast<std::size_t>(logical_width_));
+        const int logical_y = static_cast<int>(
+            cell / static_cast<std::size_t>(logical_width_));
+        const std::uint32_t slot_id = slot_for(logical_x, logical_y, 0);
+        if (slot_id == std::numeric_limits<std::uint32_t>::max()) {
+            continue;
+        }
+        FusedSlot next = floor_cells_[cell];
+        next.slot_id = slot_id;
+        next.depth = 0.0f;
+        next.confidence = ray_completion_confidences[cell];
+        next.rgba = color_to_rgba(ray_completion_colors[cell]);
+        next.floor = true;
+        floor_cells_[cell] = next;
+        floor_cell_valid_[cell] = 1U;
+        result.slots.push_back(next);
+        result.occupied_slots.push_back(slot_id);
+#if defined(_WIN32)
+        ++ray_r3_added;
+        ++completion_direct_rgb_cells;
+#endif
+    }
+
 #if defined(_WIN32)
     if (accepted_fuse_count_ == 0U) {
         std::size_t remaining_interior_holes = 0U;
+        std::size_t remaining_exterior_empty = 0U;
         for (std::size_t cell = 0; cell < cell_count; ++cell) {
-            if (floor_cell_valid_[cell] == 0U && exterior_empty[cell] == 0U) {
-                ++remaining_interior_holes;
+            if (floor_cell_valid_[cell] == 0U) {
+                if (exterior_empty[cell] == 0U) {
+                    ++remaining_interior_holes;
+                } else {
+                    ++remaining_exterior_empty;
+                }
             }
         }
+        const std::size_t ray_floor_after_r3 = static_cast<std::size_t>(std::count(
+            floor_cell_valid_.begin(), floor_cell_valid_.end(), static_cast<std::uint8_t>(1U)));
+        const float ray_floor_world_area_after =
+            static_cast<float>(ray_floor_after_r3)
+            * ray_logical_cell_world_size * ray_logical_cell_world_size;
         std::clog << "[WINDOWS_RAY_PLANE_RESULT] R1_candidates="
                   << ray_r1_candidate_count
                   << " R1_added=" << ray_r1_added
                   << " R2_candidates=" << ray_r2_candidate_count
                   << " R2_added=" << ray_r2_added
+                  << " R3_candidates=" << ray_r3_candidate_count
+                  << " R3_added=" << ray_r3_added
+                  << " R3_missing_direct_rgb=" << ray_r3_missing_direct_rgb
+                  << " floor_before_R3=" << ray_floor_before_r3
+                  << " floor_after_R3=" << ray_floor_after_r3
+                  << " floor_world_area_before=" << ray_floor_world_area_before
+                  << " floor_world_area_after=" << ray_floor_world_area_after
                   << " remaining_interior_holes=" << remaining_interior_holes
+                  << " remaining_exterior_empty=" << remaining_exterior_empty
                   << " geometry_without_direct_rgb="
                   << completion_geometry_without_direct_rgb
                   << " geometry_dropped_due_rgb="

@@ -2715,6 +2715,31 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
+    struct RayCellClassification {
+        std::size_t support_views = 0U;
+        std::size_t contradict_views = 0U;
+        int sole_support_view = -1;
+    };
+    const auto classify_ray_cell = [](const RayPlaneCellSupport& support) {
+        RayCellClassification classification;
+        for (int view_index = 0; view_index < 3; ++view_index) {
+            const std::size_t view = static_cast<std::size_t>(view_index);
+            if (support.support_pixels[view] > support.contradict_pixels[view]
+                && support.support_pixels[view] > 0U) {
+                ++classification.support_views;
+                classification.sole_support_view = view_index;
+            } else if (support.contradict_pixels[view]
+                > support.support_pixels[view]
+                && support.contradict_pixels[view] > 0U) {
+                ++classification.contradict_views;
+            }
+        }
+        if (classification.support_views != 1U) {
+            classification.sole_support_view = -1;
+        }
+        return classification;
+    };
+
     std::vector<std::uint8_t> ray_completion_tier(cell_count, 0U);
     std::vector<cv::Vec3f> ray_completion_colors(
         cell_count, cv::Vec3f(0.0f, 0.0f, 0.0f));
@@ -2733,19 +2758,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 continue;
             }
             const RayPlaneCellSupport& support = ray_plane_support[cell];
-            std::size_t support_views = 0U;
-            std::size_t contradict_views = 0U;
-            for (int view_index = 0; view_index < 3; ++view_index) {
-                const std::size_t view = static_cast<std::size_t>(view_index);
-                if (support.support_pixels[view] > support.contradict_pixels[view]
-                    && support.support_pixels[view] > 0U) {
-                    ++support_views;
-                } else if (support.contradict_pixels[view]
-                    > support.support_pixels[view]
-                    && support.contradict_pixels[view] > 0U) {
-                    ++contradict_views;
-                }
-            }
+            const RayCellClassification classification = classify_ray_cell(support);
+            const std::size_t support_views = classification.support_views;
+            const std::size_t contradict_views = classification.contradict_views;
             const bool no_contradiction = contradict_views == 0U;
             const bool interior_hole = exterior_empty[cell] == 0U;
             const bool r1 = no_contradiction && support_views >= 2U;
@@ -2797,7 +2812,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
 #endif
     for (std::size_t cell = 0U; cell < cell_count; ++cell) {
         const std::uint8_t tier = ray_completion_tier[cell];
-        if (tier == 0U || floor_cell_valid_[cell] != 0U) {
+        if (tier == 0U || tier == 3U || floor_cell_valid_[cell] != 0U) {
             continue;
         }
         std::uint32_t rgba = 0U;
@@ -2835,6 +2850,156 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             ++ray_r2_added;
         }
 #endif
+    }
+
+    // Ray-R3 is intentionally a separate completion tier. It uses only
+    // single-view ray support that also has a direct near-floor sample, then
+    // requires that the same source view's component touches a trusted
+    // current-group floor seed. R1/R2 and their tolerances are unchanged.
+    std::vector<std::uint8_t> trusted_floor_seed_mask(cell_count, 0U);
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (current_observed_floor_mask[cell] != 0U
+            || floor_completion_tier[cell] != 0U
+            || ray_completion_tier[cell] == 1U) {
+            trusted_floor_seed_mask[cell] = 1U;
+        }
+    }
+
+    std::array<cv::Mat, 3> r3_raw_masks;
+    for (cv::Mat& mask : r3_raw_masks) {
+        mask = cv::Mat(logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+    }
+    std::vector<std::uint8_t> r3_source_view(cell_count, 255U);
+    for (int y = 0; y < logical_height_; ++y) {
+        for (int x = 0; x < logical_width_; ++x) {
+            const std::size_t cell = static_cast<std::size_t>(y)
+                * static_cast<std::size_t>(logical_width_)
+                + static_cast<std::size_t>(x);
+            if (floor_cell_valid_[cell] != 0U
+                || ray_completion_tier[cell] != 0U) {
+                continue;
+            }
+            const RayPlaneCellSupport& support = ray_plane_support[cell];
+            const RayCellClassification classification = classify_ray_cell(support);
+            if (classification.support_views != 1U
+                || classification.contradict_views != 0U
+                || classification.sole_support_view < 0) {
+                continue;
+            }
+            const std::size_t sole_view = static_cast<std::size_t>(
+                classification.sole_support_view);
+            const float direct_weight = support.direct_floor_color_weight[sole_view];
+            if (!std::isfinite(direct_weight) || direct_weight <= kNumericEpsilon) {
+                continue;
+            }
+            r3_raw_masks[sole_view].at<std::uint8_t>(y, x) = 255U;
+            r3_source_view[cell] = static_cast<std::uint8_t>(sole_view);
+        }
+    }
+
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        cv::Mat labels;
+        cv::Mat stats;
+        cv::Mat centroids;
+        const int component_count = cv::connectedComponentsWithStats(
+            r3_raw_masks[static_cast<std::size_t>(view_index)], labels, stats,
+            centroids, 8, CV_32S);
+        std::vector<std::uint8_t> component_touches_seed(
+            static_cast<std::size_t>(std::max(component_count, 0)), 0U);
+        for (int y = 0; y < logical_height_; ++y) {
+            for (int x = 0; x < logical_width_; ++x) {
+                const int component = labels.at<int>(y, x);
+                if (component <= 0
+                    || component >= component_count
+                    || component_touches_seed[static_cast<std::size_t>(component)] != 0U) {
+                    continue;
+                }
+                bool touches_seed = false;
+                for (int dy = -1; dy <= 1 && !touches_seed; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) {
+                            continue;
+                        }
+                        const int nx = x + dx;
+                        const int ny = y + dy;
+                        if (nx < 0 || nx >= logical_width_
+                            || ny < 0 || ny >= logical_height_) {
+                            continue;
+                        }
+                        const std::size_t neighbor = static_cast<std::size_t>(ny)
+                            * static_cast<std::size_t>(logical_width_)
+                            + static_cast<std::size_t>(nx);
+                        if (trusted_floor_seed_mask[neighbor] != 0U) {
+                            touches_seed = true;
+                            break;
+                        }
+                    }
+                }
+                if (touches_seed) {
+                    component_touches_seed[static_cast<std::size_t>(component)] = 1U;
+                }
+            }
+        }
+        for (int y = 0; y < logical_height_; ++y) {
+            for (int x = 0; x < logical_width_; ++x) {
+                const int component = labels.at<int>(y, x);
+                if (component <= 0
+                    || component >= component_count
+                    || component_touches_seed[static_cast<std::size_t>(component)] == 0U) {
+                    continue;
+                }
+                const std::size_t cell = static_cast<std::size_t>(y)
+                    * static_cast<std::size_t>(logical_width_)
+                    + static_cast<std::size_t>(x);
+                const std::size_t sole_view = static_cast<std::size_t>(
+                    r3_source_view[cell]);
+                if (sole_view >= 3U) {
+                    continue;
+                }
+                ray_completion_tier[cell] = 3U;
+                const float direct_weight =
+                    ray_plane_support[cell].direct_floor_color_weight[sole_view];
+                const cv::Vec3f direct_color_sum =
+                    ray_plane_support[cell].direct_floor_color_sum[sole_view];
+                const float direct_confidence_sum =
+                    ray_plane_support[cell].direct_floor_confidence_sum[sole_view];
+                if (std::isfinite(direct_weight)
+                    && direct_weight > kNumericEpsilon
+                    && finite_vec(direct_color_sum)
+                    && std::isfinite(direct_confidence_sum)) {
+                    ray_completion_colors[cell] = direct_color_sum
+                        * (1.0f / direct_weight);
+                    ray_completion_confidences[cell] = std::clamp(
+                        direct_confidence_sum / direct_weight, 0.0f, 1.0f);
+                    ray_completion_color_valid[cell] = 1U;
+                }
+            }
+        }
+    }
+
+    for (std::size_t cell = 0U; cell < cell_count; ++cell) {
+        if (ray_completion_tier[cell] != 3U || floor_cell_valid_[cell] != 0U
+            || ray_completion_color_valid[cell] == 0U) {
+            continue;
+        }
+        const int logical_x = static_cast<int>(
+            cell % static_cast<std::size_t>(logical_width_));
+        const int logical_y = static_cast<int>(
+            cell / static_cast<std::size_t>(logical_width_));
+        const std::uint32_t slot_id = slot_for(logical_x, logical_y, 0);
+        if (slot_id == std::numeric_limits<std::uint32_t>::max()) {
+            continue;
+        }
+        FusedSlot next = floor_cells_[cell];
+        next.slot_id = slot_id;
+        next.depth = 0.0f;
+        next.confidence = ray_completion_confidences[cell];
+        next.rgba = color_to_rgba(ray_completion_colors[cell]);
+        next.floor = true;
+        floor_cells_[cell] = next;
+        floor_cell_valid_[cell] = 1U;
+        result.slots.push_back(next);
+        result.occupied_slots.push_back(slot_id);
     }
 
     std::vector<float> final_object_heights;
