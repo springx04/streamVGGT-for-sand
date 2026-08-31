@@ -1271,10 +1271,111 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         const float v_ninety_eight = percentile_value(robust_floor_v, 0.98f);
         const float raw_u_span = std::max(u_ninety_eight - u_two, 0.01f * scene_scale);
         const float raw_v_span = std::max(v_ninety_eight - v_two, 0.01f * scene_scale);
-        const float u_min = u_two - 0.08f * raw_u_span;
-        const float u_max = u_ninety_eight + 0.08f * raw_u_span;
-        const float v_min = v_two - 0.08f * raw_v_span;
-        const float v_max = v_ninety_eight + 0.08f * raw_v_span;
+        const float sparse_u_min = u_two - 0.08f * raw_u_span;
+        const float sparse_u_max = u_ninety_eight + 0.08f * raw_u_span;
+        const float sparse_v_min = v_two - 0.08f * raw_v_span;
+        const float sparse_v_max = v_ninety_eight + 0.08f * raw_v_span;
+
+        // The balanced/RANSAC samples above remain the baseline extent. On
+        // the first group only, use all full-resolution point-head pixels as
+        // a second extent source, but keep only real near-plane samples that
+        // pass the existing neighborhood consistency gate. This determines
+        // representable atlas extent only; it does not create floor cells.
+        std::vector<FloorUVSample> full_extent_floor_uv;
+        for (int view_index = 0; view_index < 3; ++view_index) {
+            const GroupWorldView& view = views[static_cast<std::size_t>(view_index)];
+            for (int y = 0; y < view.world_points.rows; ++y) {
+                for (int x = 0; x < view.world_points.cols; ++x) {
+                    const cv::Vec3f point = view.world_points.at<cv::Vec3f>(y, x);
+                    const float confidence = view.world_confidence.at<float>(y, x);
+                    if (!finite_vec(point) || !std::isfinite(confidence)) {
+                        continue;
+                    }
+                    const cv::Vec3f delta = point - inlier_center;
+                    const float height = plane.normal.dot(delta);
+                    if (!std::isfinite(height)
+                        || std::abs(height) > 2.5f * floor_band) {
+                        continue;
+                    }
+                    if (!floor_neighborhood_consistent(
+                        view.world_points, view.world_confidence, x, y,
+                        inlier_center, plane.normal, floor_band)) {
+                        continue;
+                    }
+                    full_extent_floor_uv.push_back(FloorUVSample{
+                        axis_x.dot(delta), axis_y.dot(delta)});
+                }
+            }
+        }
+
+        float full_u_min = sparse_u_min;
+        float full_u_max = sparse_u_max;
+        float full_v_min = sparse_v_min;
+        float full_v_max = sparse_v_max;
+        std::size_t full_robust_support_count = 0U;
+        if (full_extent_floor_uv.size() >= 3U) {
+            std::vector<float> full_u;
+            std::vector<float> full_v;
+            full_u.reserve(full_extent_floor_uv.size());
+            full_v.reserve(full_extent_floor_uv.size());
+            for (const FloorUVSample& sample : full_extent_floor_uv) {
+                full_u.push_back(sample.u);
+                full_v.push_back(sample.v);
+            }
+            const float full_center_u = median_value(full_u);
+            const float full_center_v = median_value(full_v);
+            std::vector<float> full_radii;
+            full_radii.reserve(full_extent_floor_uv.size());
+            for (const FloorUVSample& sample : full_extent_floor_uv) {
+                full_radii.push_back(std::hypot(
+                    sample.u - full_center_u, sample.v - full_center_v));
+            }
+            const float full_radius_median = median_value(full_radii);
+            std::vector<float> full_radius_deviations;
+            full_radius_deviations.reserve(full_radii.size());
+            for (const float radius : full_radii) {
+                full_radius_deviations.push_back(std::abs(
+                    radius - full_radius_median));
+            }
+            const float full_radius_mad = median_value(full_radius_deviations);
+            const float full_radius_limit = full_radius_median
+                + 4.0f * 1.4826f
+                * std::max(full_radius_mad, kNumericEpsilon);
+            std::vector<float> full_robust_u;
+            std::vector<float> full_robust_v;
+            full_robust_u.reserve(full_extent_floor_uv.size());
+            full_robust_v.reserve(full_extent_floor_uv.size());
+            for (std::size_t index = 0; index < full_extent_floor_uv.size(); ++index) {
+                if (full_radii[index] <= full_radius_limit) {
+                    full_robust_u.push_back(full_extent_floor_uv[index].u);
+                    full_robust_v.push_back(full_extent_floor_uv[index].v);
+                }
+            }
+            full_robust_support_count = full_robust_u.size();
+            if (full_robust_u.size() >= 3U && full_robust_v.size() >= 3U) {
+                const float full_u_two = percentile_value(full_robust_u, 0.02f);
+                const float full_u_ninety_eight =
+                    percentile_value(full_robust_u, 0.98f);
+                const float full_v_two = percentile_value(full_robust_v, 0.02f);
+                const float full_v_ninety_eight =
+                    percentile_value(full_robust_v, 0.98f);
+                const float full_raw_u_span = std::max(
+                    full_u_ninety_eight - full_u_two, 0.01f * scene_scale);
+                const float full_raw_v_span = std::max(
+                    full_v_ninety_eight - full_v_two, 0.01f * scene_scale);
+                full_u_min = full_u_two - 0.08f * full_raw_u_span;
+                full_u_max = full_u_ninety_eight + 0.08f * full_raw_u_span;
+                full_v_min = full_v_two - 0.08f * full_raw_v_span;
+                full_v_max = full_v_ninety_eight + 0.08f * full_raw_v_span;
+            }
+        }
+
+        // Only expand the baseline. A full-resolution distribution must not
+        // remove any region that the sparse baseline already represented.
+        const float u_min = std::min(sparse_u_min, full_u_min);
+        const float u_max = std::max(sparse_u_max, full_u_max);
+        const float v_min = std::min(sparse_v_min, full_v_min);
+        const float v_max = std::max(sparse_v_max, full_v_max);
 
         reference_initialized_ = true;
         reference_centers_ = current_centers;
