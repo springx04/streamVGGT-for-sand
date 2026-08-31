@@ -1402,6 +1402,17 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         return logical_x >= 0 && logical_x < logical_width_
             && logical_y >= 0 && logical_y < logical_height_;
     };
+    const auto cell_to_reference_floor_point = [&](const int logical_x, const int logical_y) {
+        const float physical_x = static_cast<float>(logical_x * 2) + 0.5f;
+        const float physical_y = static_cast<float>(logical_y * 2) + 0.5f;
+        const float u = center_u_
+            + (physical_x - 0.5f * static_cast<float>(canvas_width_))
+                / gui_scale * display_scale_;
+        const float v = center_v_
+            - (physical_y - 0.5f * static_cast<float>(canvas_height_))
+                / gui_scale * display_scale_;
+        return plane_origin_ + axis_x_ * u + axis_y_ * v;
+    };
     const auto slot_for = [&](const int logical_x, const int logical_y, const int layer) {
         const int dx = (layer == 1 || layer == 3) ? 1 : 0;
         const int dy = (layer >= 2) ? 1 : 0;
@@ -1684,6 +1695,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
 
     // Update persistent floor cells. A cell not seen in this group is left
     // untouched, so a temporary arm occlusion cannot erase static ground.
+    // Keep a separate current-group observation mask: a completion cell may
+    // persist, but it must not become geometry evidence for the next F3 ring.
+    std::vector<std::uint8_t> current_observed_floor_mask(cell_count, 0U);
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
         std::array<const FloorSample*, 3> contributors{};
         bool has_strict_floor = false;
@@ -1754,6 +1768,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 cell % static_cast<std::size_t>(logical_width_));
             const int logical_y = static_cast<int>(
                 cell / static_cast<std::size_t>(logical_width_));
+            current_observed_floor_mask[cell] = 1U;
             FusedSlot next = floor_cells_[cell];
             next.slot_id = slot_for(logical_x, logical_y, 0);
             next.depth = 0.0f;
@@ -2311,6 +2326,256 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 object_best[cell].valid = false;
             }
         }
+    }
+
+    // Complete only empty floor cells after the final object filtering. The
+    // fitted plane supplies geometry, while the existing multi-view
+    // reprojection relation decides whether that geometry is justified.
+    std::vector<std::uint8_t> final_object_mask(cell_count, 0U);
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (object_best[cell].valid) {
+            final_object_mask[cell] = 1U;
+        }
+    }
+
+    std::vector<std::uint8_t> exterior_empty(cell_count, 0U);
+    std::vector<std::size_t> flood_queue;
+    flood_queue.reserve(cell_count);
+    const auto enqueue_empty_boundary = [&](const int x, const int y) {
+        const std::size_t cell = static_cast<std::size_t>(y) * logical_width_ + x;
+        if (current_observed_floor_mask[cell] == 0U && exterior_empty[cell] == 0U) {
+            exterior_empty[cell] = 1U;
+            flood_queue.push_back(cell);
+        }
+    };
+    for (int x = 0; x < logical_width_; ++x) {
+        enqueue_empty_boundary(x, 0);
+        enqueue_empty_boundary(x, logical_height_ - 1);
+    }
+    for (int y = 1; y + 1 < logical_height_; ++y) {
+        enqueue_empty_boundary(0, y);
+        enqueue_empty_boundary(logical_width_ - 1, y);
+    }
+    for (std::size_t queue_index = 0U; queue_index < flood_queue.size(); ++queue_index) {
+        const std::size_t cell = flood_queue[queue_index];
+        const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
+        const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                const int nx = x + dx;
+                const int ny = y + dy;
+                if (nx < 0 || nx >= logical_width_ || ny < 0 || ny >= logical_height_) {
+                    continue;
+                }
+                enqueue_empty_boundary(nx, ny);
+            }
+        }
+    }
+
+    std::vector<std::uint8_t> floor_completion_tier(cell_count, 0U);
+    std::vector<cv::Vec3f> floor_completion_colors(
+        cell_count, cv::Vec3f(0.0f, 0.0f, 0.0f));
+    std::vector<float> floor_completion_confidences(cell_count, 0.0f);
+    std::vector<std::uint8_t> floor_completion_color_valid(cell_count, 0U);
+    for (int y = 0; y < logical_height_; ++y) {
+        for (int x = 0; x < logical_width_; ++x) {
+            const std::size_t cell = static_cast<std::size_t>(y) * logical_width_ + x;
+            if (floor_cell_valid_[cell] != 0U) {
+                continue;
+            }
+            const cv::Vec3f plane_point = cell_to_reference_floor_point(x, y);
+            const cv::Vec3f delta = plane_point - plane_origin_;
+            const float u = axis_x_.dot(delta);
+            const float v = axis_y_.dot(delta);
+            if (u < u_min_ || u > u_max_ || v < v_min_ || v > v_max_) {
+                continue;
+            }
+
+            std::array<ReprojectionResult, 3> reprojections{};
+            std::size_t support = 0U;
+            std::size_t occluded = 0U;
+            std::size_t contradict = 0U;
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                ReprojectionResult& reprojection =
+                    reprojections[static_cast<std::size_t>(view_index)];
+                reprojection = project_world_point_to_view(
+                    plane_point, transforms[static_cast<std::size_t>(view_index)],
+                    views[static_cast<std::size_t>(view_index)],
+                    reprojection_world_tolerance, reprojection_depth_tolerance);
+                switch (reprojection.relation) {
+                case ReprojectionRelation::Support:
+                    ++support;
+                    break;
+                case ReprojectionRelation::Occluded:
+                    ++occluded;
+                    break;
+                case ReprojectionRelation::Contradict:
+                    ++contradict;
+                    break;
+                case ReprojectionRelation::Outside:
+                case ReprojectionRelation::Invalid:
+                    break;
+                }
+            }
+
+            std::uint8_t tier = 0U;
+            if (contradict == 0U && support >= 2U) {
+                tier = 1U;
+            } else if (contradict == 0U && support >= 1U
+                && support + occluded >= 2U) {
+                tier = 2U;
+            } else if (contradict == 0U && support == 0U && occluded >= 2U
+                && (final_object_mask[cell] != 0U || exterior_empty[cell] == 0U)) {
+                tier = 3U;
+            }
+            if (tier == 0U) {
+                continue;
+            }
+            floor_completion_tier[cell] = tier;
+
+            if (tier == 1U || tier == 2U) {
+                cv::Vec3f color(0.0f, 0.0f, 0.0f);
+                float color_weight = 0.0f;
+                float confidence_weight = 0.0f;
+                float total_weight = 0.0f;
+                for (int view_index = 0; view_index < 3; ++view_index) {
+                    const ReprojectionResult& reprojection =
+                        reprojections[static_cast<std::size_t>(view_index)];
+                    if (reprojection.relation != ReprojectionRelation::Support) {
+                        continue;
+                    }
+                    const GroupWorldView& view = views[static_cast<std::size_t>(view_index)];
+                    const int pixel_x = std::clamp(
+                        static_cast<int>(std::lround(reprojection.pixel_x)),
+                        0, view.rgb.cols - 1);
+                    const int pixel_y = std::clamp(
+                        static_cast<int>(std::lround(reprojection.pixel_y)),
+                        0, view.rgb.rows - 1);
+                    const cv::Vec3f sample_color = view.rgb.at<cv::Vec3f>(pixel_y, pixel_x);
+                    const float sample_confidence =
+                        view.world_confidence.at<float>(pixel_y, pixel_x);
+                    if (!finite_vec(sample_color) || !std::isfinite(sample_confidence)) {
+                        continue;
+                    }
+                    const ConfidenceStats& confidence_range =
+                        confidence_stats[static_cast<std::size_t>(view_index)];
+                    const float normalized = normalized_confidence(
+                        sample_confidence, confidence_range.q10, confidence_range.q90);
+                    const float weight = std::max(
+                        normalized * border_weight(
+                            pixel_x, pixel_y, view.rgb.cols, view.rgb.rows),
+                        1e-4f);
+                    const auto& gain = color_gain_[static_cast<std::size_t>(view_index)];
+                    const cv::Vec3f corrected(
+                        std::clamp(sample_color[0] * gain[0], 0.0f, 1.0f),
+                        std::clamp(sample_color[1] * gain[1], 0.0f, 1.0f),
+                        std::clamp(sample_color[2] * gain[2], 0.0f, 1.0f));
+                    if (!finite_vec(corrected)) {
+                        continue;
+                    }
+                    color += corrected * weight;
+                    color_weight += weight;
+                    total_weight += weight;
+                    confidence_weight += normalized * weight;
+                }
+                if (color_weight > kNumericEpsilon) {
+                    floor_completion_colors[cell] = color * (1.0f / color_weight);
+                    floor_completion_color_valid[cell] = 1U;
+                }
+                if (total_weight > kNumericEpsilon) {
+                    floor_completion_confidences[cell] = std::clamp(
+                        confidence_weight / total_weight, 0.0f, 1.0f);
+                }
+            }
+        }
+    }
+
+    // F3 geometry has an occlusion explanation but no directly visible floor
+    // RGB. Propagate colour only from current-group observed floor cells, and
+    // only through F3 cells that already passed the geometry gate. This is a
+    // texture approximation; it never creates new geometry candidates.
+    std::vector<int> f3_color_source(cell_count, -1);
+    std::vector<std::size_t> f3_color_queue;
+    f3_color_queue.reserve(cell_count);
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (current_observed_floor_mask[cell] == 0U) {
+            continue;
+        }
+        const auto channels = unpack_rgba(floor_cells_[cell].rgba);
+        if (channels[0] == 0U && channels[1] == 0U && channels[2] == 0U) {
+            continue;
+        }
+        f3_color_source[cell] = static_cast<int>(cell);
+        f3_color_queue.push_back(cell);
+    }
+    for (std::size_t queue_index = 0U; queue_index < f3_color_queue.size(); ++queue_index) {
+        const std::size_t cell = f3_color_queue[queue_index];
+        const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
+        const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                const int nx = x + dx;
+                const int ny = y + dy;
+                if (nx < 0 || nx >= logical_width_ || ny < 0 || ny >= logical_height_) {
+                    continue;
+                }
+                const std::size_t neighbor =
+                    static_cast<std::size_t>(ny) * logical_width_ + nx;
+                if (floor_completion_tier[neighbor] != 3U
+                    || f3_color_source[neighbor] >= 0) {
+                    continue;
+                }
+                f3_color_source[neighbor] = f3_color_source[cell];
+                f3_color_queue.push_back(neighbor);
+            }
+        }
+    }
+
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        const std::uint8_t tier = floor_completion_tier[cell];
+        if (tier == 0U || floor_cell_valid_[cell] != 0U) {
+            continue;
+        }
+        std::uint32_t rgba = 0U;
+        float confidence = 0.0f;
+        if (tier == 1U || tier == 2U) {
+            if (floor_completion_color_valid[cell] == 0U) {
+                continue;
+            }
+            rgba = color_to_rgba(floor_completion_colors[cell]);
+            confidence = floor_completion_confidences[cell];
+        } else {
+            const int source = f3_color_source[cell];
+            if (source < 0) {
+                continue;
+            }
+            rgba = floor_cells_[static_cast<std::size_t>(source)].rgba;
+            confidence = floor_cells_[static_cast<std::size_t>(source)].confidence;
+        }
+        const int logical_x = static_cast<int>(
+            cell % static_cast<std::size_t>(logical_width_));
+        const int logical_y = static_cast<int>(
+            cell / static_cast<std::size_t>(logical_width_));
+        const std::uint32_t slot_id = slot_for(logical_x, logical_y, 0);
+        if (slot_id == std::numeric_limits<std::uint32_t>::max()) {
+            continue;
+        }
+        FusedSlot next = floor_cells_[cell];
+        next.slot_id = slot_id;
+        next.depth = 0.0f;
+        next.confidence = confidence;
+        next.rgba = rgba;
+        next.floor = true;
+        floor_cells_[cell] = next;
+        floor_cell_valid_[cell] = 1U;
+        result.slots.push_back(next);
+        result.occupied_slots.push_back(slot_id);
     }
 
     std::vector<float> final_object_heights;
