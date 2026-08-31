@@ -1672,6 +1672,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     std::array<std::size_t, 4> raw_near_uv_directional{};
     std::size_t raw_strict_neighborhood_rejected = 0U;
     std::size_t raw_near_neighborhood_rejected = 0U;
+    std::array<std::size_t, 3> reliable_strict_uv_reject_by_view{};
+    std::array<std::size_t, 3> reliable_near_uv_reject_by_view{};
+    std::array<std::size_t, 3> reliable_object_uv_reject_by_view{};
 #endif
     for (int view_index = 0; view_index < 3; ++view_index) {
         const GroupWorldView& view = views[static_cast<std::size_t>(view_index)];
@@ -1702,6 +1705,12 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 if (!world_to_cell(u, v, logical_x, logical_y)) {
 #if defined(_WIN32)
                     if (strict_plane_band) {
+                        if (floor_neighborhood_consistent(
+                            aligned_points, view.world_confidence, x, y,
+                            plane_origin_, plane_normal_, floor_band_)) {
+                            ++reliable_strict_uv_reject_by_view[
+                                static_cast<std::size_t>(view_index)];
+                        }
                         const int reject_reason = world_to_cell_reject_reason(u, v);
                         if (reject_reason == 1) {
                             ++raw_strict_uv_reject;
@@ -1724,6 +1733,12 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                             ++raw_strict_pixel_y_reject;
                         }
                     } else if (near_plane_band) {
+                        if (floor_neighborhood_consistent(
+                            aligned_points, view.world_confidence, x, y,
+                            plane_origin_, plane_normal_, floor_band_)) {
+                            ++reliable_near_uv_reject_by_view[
+                                static_cast<std::size_t>(view_index)];
+                        }
                         const int reject_reason = world_to_cell_reject_reason(u, v);
                         if (reject_reason == 1) {
                             ++raw_near_uv_reject;
@@ -1745,6 +1760,12 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                         } else if (reject_reason == 3) {
                             ++raw_near_pixel_y_reject;
                         }
+                    } else if (height > 1.5f * floor_band_
+                        && height < max_object_height_
+                        && local_object_continuity(
+                            aligned_points, view.world_confidence, x, y, point, scene_scale_)) {
+                        ++reliable_object_uv_reject_by_view[
+                            static_cast<std::size_t>(view_index)];
                     }
 #endif
                     continue;
@@ -1840,6 +1861,24 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << raw_strict_neighborhood_rejected
                   << " near_neighborhood_rejected="
                   << raw_near_neighborhood_rejected << std::endl;
+        std::clog << "[WINDOWS_DIRECT_UV] reliable_strict_view0="
+                  << reliable_strict_uv_reject_by_view[0]
+                  << " reliable_strict_view1="
+                  << reliable_strict_uv_reject_by_view[1]
+                  << " reliable_strict_view2="
+                  << reliable_strict_uv_reject_by_view[2]
+                  << " reliable_near_view0="
+                  << reliable_near_uv_reject_by_view[0]
+                  << " reliable_near_view1="
+                  << reliable_near_uv_reject_by_view[1]
+                  << " reliable_near_view2="
+                  << reliable_near_uv_reject_by_view[2]
+                  << " reliable_object_view0="
+                  << reliable_object_uv_reject_by_view[0]
+                  << " reliable_object_view1="
+                  << reliable_object_uv_reject_by_view[1]
+                  << " reliable_object_view2="
+                  << reliable_object_uv_reject_by_view[2] << std::endl;
     }
 #endif
 
@@ -2113,6 +2152,155 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             floor_cell_valid_[cell] = 1U;
         }
     }
+    // Keep each view's direct strict/near-floor visibility separate from the
+    // current observed-floor result.  The latter remains governed by the
+    // frozen strict/two-view policy in this diagnostic pass.
+    std::array<std::vector<std::uint8_t>, 3> direct_floor_presence_by_view;
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        auto& direct_presence = direct_floor_presence_by_view[
+            static_cast<std::size_t>(view_index)];
+        direct_presence.assign(cell_count, 0U);
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            const FloorSample& strict_sample = floor_best[
+                static_cast<std::size_t>(view_index) * cell_count + cell];
+            const FloorSample& near_sample = near_floor_best[
+                static_cast<std::size_t>(view_index) * cell_count + cell];
+            if (strict_sample.valid || near_sample.valid) {
+                direct_presence[cell] = 1U;
+            }
+        }
+    }
+#if defined(_WIN32)
+    const auto resize_logical_mask = [&](const cv::Mat& mask) {
+        cv::Mat resized;
+        cv::resize(mask, resized, cv::Size(canvas_width_, canvas_height_),
+            0.0, 0.0, cv::INTER_NEAREST);
+        return resized;
+    };
+    const auto make_view_mask_visual = [&](const std::array<cv::Mat, 3>& masks) {
+        cv::Mat visual(logical_height_, logical_width_, CV_8UC3,
+            cv::Scalar(0, 0, 0));
+        for (int y = 0; y < logical_height_; ++y) {
+            for (int x = 0; x < logical_width_; ++x) {
+                cv::Vec3b& pixel = visual.at<cv::Vec3b>(y, x);
+                if (masks[0].at<std::uint8_t>(y, x) != 0U) {
+                    pixel[2] = 255U; // view0 = red
+                }
+                if (masks[1].at<std::uint8_t>(y, x) != 0U) {
+                    pixel[1] = 255U; // view1 = green
+                }
+                if (masks[2].at<std::uint8_t>(y, x) != 0U) {
+                    pixel[0] = 255U; // view2 = blue
+                }
+            }
+        }
+        return resize_logical_mask(visual);
+    };
+    if (accepted_fuse_count_ == 0U) {
+        std::array<cv::Mat, 3> direct_floor_masks;
+        std::array<std::size_t, 3> strict_counts{};
+        std::array<std::size_t, 3> near_counts{};
+        std::array<std::size_t, 3> direct_counts{};
+        std::array<std::size_t, 3> direct_only_counts{};
+        std::array<std::size_t, 3> direct_only_kept_counts{};
+        std::array<std::size_t, 3> direct_only_lost_counts{};
+        std::array<std::size_t, 8> direct_pattern_counts{};
+        cv::Mat direct_floor_union(logical_height_, logical_width_, CV_8UC1,
+            cv::Scalar(0));
+        cv::Mat lost_floor_direct_before(logical_height_, logical_width_, CV_8UC1,
+            cv::Scalar(0));
+        std::size_t direct_union_count = 0U;
+        std::size_t lost_direct_count = 0U;
+        for (int view_index = 0; view_index < 3; ++view_index) {
+            direct_floor_masks[static_cast<std::size_t>(view_index)] = cv::Mat(
+                logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+        }
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
+            const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
+            std::uint8_t pattern = 0U;
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                const FloorSample& strict_sample = floor_best[
+                    static_cast<std::size_t>(view_index) * cell_count + cell];
+                const FloorSample& near_sample = near_floor_best[
+                    static_cast<std::size_t>(view_index) * cell_count + cell];
+                if (strict_sample.valid) {
+                    ++strict_counts[static_cast<std::size_t>(view_index)];
+                }
+                if (near_sample.valid) {
+                    ++near_counts[static_cast<std::size_t>(view_index)];
+                }
+                if (direct_floor_presence_by_view[static_cast<std::size_t>(view_index)][cell]
+                    != 0U) {
+                    direct_floor_masks[static_cast<std::size_t>(view_index)].at<
+                        std::uint8_t>(y, x) = 255U;
+                    ++direct_counts[static_cast<std::size_t>(view_index)];
+                    pattern |= static_cast<std::uint8_t>(1U) << view_index;
+                }
+            }
+            if (pattern == 0U) {
+                continue;
+            }
+            ++direct_pattern_counts[pattern];
+            direct_floor_union.at<std::uint8_t>(y, x) = 255U;
+            ++direct_union_count;
+            if (support_count(pattern) == 1) {
+                for (int view_index = 0; view_index < 3; ++view_index) {
+                    if ((pattern & (static_cast<std::uint8_t>(1U) << view_index)) == 0U) {
+                        continue;
+                    }
+                    ++direct_only_counts[static_cast<std::size_t>(view_index)];
+                    if (current_observed_floor_mask[cell] != 0U) {
+                        ++direct_only_kept_counts[static_cast<std::size_t>(view_index)];
+                    } else {
+                        ++direct_only_lost_counts[static_cast<std::size_t>(view_index)];
+                    }
+                }
+            }
+            if (current_observed_floor_mask[cell] == 0U) {
+                lost_floor_direct_before.at<std::uint8_t>(y, x) = 255U;
+                ++lost_direct_count;
+            }
+        }
+        try {
+            if (!cv::imwrite("tmp/direct_floor_union.png",
+                    make_view_mask_visual(direct_floor_masks))
+                || !cv::imwrite("tmp/lost_floor_direct_before.png",
+                    resize_logical_mask(lost_floor_direct_before))) {
+                std::clog << "[WINDOWS_DIRECT_FLOOR_MASK] write_failed=1" << std::endl;
+            }
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_DIRECT_FLOOR_MASK] write_failed=1" << std::endl;
+        }
+        std::clog << "[WINDOWS_DIRECT_FLOOR] strict_view0=" << strict_counts[0]
+                  << " strict_view1=" << strict_counts[1]
+                  << " strict_view2=" << strict_counts[2]
+                  << " near_view0=" << near_counts[0]
+                  << " near_view1=" << near_counts[1]
+                  << " near_view2=" << near_counts[2]
+                  << " direct_view0=" << direct_counts[0]
+                  << " direct_view1=" << direct_counts[1]
+                  << " direct_view2=" << direct_counts[2]
+                  << " union=" << direct_union_count
+                  << " only_view0=" << direct_only_counts[0]
+                  << " only_view1=" << direct_only_counts[1]
+                  << " only_view2=" << direct_only_counts[2]
+                  << " only_view0_kept=" << direct_only_kept_counts[0]
+                  << " only_view1_kept=" << direct_only_kept_counts[1]
+                  << " only_view2_kept=" << direct_only_kept_counts[2]
+                  << " only_view0_lost=" << direct_only_lost_counts[0]
+                  << " only_view1_lost=" << direct_only_lost_counts[1]
+                  << " only_view2_lost=" << direct_only_lost_counts[2]
+                  << " lost_before_f4=" << lost_direct_count
+                  << " pattern1=" << direct_pattern_counts[1]
+                  << " pattern2=" << direct_pattern_counts[2]
+                  << " pattern3=" << direct_pattern_counts[3]
+                  << " pattern4=" << direct_pattern_counts[4]
+                  << " pattern5=" << direct_pattern_counts[5]
+                  << " pattern6=" << direct_pattern_counts[6]
+                  << " pattern7=" << direct_pattern_counts[7] << std::endl;
+    }
+#endif
 #if defined(_WIN32)
     if (accepted_fuse_count_ == 0U) {
         std::vector<std::pair<int, int>> roundtrip_cells;
@@ -2182,6 +2370,172 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << " status=" << (roundtrip_ok ? "PASS" : "FAIL") << std::endl;
     }
 #endif
+
+    const float reprojection_world_tolerance = std::max(
+        3.0f * floor_band_, 0.012f * scene_scale_);
+    const float reprojection_depth_tolerance = std::max(
+        3.0f * floor_band_, 0.015f * scene_scale_);
+
+    // F4 is the direct three-view visibility union.  It uses only an
+    // existing near-floor observation from one source view; the other views
+    // can support, occlude, lie outside, or be invalid.  Only Contradict is a
+    // veto.  This promotion happens before every inferred floor tier.
+    std::vector<FloorSample> f4_best(cell_count);
+    std::vector<int> f4_source_view(cell_count, -1);
+#if defined(_WIN32)
+    std::array<std::size_t, 3> f4_candidate_counts{};
+    std::array<std::size_t, 3> f4_rejected_contradict_counts{};
+    std::array<std::size_t, 3> f4_accepted_counts{};
+#endif
+    for (int source_view = 0; source_view < 3; ++source_view) {
+        const std::size_t source_offset = static_cast<std::size_t>(source_view) * cell_count;
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            if (current_observed_floor_mask[cell] != 0U) {
+                continue;
+            }
+            const FloorSample& sample = near_floor_best[source_offset + cell];
+            if (!sample.valid) {
+                continue;
+            }
+#if defined(_WIN32)
+            ++f4_candidate_counts[static_cast<std::size_t>(source_view)];
+#endif
+            const int logical_x = static_cast<int>(
+                cell % static_cast<std::size_t>(logical_width_));
+            const int logical_y = static_cast<int>(
+                cell / static_cast<std::size_t>(logical_width_));
+            const cv::Vec3f plane_point = cell_to_reference_floor_point(logical_x, logical_y);
+            bool contradicted = false;
+            for (int target_view = 0; target_view < 3; ++target_view) {
+                if (target_view == source_view) {
+                    continue;
+                }
+                const ReprojectionResult reprojection = project_world_point_to_view(
+                    plane_point,
+                    transforms[static_cast<std::size_t>(target_view)],
+                    views[static_cast<std::size_t>(target_view)],
+                    reprojection_world_tolerance,
+                    reprojection_depth_tolerance);
+                if (reprojection.relation == ReprojectionRelation::Contradict) {
+                    contradicted = true;
+                    break;
+                }
+            }
+            if (contradicted) {
+#if defined(_WIN32)
+                ++f4_rejected_contradict_counts[static_cast<std::size_t>(source_view)];
+#endif
+                continue;
+            }
+            if (!f4_best[cell].valid || sample.weight > f4_best[cell].weight) {
+                f4_best[cell] = sample;
+                f4_source_view[cell] = source_view;
+            }
+        }
+    }
+    std::size_t f4_accepted_total = 0U;
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (current_observed_floor_mask[cell] != 0U || !f4_best[cell].valid) {
+            continue;
+        }
+        const int source_view = f4_source_view[cell];
+        if (source_view < 0 || source_view >= 3) {
+            continue;
+        }
+        const FloorSample& sample = f4_best[cell];
+        const auto& gain = color_gain_[static_cast<std::size_t>(source_view)];
+        const cv::Vec3f corrected_color(
+            std::clamp(sample.color[0] * gain[0], 0.0f, 1.0f),
+            std::clamp(sample.color[1] * gain[1], 0.0f, 1.0f),
+            std::clamp(sample.color[2] * gain[2], 0.0f, 1.0f));
+        const int logical_x = static_cast<int>(
+            cell % static_cast<std::size_t>(logical_width_));
+        const int logical_y = static_cast<int>(
+            cell / static_cast<std::size_t>(logical_width_));
+        FusedSlot next = floor_cells_[cell];
+        next.slot_id = slot_for(logical_x, logical_y, 0);
+        next.depth = 0.0f;
+        next.confidence = std::clamp(sample.normalized_confidence, 0.0f, 1.0f);
+        if (finite_vec(corrected_color)) {
+            next.rgba = color_to_rgba(corrected_color);
+        }
+        next.floor = true;
+        floor_cells_[cell] = next;
+        floor_cell_valid_[cell] = 1U;
+        current_observed_floor_mask[cell] = 1U;
+        ++f4_accepted_total;
+#if defined(_WIN32)
+        ++f4_accepted_counts[static_cast<std::size_t>(source_view)];
+#endif
+    }
+#if defined(_WIN32)
+    if (accepted_fuse_count_ == 0U) {
+        std::size_t direct_floor_after_f4 = 0U;
+        std::size_t lost_floor_after_f4 = 0U;
+        std::array<std::size_t, 3> floor_only_kept_after_f4{};
+        std::array<std::size_t, 3> floor_only_lost_after_f4{};
+        cv::Mat lost_floor_direct_after(logical_height_, logical_width_, CV_8UC1,
+            cv::Scalar(0));
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            bool direct = false;
+            std::uint8_t pattern = 0U;
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                if (direct_floor_presence_by_view[static_cast<std::size_t>(view_index)][cell]
+                    != 0U) {
+                    direct = true;
+                    pattern |= static_cast<std::uint8_t>(1U) << view_index;
+                }
+            }
+            if (!direct) {
+                continue;
+            }
+            if (current_observed_floor_mask[cell] != 0U) {
+                ++direct_floor_after_f4;
+            } else {
+                ++lost_floor_after_f4;
+                const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
+                const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
+                lost_floor_direct_after.at<std::uint8_t>(y, x) = 255U;
+            }
+            if (support_count(pattern) == 1) {
+                const int view_index = pattern == 1U ? 0 : (pattern == 2U ? 1 : 2);
+                if (current_observed_floor_mask[cell] != 0U) {
+                    ++floor_only_kept_after_f4[static_cast<std::size_t>(view_index)];
+                } else {
+                    ++floor_only_lost_after_f4[static_cast<std::size_t>(view_index)];
+                }
+            }
+        }
+        try {
+            if (!cv::imwrite("tmp/lost_floor_direct_after.png",
+                    resize_logical_mask(lost_floor_direct_after))) {
+                std::clog << "[WINDOWS_DIRECT_FLOOR_MASK] write_failed=1" << std::endl;
+            }
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_DIRECT_FLOOR_MASK] write_failed=1" << std::endl;
+        }
+        std::clog << "[WINDOWS_F4] candidates_view0=" << f4_candidate_counts[0]
+                  << " candidates_view1=" << f4_candidate_counts[1]
+                  << " candidates_view2=" << f4_candidate_counts[2]
+                  << " rejected_contradict_view0=" << f4_rejected_contradict_counts[0]
+                  << " rejected_contradict_view1=" << f4_rejected_contradict_counts[1]
+                  << " rejected_contradict_view2=" << f4_rejected_contradict_counts[2]
+                  << " accepted_view0=" << f4_accepted_counts[0]
+                  << " accepted_view1=" << f4_accepted_counts[1]
+                  << " accepted_view2=" << f4_accepted_counts[2]
+                  << " accepted_total=" << f4_accepted_total
+                  << " direct_floor_after_f4=" << direct_floor_after_f4
+                  << " lost_floor_after_f4=" << lost_floor_after_f4
+                  << " only_view0_kept_after_f4=" << floor_only_kept_after_f4[0]
+                  << " only_view1_kept_after_f4=" << floor_only_kept_after_f4[1]
+                  << " only_view2_kept_after_f4=" << floor_only_kept_after_f4[2]
+                  << " only_view0_lost_after_f4=" << floor_only_lost_after_f4[0]
+                  << " only_view1_lost_after_f4=" << floor_only_lost_after_f4[1]
+                  << " only_view2_lost_after_f4=" << floor_only_lost_after_f4[2]
+                  << std::endl;
+    }
+#endif
+
     result.slots.reserve(cell_count / 2U);
     result.occupied_slots.reserve(cell_count / 2U);
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
@@ -2266,12 +2620,26 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         }
     }
 
+#if defined(_WIN32)
+    std::array<std::vector<std::uint8_t>, 3> direct_object_presence_by_view;
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        auto& direct_presence = direct_object_presence_by_view[
+            static_cast<std::size_t>(view_index)];
+        direct_presence.assign(cell_count, 0U);
+        for (const ViewObjectObservation& observation : object_observations_by_view[
+                static_cast<std::size_t>(view_index)]) {
+            const std::size_t cell = static_cast<std::size_t>(observation.logical_y)
+                * static_cast<std::size_t>(logical_width_)
+                + static_cast<std::size_t>(observation.logical_x);
+            if (cell < cell_count) {
+                direct_presence[cell] = 1U;
+            }
+        }
+    }
+#endif
+
     const float object_cross_view_height_tolerance = std::max(
         3.0f * floor_band_, 0.02f * scene_scale_);
-    const float reprojection_world_tolerance = std::max(
-        3.0f * floor_band_, 0.012f * scene_scale_);
-    const float reprojection_depth_tolerance = std::max(
-        3.0f * floor_band_, 0.015f * scene_scale_);
 
     std::vector<ObjectSurfaceCandidate> object_best(cell_count);
 #if defined(_WIN32)
@@ -2739,17 +3107,25 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     const float height_neighbor_threshold = std::max(
         4.0f * floor_band_, 0.03f * scene_scale_);
     std::array<cv::Mat, 3> tier4_raw_masks;
+    std::array<cv::Mat, 3> tier4_relation_anchor_masks;
     for (int source_view = 0; source_view < 3; ++source_view) {
         tier4_raw_masks[static_cast<std::size_t>(source_view)] = cv::Mat(
+            logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+        tier4_relation_anchor_masks[static_cast<std::size_t>(source_view)] = cv::Mat(
             logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
     }
     std::vector<ObjectSurfaceCandidate> tier4_best(cell_count);
 #if defined(_WIN32)
     std::size_t tier4_rejected_contradict = 0U;
-    std::size_t tier4_rejected_no_other_view_relation = 0U;
     std::array<std::size_t, 3> tier4_component_counts{};
-    std::array<std::size_t, 3> tier4_touching_component_counts{};
-    std::size_t tier4_rejected_disconnected = 0U;
+    std::array<std::size_t, 3> tier4_relation_anchor_cell_counts{};
+    std::array<std::size_t, 3> tier4_relation_anchor_component_counts{};
+    std::array<std::size_t, 3> tier4_seed_anchor_component_counts{};
+    std::array<std::size_t, 3> tier4_both_anchor_component_counts{};
+    std::array<std::size_t, 3> tier4_relation_only_component_counts{};
+    std::array<std::size_t, 3> tier4_seed_only_component_counts{};
+    std::array<std::size_t, 3> tier4_no_anchor_component_counts{};
+    std::size_t tier4_rejected_no_anchor = 0U;
     std::size_t tier4_accepted_before_height_neighbor = 0U;
 #endif
 
@@ -2770,9 +3146,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         return candidate;
     };
 
-    // Construct raw Tier4 candidates only from observations that survived the
-    // existing per-view object classifier. The two other views provide the
-    // unchanged reprojection gate; this is not a new view matcher.
+    // Construct raw Tier4-v2 candidates only from observations that survived
+    // the existing per-view object classifier.  Contradict remains a hard
+    // veto, while Outside/Invalid are retained for component-level anchors.
     for (int source_view = 0; source_view < 3; ++source_view) {
         const auto& observations = object_observations_by_view[
             static_cast<std::size_t>(source_view)];
@@ -2784,7 +3160,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 continue;
             }
             const cv::Vec3f point_reference = representative_reference_point(observation);
-            bool has_other_view_relation = false;
+            bool has_relation_anchor = false;
             bool has_contradict = false;
             for (int target_view = 0; target_view < 3; ++target_view) {
                 if (target_view == source_view) {
@@ -2800,7 +3176,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     has_contradict = true;
                 } else if (reprojection.relation == ReprojectionRelation::Support
                     || reprojection.relation == ReprojectionRelation::Occluded) {
-                    has_other_view_relation = true;
+                    has_relation_anchor = true;
                 }
             }
             if (has_contradict) {
@@ -2809,20 +3185,21 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
 #endif
                 continue;
             }
-            if (!has_other_view_relation) {
-#if defined(_WIN32)
-                ++tier4_rejected_no_other_view_relation;
-#endif
-                continue;
-            }
             tier4_raw_masks[static_cast<std::size_t>(source_view)].at<std::uint8_t>(
                 observation.logical_y, observation.logical_x) = 255U;
+            if (has_relation_anchor) {
+                tier4_relation_anchor_masks[static_cast<std::size_t>(source_view)].at<
+                    std::uint8_t>(observation.logical_y, observation.logical_x) = 255U;
+#if defined(_WIN32)
+                ++tier4_relation_anchor_cell_counts[static_cast<std::size_t>(source_view)];
+#endif
+            }
         }
     }
 
-    // Evaluate each source-view mask independently. A component is trusted
-    // only if one of its cells is 8-neighbor adjacent to the frozen seed set
-    // and the contact height passes the existing height-neighbor threshold.
+    // Evaluate each source-view mask independently.  A component is accepted
+    // by relation anchor A or trusted-seed anchor B; neither anchor may be
+    // synthesized by another Tier4-v2 component.
     for (int source_view = 0; source_view < 3; ++source_view) {
         cv::Mat labels;
         cv::Mat stats;
@@ -2835,11 +3212,18 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             component_count > 0 ? static_cast<std::size_t>(component_count - 1) : 0U;
 #endif
         for (int component = 1; component < component_count; ++component) {
+            bool component_has_relation_anchor = false;
             bool touches_trusted_seed = false;
-            for (int y = 0; y < logical_height_ && !touches_trusted_seed; ++y) {
-                for (int x = 0; x < logical_width_ && !touches_trusted_seed; ++x) {
+            for (int y = 0; y < logical_height_
+                && (!touches_trusted_seed || !component_has_relation_anchor); ++y) {
+                for (int x = 0; x < logical_width_
+                    && (!touches_trusted_seed || !component_has_relation_anchor); ++x) {
                     if (labels.at<int>(y, x) != component) {
                         continue;
+                    }
+                    if (tier4_relation_anchor_masks[static_cast<std::size_t>(source_view)].at<
+                            std::uint8_t>(y, x) != 0U) {
+                        component_has_relation_anchor = true;
                     }
                     const ViewObjectObservation* observation = find_object_observation(
                         source_view, x, y);
@@ -2872,15 +3256,31 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     }
                 }
             }
-            if (!touches_trusted_seed) {
+            const bool component_has_seed_anchor = touches_trusted_seed;
 #if defined(_WIN32)
-                ++tier4_rejected_disconnected;
+            if (component_has_relation_anchor) {
+                ++tier4_relation_anchor_component_counts[
+                    static_cast<std::size_t>(source_view)];
+            }
+            if (component_has_seed_anchor) {
+                ++tier4_seed_anchor_component_counts[static_cast<std::size_t>(source_view)];
+            }
+            if (component_has_relation_anchor && component_has_seed_anchor) {
+                ++tier4_both_anchor_component_counts[static_cast<std::size_t>(source_view)];
+            } else if (component_has_relation_anchor) {
+                ++tier4_relation_only_component_counts[static_cast<std::size_t>(source_view)];
+            } else if (component_has_seed_anchor) {
+                ++tier4_seed_only_component_counts[static_cast<std::size_t>(source_view)];
+            } else {
+                ++tier4_no_anchor_component_counts[static_cast<std::size_t>(source_view)];
+            }
+#endif
+            if (!component_has_relation_anchor && !component_has_seed_anchor) {
+#if defined(_WIN32)
+                ++tier4_rejected_no_anchor;
 #endif
                 continue;
             }
-#if defined(_WIN32)
-            ++tier4_touching_component_counts[static_cast<std::size_t>(source_view)];
-#endif
             for (int y = 0; y < logical_height_; ++y) {
                 for (int x = 0; x < logical_width_; ++x) {
                     if (labels.at<int>(y, x) != component) {
@@ -3073,19 +3473,129 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << " components_view0=" << tier4_component_counts[0]
                   << " components_view1=" << tier4_component_counts[1]
                   << " components_view2=" << tier4_component_counts[2]
-                  << " touching_view0=" << tier4_touching_component_counts[0]
-                  << " touching_view1=" << tier4_touching_component_counts[1]
-                  << " touching_view2=" << tier4_touching_component_counts[2]
+                  << " relation_anchor_cells_view0=" << tier4_relation_anchor_cell_counts[0]
+                  << " relation_anchor_cells_view1=" << tier4_relation_anchor_cell_counts[1]
+                  << " relation_anchor_cells_view2=" << tier4_relation_anchor_cell_counts[2]
+                  << " relation_anchor_components_view0="
+                  << tier4_relation_anchor_component_counts[0]
+                  << " relation_anchor_components_view1="
+                  << tier4_relation_anchor_component_counts[1]
+                  << " relation_anchor_components_view2="
+                  << tier4_relation_anchor_component_counts[2]
+                  << " seed_anchor_components_view0="
+                  << tier4_seed_anchor_component_counts[0]
+                  << " seed_anchor_components_view1="
+                  << tier4_seed_anchor_component_counts[1]
+                  << " seed_anchor_components_view2="
+                  << tier4_seed_anchor_component_counts[2]
+                  << " relation_only_view0=" << tier4_relation_only_component_counts[0]
+                  << " relation_only_view1=" << tier4_relation_only_component_counts[1]
+                  << " relation_only_view2=" << tier4_relation_only_component_counts[2]
+                  << " seed_only_view0=" << tier4_seed_only_component_counts[0]
+                  << " seed_only_view1=" << tier4_seed_only_component_counts[1]
+                  << " seed_only_view2=" << tier4_seed_only_component_counts[2]
+                  << " both_view0=" << tier4_both_anchor_component_counts[0]
+                  << " both_view1=" << tier4_both_anchor_component_counts[1]
+                  << " both_view2=" << tier4_both_anchor_component_counts[2]
                   << " rejected_contradict=" << tier4_rejected_contradict
-                  << " rejected_no_other_view_relation="
-                  << tier4_rejected_no_other_view_relation
-                  << " rejected_disconnected=" << tier4_rejected_disconnected
+                  << " rejected_no_anchor=" << tier4_rejected_no_anchor
                   << " accepted_before_height_neighbor="
                   << tier4_accepted_before_height_neighbor
                   << " accepted_final=" << tier4_final_count
                   << " final_view0=" << tier4_final_counts[0]
                   << " final_view1=" << tier4_final_counts[1]
                   << " final_view2=" << tier4_final_counts[2] << std::endl;
+    }
+#endif
+
+#if defined(_WIN32)
+    // Final direct-visibility accounting for the Tier4-v2 pipeline.  The
+    // before-v2 numbers are emitted by the diagnostic-only run immediately
+    // preceding this change; this block records the after-v2 retention.
+    if (accepted_fuse_count_ == 0U) {
+        std::array<std::size_t, 3> direct_object_counts{};
+        std::array<std::size_t, 3> direct_object_only_counts{};
+        std::array<std::size_t, 3> direct_object_only_kept_counts{};
+        std::array<std::size_t, 3> direct_object_only_lost_counts{};
+        std::array<std::size_t, 8> direct_object_pattern_counts{};
+        cv::Mat direct_object_union(logical_height_, logical_width_, CV_8UC1,
+            cv::Scalar(0));
+        cv::Mat lost_object_direct_after(logical_height_, logical_width_, CV_8UC1,
+            cv::Scalar(0));
+        std::size_t direct_union_count = 0U;
+        std::size_t lost_direct_count = 0U;
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
+            const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
+            std::uint8_t pattern = 0U;
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                if (direct_object_presence_by_view[static_cast<std::size_t>(view_index)][cell]
+                    == 0U) {
+                    continue;
+                }
+                ++direct_object_counts[static_cast<std::size_t>(view_index)];
+                pattern |= static_cast<std::uint8_t>(1U) << view_index;
+            }
+            if (pattern == 0U) {
+                continue;
+            }
+            ++direct_object_pattern_counts[pattern];
+            direct_object_union.at<std::uint8_t>(y, x) = 255U;
+            ++direct_union_count;
+            if (support_count(pattern) == 1) {
+                for (int view_index = 0; view_index < 3; ++view_index) {
+                    if ((pattern & (static_cast<std::uint8_t>(1U) << view_index)) == 0U) {
+                        continue;
+                    }
+                    ++direct_object_only_counts[static_cast<std::size_t>(view_index)];
+                    if (object_best[cell].valid) {
+                        ++direct_object_only_kept_counts[static_cast<std::size_t>(view_index)];
+                    } else {
+                        ++direct_object_only_lost_counts[static_cast<std::size_t>(view_index)];
+                    }
+                }
+            }
+            if (!object_best[cell].valid) {
+                lost_object_direct_after.at<std::uint8_t>(y, x) = 255U;
+                ++lost_direct_count;
+            }
+        }
+        std::clog << "[WINDOWS_DIRECT_OBJECT] view0=" << direct_object_counts[0]
+                  << " view1=" << direct_object_counts[1]
+                  << " view2=" << direct_object_counts[2]
+                  << " union=" << direct_union_count
+                  << " only_view0=" << direct_object_only_counts[0]
+                  << " only_view1=" << direct_object_only_counts[1]
+                  << " only_view2=" << direct_object_only_counts[2]
+                  << " only_view0_kept=" << direct_object_only_kept_counts[0]
+                  << " only_view1_kept=" << direct_object_only_kept_counts[1]
+                  << " only_view2_kept=" << direct_object_only_kept_counts[2]
+                  << " only_view0_lost=" << direct_object_only_lost_counts[0]
+                  << " only_view1_lost=" << direct_object_only_lost_counts[1]
+                  << " only_view2_lost=" << direct_object_only_lost_counts[2]
+                  << " lost_after_tier4_v2=" << lost_direct_count
+                  << " pattern1=" << direct_object_pattern_counts[1]
+                  << " pattern2=" << direct_object_pattern_counts[2]
+                  << " pattern3=" << direct_object_pattern_counts[3]
+                  << " pattern4=" << direct_object_pattern_counts[4]
+                  << " pattern5=" << direct_object_pattern_counts[5]
+                  << " pattern6=" << direct_object_pattern_counts[6]
+                  << " pattern7=" << direct_object_pattern_counts[7] << std::endl;
+        try {
+            std::array<cv::Mat, 3> direct_object_masks;
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                direct_object_masks[static_cast<std::size_t>(view_index)] =
+                    object_raw_masks[static_cast<std::size_t>(view_index)];
+            }
+            if (!cv::imwrite("tmp/direct_object_union.png",
+                    make_view_mask_visual(direct_object_masks))
+                || !cv::imwrite("tmp/lost_object_direct_after.png",
+                    resize_logical_mask(lost_object_direct_after))) {
+                std::clog << "[WINDOWS_DIRECT_OBJECT_MASK] write_failed=1" << std::endl;
+            }
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_DIRECT_OBJECT_MASK] write_failed=1" << std::endl;
+        }
     }
 #endif
 
@@ -4321,6 +4831,115 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << " final=" << object_final
                   << " object_world_hmax=" << object_world_hmax
                   << " object_render_zmax=" << object_render_zmax << std::endl;
+    }
+#endif
+
+#if defined(_WIN32)
+    if (accepted_fuse_count_ == 0U) {
+        std::array<std::size_t, 3> floor_only_kept_after{};
+        std::array<std::size_t, 3> floor_only_lost_after{};
+        std::array<std::size_t, 3> object_only_kept_after{};
+        std::array<std::size_t, 3> object_only_lost_after{};
+        std::size_t direct_floor_total = 0U;
+        std::size_t direct_object_total = 0U;
+        std::size_t lost_floor_after = 0U;
+        std::size_t lost_object_after = 0U;
+        std::size_t inferred_floor_total = 0U;
+        cv::Mat direct_union_vs_final(logical_height_, logical_width_, CV_8UC3,
+            cv::Scalar(0, 0, 0));
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            const int x = static_cast<int>(cell % static_cast<std::size_t>(logical_width_));
+            const int y = static_cast<int>(cell / static_cast<std::size_t>(logical_width_));
+            std::uint8_t floor_pattern = 0U;
+            std::uint8_t object_pattern = 0U;
+            for (int view_index = 0; view_index < 3; ++view_index) {
+                const std::uint8_t bit = static_cast<std::uint8_t>(1U) << view_index;
+                if (direct_floor_presence_by_view[static_cast<std::size_t>(view_index)][cell]
+                    != 0U) {
+                    floor_pattern |= bit;
+                }
+                if (direct_object_presence_by_view[static_cast<std::size_t>(view_index)][cell]
+                    != 0U) {
+                    object_pattern |= bit;
+                }
+            }
+            const bool direct_floor = floor_pattern != 0U;
+            const bool direct_object = object_pattern != 0U;
+            if (direct_floor) {
+                ++direct_floor_total;
+                if (support_count(floor_pattern) == 1) {
+                    const int view_index = floor_pattern == 1U ? 0
+                        : (floor_pattern == 2U ? 1 : 2);
+                    if (floor_cell_valid_[cell] != 0U) {
+                        ++floor_only_kept_after[static_cast<std::size_t>(view_index)];
+                    } else {
+                        ++floor_only_lost_after[static_cast<std::size_t>(view_index)];
+                    }
+                }
+                if (floor_cell_valid_[cell] == 0U) {
+                    ++lost_floor_after;
+                }
+            }
+            if (direct_object) {
+                ++direct_object_total;
+                if (support_count(object_pattern) == 1) {
+                    const int view_index = object_pattern == 1U ? 0
+                        : (object_pattern == 2U ? 1 : 2);
+                    if (object_best[cell].valid) {
+                        ++object_only_kept_after[static_cast<std::size_t>(view_index)];
+                    } else {
+                        ++object_only_lost_after[static_cast<std::size_t>(view_index)];
+                    }
+                }
+                if (!object_best[cell].valid) {
+                    ++lost_object_after;
+                }
+            }
+            if (!direct_floor && !direct_object
+                && floor_cell_valid_[cell] != 0U
+                && current_observed_floor_mask[cell] == 0U) {
+                ++inferred_floor_total;
+            }
+
+            cv::Vec3b& pixel = direct_union_vs_final.at<cv::Vec3b>(y, x);
+            const bool direct_kept = (direct_floor && floor_cell_valid_[cell] != 0U)
+                || (direct_object && object_best[cell].valid);
+            if (direct_floor || direct_object) {
+                if (direct_kept) {
+                    pixel = cv::Vec3b(0U, 255U, 0U); // direct kept = green
+                } else {
+                    pixel = cv::Vec3b(0U, 0U, 255U); // direct lost = red
+                }
+            } else if (floor_cell_valid_[cell] != 0U
+                && current_observed_floor_mask[cell] == 0U) {
+                pixel = cv::Vec3b(255U, 0U, 0U); // inferred-only floor = blue
+            }
+        }
+        std::clog << "[WINDOWS_DIRECT_FINAL] direct_floor=" << direct_floor_total
+                  << " direct_object=" << direct_object_total
+                  << " lost_floor_after=" << lost_floor_after
+                  << " lost_object_after=" << lost_object_after
+                  << " inferred_floor=" << inferred_floor_total
+                  << " floor_only_view0_kept=" << floor_only_kept_after[0]
+                  << " floor_only_view1_kept=" << floor_only_kept_after[1]
+                  << " floor_only_view2_kept=" << floor_only_kept_after[2]
+                  << " floor_only_view0_lost=" << floor_only_lost_after[0]
+                  << " floor_only_view1_lost=" << floor_only_lost_after[1]
+                  << " floor_only_view2_lost=" << floor_only_lost_after[2]
+                  << " object_only_view0_kept=" << object_only_kept_after[0]
+                  << " object_only_view1_kept=" << object_only_kept_after[1]
+                  << " object_only_view2_kept=" << object_only_kept_after[2]
+                  << " object_only_view0_lost=" << object_only_lost_after[0]
+                  << " object_only_view1_lost=" << object_only_lost_after[1]
+                  << " object_only_view2_lost=" << object_only_lost_after[2] << std::endl;
+        try {
+            if (!cv::imwrite("tmp/direct_union_vs_final.png",
+                    resize_logical_mask(direct_union_vs_final))) {
+                std::clog << "[WINDOWS_DIRECT_FINAL_MASK] write_failed=1" << std::endl;
+            }
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_DIRECT_FINAL_MASK] write_failed=1" << std::endl;
+        }
     }
 #endif
 

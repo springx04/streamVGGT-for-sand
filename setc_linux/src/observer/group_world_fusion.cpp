@@ -1905,6 +1905,106 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             floor_cell_valid_[cell] = 1U;
         }
     }
+    // Keep each view's direct strict/near-floor visibility separate from the
+    // current observed-floor result.  F4 promotes only the existing direct
+    // near-floor samples; inferred tiers remain downstream.
+    std::array<std::vector<std::uint8_t>, 3> direct_floor_presence_by_view;
+    for (int view_index = 0; view_index < 3; ++view_index) {
+        auto& direct_presence = direct_floor_presence_by_view[
+            static_cast<std::size_t>(view_index)];
+        direct_presence.assign(cell_count, 0U);
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            const FloorSample& strict_sample = floor_best[
+                static_cast<std::size_t>(view_index) * cell_count + cell];
+            const FloorSample& near_sample = near_floor_best[
+                static_cast<std::size_t>(view_index) * cell_count + cell];
+            if (strict_sample.valid || near_sample.valid) {
+                direct_presence[cell] = 1U;
+            }
+        }
+    }
+    const float reprojection_world_tolerance = std::max(
+        3.0f * floor_band_, 0.012f * scene_scale_);
+    const float reprojection_depth_tolerance = std::max(
+        3.0f * floor_band_, 0.015f * scene_scale_);
+
+    // F4 is the direct three-view visibility union.  It uses only an
+    // existing near-floor observation from one source view; the other views
+    // can support, occlude, lie outside, or be invalid.  Only Contradict is a
+    // veto.  This promotion happens before every inferred floor tier.
+    std::vector<FloorSample> f4_best(cell_count);
+    std::vector<int> f4_source_view(cell_count, -1);
+    for (int source_view = 0; source_view < 3; ++source_view) {
+        const std::size_t source_offset = static_cast<std::size_t>(source_view) * cell_count;
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            if (current_observed_floor_mask[cell] != 0U) {
+                continue;
+            }
+            const FloorSample& sample = near_floor_best[source_offset + cell];
+            if (!sample.valid) {
+                continue;
+            }
+            const int logical_x = static_cast<int>(
+                cell % static_cast<std::size_t>(logical_width_));
+            const int logical_y = static_cast<int>(
+                cell / static_cast<std::size_t>(logical_width_));
+            const cv::Vec3f plane_point = cell_to_reference_floor_point(logical_x, logical_y);
+            bool contradicted = false;
+            for (int target_view = 0; target_view < 3; ++target_view) {
+                if (target_view == source_view) {
+                    continue;
+                }
+                const ReprojectionResult reprojection = project_world_point_to_view(
+                    plane_point,
+                    transforms[static_cast<std::size_t>(target_view)],
+                    views[static_cast<std::size_t>(target_view)],
+                    reprojection_world_tolerance,
+                    reprojection_depth_tolerance);
+                if (reprojection.relation == ReprojectionRelation::Contradict) {
+                    contradicted = true;
+                    break;
+                }
+            }
+            if (contradicted) {
+                continue;
+            }
+            if (!f4_best[cell].valid || sample.weight > f4_best[cell].weight) {
+                f4_best[cell] = sample;
+                f4_source_view[cell] = source_view;
+            }
+        }
+    }
+    for (std::size_t cell = 0; cell < cell_count; ++cell) {
+        if (current_observed_floor_mask[cell] != 0U || !f4_best[cell].valid) {
+            continue;
+        }
+        const int source_view = f4_source_view[cell];
+        if (source_view < 0 || source_view >= 3) {
+            continue;
+        }
+        const FloorSample& sample = f4_best[cell];
+        const auto& gain = color_gain_[static_cast<std::size_t>(source_view)];
+        const cv::Vec3f corrected_color(
+            std::clamp(sample.color[0] * gain[0], 0.0f, 1.0f),
+            std::clamp(sample.color[1] * gain[1], 0.0f, 1.0f),
+            std::clamp(sample.color[2] * gain[2], 0.0f, 1.0f));
+        const int logical_x = static_cast<int>(
+            cell % static_cast<std::size_t>(logical_width_));
+        const int logical_y = static_cast<int>(
+            cell / static_cast<std::size_t>(logical_width_));
+        FusedSlot next = floor_cells_[cell];
+        next.slot_id = slot_for(logical_x, logical_y, 0);
+        next.depth = 0.0f;
+        next.confidence = std::clamp(sample.normalized_confidence, 0.0f, 1.0f);
+        if (finite_vec(corrected_color)) {
+            next.rgba = color_to_rgba(corrected_color);
+        }
+        next.floor = true;
+        floor_cells_[cell] = next;
+        floor_cell_valid_[cell] = 1U;
+        current_observed_floor_mask[cell] = 1U;
+    }
+
     result.slots.reserve(cell_count / 2U);
     result.occupied_slots.reserve(cell_count / 2U);
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
@@ -1979,10 +2079,6 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
 
     const float object_cross_view_height_tolerance = std::max(
         3.0f * floor_band_, 0.02f * scene_scale_);
-    const float reprojection_world_tolerance = std::max(
-        3.0f * floor_band_, 0.012f * scene_scale_);
-    const float reprojection_depth_tolerance = std::max(
-        3.0f * floor_band_, 0.015f * scene_scale_);
 
     std::vector<ObjectSurfaceCandidate> object_best(cell_count);
     std::array<std::vector<std::uint8_t>, 3> object_matched_by_view;
@@ -2429,8 +2525,11 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     const float height_neighbor_threshold = std::max(
         4.0f * floor_band_, 0.03f * scene_scale_);
     std::array<cv::Mat, 3> tier4_raw_masks;
+    std::array<cv::Mat, 3> tier4_relation_anchor_masks;
     for (int source_view = 0; source_view < 3; ++source_view) {
         tier4_raw_masks[static_cast<std::size_t>(source_view)] = cv::Mat(
+            logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
+        tier4_relation_anchor_masks[static_cast<std::size_t>(source_view)] = cv::Mat(
             logical_height_, logical_width_, CV_8UC1, cv::Scalar(0));
     }
     std::vector<ObjectSurfaceCandidate> tier4_best(cell_count);
@@ -2452,9 +2551,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         return candidate;
     };
 
-    // Construct raw Tier4 candidates only from observations that survived the
-    // existing per-view object classifier. The two other views provide the
-    // unchanged reprojection gate; this is not a new view matcher.
+    // Construct raw Tier4-v2 candidates only from observations that survived
+    // the existing per-view object classifier.  Contradict remains a hard
+    // veto, while Outside/Invalid are retained for component-level anchors.
     for (int source_view = 0; source_view < 3; ++source_view) {
         const auto& observations = object_observations_by_view[
             static_cast<std::size_t>(source_view)];
@@ -2466,7 +2565,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 continue;
             }
             const cv::Vec3f point_reference = representative_reference_point(observation);
-            bool has_other_view_relation = false;
+            bool has_relation_anchor = false;
             bool has_contradict = false;
             for (int target_view = 0; target_view < 3; ++target_view) {
                 if (target_view == source_view) {
@@ -2482,20 +2581,24 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     has_contradict = true;
                 } else if (reprojection.relation == ReprojectionRelation::Support
                     || reprojection.relation == ReprojectionRelation::Occluded) {
-                    has_other_view_relation = true;
+                    has_relation_anchor = true;
                 }
             }
-            if (has_contradict || !has_other_view_relation) {
+            if (has_contradict) {
                 continue;
             }
             tier4_raw_masks[static_cast<std::size_t>(source_view)].at<std::uint8_t>(
                 observation.logical_y, observation.logical_x) = 255U;
+            if (has_relation_anchor) {
+                tier4_relation_anchor_masks[static_cast<std::size_t>(source_view)].at<
+                    std::uint8_t>(observation.logical_y, observation.logical_x) = 255U;
+            }
         }
     }
 
-    // Evaluate each source-view mask independently. A component is trusted
-    // only if one of its cells is 8-neighbor adjacent to the frozen seed set
-    // and the contact height passes the existing height-neighbor threshold.
+    // Evaluate each source-view mask independently.  A component is accepted
+    // by relation anchor A or trusted-seed anchor B; neither anchor may be
+    // synthesized by another Tier4-v2 component.
     for (int source_view = 0; source_view < 3; ++source_view) {
         cv::Mat labels;
         cv::Mat stats;
@@ -2504,11 +2607,18 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             tier4_raw_masks[static_cast<std::size_t>(source_view)],
             labels, stats, centroids, 8, CV_32S);
         for (int component = 1; component < component_count; ++component) {
+            bool component_has_relation_anchor = false;
             bool touches_trusted_seed = false;
-            for (int y = 0; y < logical_height_ && !touches_trusted_seed; ++y) {
-                for (int x = 0; x < logical_width_ && !touches_trusted_seed; ++x) {
+            for (int y = 0; y < logical_height_
+                && (!touches_trusted_seed || !component_has_relation_anchor); ++y) {
+                for (int x = 0; x < logical_width_
+                    && (!touches_trusted_seed || !component_has_relation_anchor); ++x) {
                     if (labels.at<int>(y, x) != component) {
                         continue;
+                    }
+                    if (tier4_relation_anchor_masks[static_cast<std::size_t>(source_view)].at<
+                            std::uint8_t>(y, x) != 0U) {
+                        component_has_relation_anchor = true;
                     }
                     const ViewObjectObservation* observation = find_object_observation(
                         source_view, x, y);
@@ -2541,7 +2651,7 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                     }
                 }
             }
-            if (!touches_trusted_seed) {
+            if (!component_has_relation_anchor && !touches_trusted_seed) {
                 continue;
             }
             for (int y = 0; y < logical_height_; ++y) {
