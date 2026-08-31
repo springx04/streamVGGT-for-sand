@@ -2078,6 +2078,11 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         3.0f * floor_band_, 0.015f * scene_scale_);
 
     std::vector<ObjectSurfaceCandidate> object_best(cell_count);
+#if defined(_WIN32)
+    // Diagnostics only: record which frozen object tier supplied the final
+    // candidate. This vector never participates in candidate selection.
+    std::vector<std::uint8_t> object_tier_provenance(cell_count, 0U);
+#endif
     std::array<std::vector<std::uint8_t>, 3> object_matched_by_view;
     for (int view_index = 0; view_index < 3; ++view_index) {
         object_matched_by_view[static_cast<std::size_t>(view_index)].assign(
@@ -2353,10 +2358,23 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             }
             mark_object_matched(*best_third);
             consider_object_candidate(std::move(triple));
+#if defined(_WIN32)
+            if (triple_cell < cell_count && object_best[triple_cell].valid) {
+                object_tier_provenance[triple_cell] = 1U;
+            }
+#endif
         } else {
             // No third view was needed to validate this strict pair.  The
             // candidate is moved only after all optional third-view work.
+            const std::size_t pair_cell = static_cast<std::size_t>(pair.logical_y)
+                * static_cast<std::size_t>(logical_width_)
+                + static_cast<std::size_t>(pair.logical_x);
             consider_object_candidate(std::move(pair));
+#if defined(_WIN32)
+            if (pair_cell < cell_count && object_best[pair_cell].valid) {
+                object_tier_provenance[pair_cell] = 1U;
+            }
+#endif
         }
     }
 
@@ -2401,6 +2419,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             continue;
         }
         object_best[cell] = std::move(fallback_best[cell]);
+#if defined(_WIN32)
+        object_tier_provenance[cell] = 2U;
+#endif
     }
 
     // Tier 3 is deliberately limited to the Phase-A-supported case: a
@@ -2443,6 +2464,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             continue;
         }
         object_best[cell] = std::move(atlas_consensus_best[cell]);
+#if defined(_WIN32)
+        object_tier_provenance[cell] = 3U;
+#endif
     }
 
     std::vector<std::uint8_t> single_support_cells(cell_count, 0U);
@@ -3419,6 +3443,28 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         final_object_heights.push_back(candidate.height);
         ++object_final;
     }
+#if defined(_WIN32)
+    if (accepted_fuse_count_ == 0U) {
+        std::array<std::size_t, 4> object_tier_counts{};
+        for (std::size_t cell = 0; cell < cell_count; ++cell) {
+            if (!object_best[cell].valid) {
+                continue;
+            }
+            const std::uint8_t tier = object_tier_provenance[cell];
+            if (tier >= 1U && tier <= 3U) {
+                ++object_tier_counts[tier];
+            } else {
+                ++object_tier_counts[0];
+            }
+        }
+        std::clog << "[WINDOWS_OBJECT_TIER_DIAG] tier1="
+                  << object_tier_counts[1]
+                  << " tier2=" << object_tier_counts[2]
+                  << " tier3=" << object_tier_counts[3]
+                  << " unclassified=" << object_tier_counts[0]
+                  << " final=" << object_final << std::endl;
+    }
+#endif
 
     // Brightness is a display-only correction. Geometry and all of the
     // floor/object decisions above have already completed without consulting
