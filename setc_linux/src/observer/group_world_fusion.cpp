@@ -1291,9 +1291,22 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         v_max_ = v_max;
         center_u_ = 0.5f * (u_min_ + u_max_);
         center_v_ = 0.5f * (v_min_ + v_max_);
-        // The larger expanded floor span covers about 0.9 GUI units. This
-        // is also the fixed world-units-per-GUI-unit scale used for Z.
-        display_scale_ = std::max(u_max_ - u_min_, v_max_ - v_min_) / 0.9f;
+        // Fit the expanded atlas independently to the physical canvas axes.
+        // world_to_cell() uses max(width,height) as its GUI scale for both
+        // axes, so a square-canvas scale would under-capacity the shorter
+        // physical axis on the actual 770x630 canvas.
+        const float target_fill = 0.90f;
+        const float initialization_gui_scale = static_cast<float>(
+            std::max(canvas_width_, canvas_height_));
+        const float u_span = u_max_ - u_min_;
+        const float v_span = v_max_ - v_min_;
+        const float required_scale_x =
+            u_span * initialization_gui_scale
+            / (target_fill * static_cast<float>(canvas_width_));
+        const float required_scale_y =
+            v_span * initialization_gui_scale
+            / (target_fill * static_cast<float>(canvas_height_));
+        display_scale_ = std::max(required_scale_x, required_scale_y);
         if (!std::isfinite(display_scale_) || display_scale_ <= kNumericEpsilon) {
             reset();
             return reject("reference display scale is invalid");

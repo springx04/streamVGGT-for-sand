@@ -1295,9 +1295,46 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         v_max_ = v_max;
         center_u_ = 0.5f * (u_min_ + u_max_);
         center_v_ = 0.5f * (v_min_ + v_max_);
-        // The larger expanded floor span covers about 0.9 GUI units. This
-        // is also the fixed world-units-per-GUI-unit scale used for Z.
-        display_scale_ = std::max(u_max_ - u_min_, v_max_ - v_min_) / 0.9f;
+        // Fit the expanded atlas independently to the physical canvas axes.
+        // world_to_cell() uses max(width,height) as its GUI scale for both
+        // axes, so a square-canvas scale would under-capacity the shorter
+        // physical axis on the actual 770x630 canvas.
+        const float target_fill = 0.90f;
+        const float initialization_gui_scale = static_cast<float>(
+            std::max(canvas_width_, canvas_height_));
+        const float u_span = u_max_ - u_min_;
+        const float v_span = v_max_ - v_min_;
+        const float required_scale_x =
+            u_span * initialization_gui_scale
+            / (target_fill * static_cast<float>(canvas_width_));
+        const float required_scale_y =
+            v_span * initialization_gui_scale
+            / (target_fill * static_cast<float>(canvas_height_));
+        display_scale_ = std::max(required_scale_x, required_scale_y);
+#if defined(_WIN32)
+        if (accepted_fuse_count_ == 0U) {
+            const float old_display_scale = std::max(u_span, v_span) / target_fill;
+            const float old_x_capacity = old_display_scale
+                * static_cast<float>(canvas_width_) / initialization_gui_scale;
+            const float old_y_capacity = old_display_scale
+                * static_cast<float>(canvas_height_) / initialization_gui_scale;
+            const float new_x_capacity = display_scale_
+                * static_cast<float>(canvas_width_) / initialization_gui_scale;
+            const float new_y_capacity = display_scale_
+                * static_cast<float>(canvas_height_) / initialization_gui_scale;
+            std::clog << "[WINDOWS_ATLAS_MAPPING] canvas=" << canvas_width_ << "x"
+                      << canvas_height_ << " gui_scale=" << initialization_gui_scale
+                      << " u_span=" << u_span << " v_span=" << v_span
+                      << " old_display_scale=" << old_display_scale
+                      << " old_x_capacity=" << old_x_capacity
+                      << " old_y_capacity=" << old_y_capacity
+                      << " required_scale_x=" << required_scale_x
+                      << " required_scale_y=" << required_scale_y
+                      << " new_display_scale=" << display_scale_
+                      << " new_x_capacity=" << new_x_capacity
+                      << " new_y_capacity=" << new_y_capacity << std::endl;
+        }
+#endif
         if (!std::isfinite(display_scale_) || display_scale_ <= kNumericEpsilon) {
             reset();
             return reject("reference display scale is invalid");
@@ -1415,6 +1452,36 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
         return logical_x >= 0 && logical_x < logical_width_
             && logical_y >= 0 && logical_y < logical_height_;
     };
+#if defined(_WIN32)
+    // Diagnostic-only mirror of world_to_cell(): retain the production
+    // return contract while identifying whether a reject came from the
+    // atlas UV bounds or from a physical canvas edge.
+    const auto world_to_cell_reject_reason = [&](const float u, const float v) {
+        if (!std::isfinite(u) || !std::isfinite(v)
+            || u < u_min_ || u > u_max_ || v < v_min_ || v > v_max_) {
+            return 1; // UV bounds
+        }
+        const float physical_x = canvas_width_ * 0.5f
+            + (u - center_u_) / display_scale_ * gui_scale;
+        const float physical_y = canvas_height_ * 0.5f
+            - (v - center_v_) / display_scale_ * gui_scale;
+        const int rounded_x = static_cast<int>(std::lround(physical_x));
+        const int rounded_y = static_cast<int>(std::lround(physical_y));
+        if (rounded_x < 0 || rounded_x >= canvas_width_) {
+            return 2; // physical X
+        }
+        if (rounded_y < 0 || rounded_y >= canvas_height_) {
+            return 3; // physical Y
+        }
+        const int mapped_x = rounded_x / 2;
+        const int mapped_y = rounded_y / 2;
+        if (mapped_x < 0 || mapped_x >= logical_width_
+            || mapped_y < 0 || mapped_y >= logical_height_) {
+            return 3; // logical Y/canvas quantization edge
+        }
+        return 0;
+    };
+#endif
     const auto cell_to_reference_floor_point = [&](const int logical_x, const int logical_y) {
         const float physical_x = static_cast<float>(logical_x * 2) + 0.5f;
         const float physical_y = static_cast<float>(logical_y * 2) + 0.5f;
@@ -1446,9 +1513,13 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     }
 #if defined(_WIN32)
     std::size_t raw_strict_plane_band_total = 0U;
-    std::size_t raw_strict_plane_band_outside_atlas = 0U;
+    std::size_t raw_strict_uv_reject = 0U;
+    std::size_t raw_strict_pixel_x_reject = 0U;
+    std::size_t raw_strict_pixel_y_reject = 0U;
     std::size_t raw_near_plane_total = 0U;
-    std::size_t raw_near_plane_outside_atlas = 0U;
+    std::size_t raw_near_uv_reject = 0U;
+    std::size_t raw_near_pixel_x_reject = 0U;
+    std::size_t raw_near_pixel_y_reject = 0U;
     std::size_t raw_strict_neighborhood_rejected = 0U;
     std::size_t raw_near_neighborhood_rejected = 0U;
 #endif
@@ -1481,9 +1552,23 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 if (!world_to_cell(u, v, logical_x, logical_y)) {
 #if defined(_WIN32)
                     if (strict_plane_band) {
-                        ++raw_strict_plane_band_outside_atlas;
+                        const int reject_reason = world_to_cell_reject_reason(u, v);
+                        if (reject_reason == 1) {
+                            ++raw_strict_uv_reject;
+                        } else if (reject_reason == 2) {
+                            ++raw_strict_pixel_x_reject;
+                        } else if (reject_reason == 3) {
+                            ++raw_strict_pixel_y_reject;
+                        }
                     } else if (near_plane_band) {
-                        ++raw_near_plane_outside_atlas;
+                        const int reject_reason = world_to_cell_reject_reason(u, v);
+                        if (reject_reason == 1) {
+                            ++raw_near_uv_reject;
+                        } else if (reject_reason == 2) {
+                            ++raw_near_pixel_x_reject;
+                        } else if (reject_reason == 3) {
+                            ++raw_near_pixel_y_reject;
+                        }
                     }
 #endif
                     continue;
@@ -1560,10 +1645,13 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     if (accepted_fuse_count_ == 0U) {
         std::clog << "[WINDOWS_FLOOR_EDGE_DIAG] strict_plane_band_total="
                   << raw_strict_plane_band_total
-                  << " strict_plane_band_outside_atlas="
-                  << raw_strict_plane_band_outside_atlas
+                  << " strict_uv_reject=" << raw_strict_uv_reject
+                  << " strict_pixel_x_reject=" << raw_strict_pixel_x_reject
+                  << " strict_pixel_y_reject=" << raw_strict_pixel_y_reject
                   << " near_plane_total=" << raw_near_plane_total
-                  << " near_plane_outside_atlas=" << raw_near_plane_outside_atlas
+                  << " near_uv_reject=" << raw_near_uv_reject
+                  << " near_pixel_x_reject=" << raw_near_pixel_x_reject
+                  << " near_pixel_y_reject=" << raw_near_pixel_y_reject
                   << " strict_neighborhood_rejected="
                   << raw_strict_neighborhood_rejected
                   << " near_neighborhood_rejected="
@@ -1841,6 +1929,75 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             floor_cell_valid_[cell] = 1U;
         }
     }
+#if defined(_WIN32)
+    if (accepted_fuse_count_ == 0U) {
+        std::vector<std::pair<int, int>> roundtrip_cells;
+        roundtrip_cells.reserve(32U);
+        const float roundtrip_u_margin = 0.02f * (u_max_ - u_min_);
+        const float roundtrip_v_margin = 0.02f * (v_max_ - v_min_);
+        const std::array<std::pair<float, float>, 5> fixed_uv{{
+            {center_u_, center_v_},
+            {u_min_ + roundtrip_u_margin, v_min_ + roundtrip_v_margin},
+            {u_max_ - roundtrip_u_margin, v_min_ + roundtrip_v_margin},
+            {u_min_ + roundtrip_u_margin, v_max_ - roundtrip_v_margin},
+            {u_max_ - roundtrip_u_margin, v_max_ - roundtrip_v_margin}}};
+        for (const auto& uv : fixed_uv) {
+            int logical_x = 0;
+            int logical_y = 0;
+            if (world_to_cell(uv.first, uv.second, logical_x, logical_y)) {
+                roundtrip_cells.emplace_back(logical_x, logical_y);
+            }
+        }
+        std::size_t occupied_samples = 0U;
+        for (std::size_t cell = 0; cell < cell_count && occupied_samples < 16U; ++cell) {
+            if (current_observed_floor_mask[cell] == 0U) {
+                continue;
+            }
+            roundtrip_cells.emplace_back(
+                static_cast<int>(cell % static_cast<std::size_t>(logical_width_)),
+                static_cast<int>(cell / static_cast<std::size_t>(logical_width_)));
+            ++occupied_samples;
+        }
+        std::size_t roundtrip_mapped = 0U;
+        std::size_t roundtrip_passed = 0U;
+        std::size_t roundtrip_failures = 0U;
+        std::size_t roundtrip_max_dx = 0U;
+        std::size_t roundtrip_max_dy = 0U;
+        for (const auto& cell : roundtrip_cells) {
+            const cv::Vec3f point = cell_to_reference_floor_point(cell.first, cell.second);
+            const cv::Vec3f delta = point - plane_origin_;
+            const float u = axis_x_.dot(delta);
+            const float v = axis_y_.dot(delta);
+            int mapped_x = 0;
+            int mapped_y = 0;
+            if (!world_to_cell(u, v, mapped_x, mapped_y)) {
+                ++roundtrip_failures;
+                continue;
+            }
+            ++roundtrip_mapped;
+            const std::size_t dx = static_cast<std::size_t>(
+                std::abs(mapped_x - cell.first));
+            const std::size_t dy = static_cast<std::size_t>(
+                std::abs(mapped_y - cell.second));
+            roundtrip_max_dx = std::max(roundtrip_max_dx, dx);
+            roundtrip_max_dy = std::max(roundtrip_max_dy, dy);
+            if (dx <= 1U && dy <= 1U) {
+                ++roundtrip_passed;
+            } else {
+                ++roundtrip_failures;
+            }
+        }
+        const bool roundtrip_ok = roundtrip_failures == 0U
+            && roundtrip_mapped == roundtrip_cells.size();
+        std::clog << "[WINDOWS_ATLAS_ROUNDTRIP] cells=" << roundtrip_cells.size()
+                  << " mapped=" << roundtrip_mapped
+                  << " passed=" << roundtrip_passed
+                  << " failures=" << roundtrip_failures
+                  << " max_abs_dx=" << roundtrip_max_dx
+                  << " max_abs_dy=" << roundtrip_max_dy
+                  << " status=" << (roundtrip_ok ? "PASS" : "FAIL") << std::endl;
+    }
+#endif
     result.slots.reserve(cell_count / 2U);
     result.occupied_slots.reserve(cell_count / 2U);
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
@@ -2710,6 +2867,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     std::size_t completion_f3_added = 0U;
     std::size_t completion_geometry_without_direct_rgb = 0U;
     std::size_t completion_geometry_dropped_due_rgb = 0U;
+    std::size_t completion_direct_rgb_cells = 0U;
+    std::size_t completion_propagated_rgb_cells = 0U;
+    std::size_t completion_without_texture_source = 0U;
 #endif
     for (std::size_t cell = 0; cell < cell_count; ++cell) {
         const std::uint8_t tier = floor_completion_tier[cell];
@@ -2737,8 +2897,17 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             }
         }
 #if defined(_WIN32)
+        const bool has_propagated_color = !has_direct_color
+            && nearest_floor_source[cell] >= 0;
         if (!has_direct_color) {
             ++completion_geometry_without_direct_rgb;
+        }
+        if (has_direct_color) {
+            ++completion_direct_rgb_cells;
+        } else if (has_propagated_color) {
+            ++completion_propagated_rgb_cells;
+        } else {
+            ++completion_without_texture_source;
         }
 #endif
         const int logical_x = static_cast<int>(
@@ -2820,7 +2989,9 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
     std::size_t ray_valid_pixels = 0U;
     std::size_t ray_plane_intersections = 0U;
     std::size_t ray_physical_gate_rejected = 0U;
-    std::size_t ray_intersections_outside_atlas = 0U;
+    std::size_t ray_uv_reject = 0U;
+    std::size_t ray_pixel_x_reject = 0U;
+    std::size_t ray_pixel_y_reject = 0U;
     std::size_t ray_support_pixels = 0U;
     std::size_t ray_contradict_pixels = 0U;
 #endif
@@ -2876,7 +3047,14 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                 int logical_y = 0;
                 if (!world_to_cell(plane_u, plane_v, logical_x, logical_y)) {
 #if defined(_WIN32)
-                    ++ray_intersections_outside_atlas;
+                    const int reject_reason = world_to_cell_reject_reason(plane_u, plane_v);
+                    if (reject_reason == 1) {
+                        ++ray_uv_reject;
+                    } else if (reject_reason == 2) {
+                        ++ray_pixel_x_reject;
+                    } else if (reject_reason == 3) {
+                        ++ray_pixel_y_reject;
+                    }
 #endif
                     continue;
                 }
@@ -3011,8 +3189,12 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << " physical_gate_rejected=" << ray_physical_gate_rejected
                   << " support_pixels=" << ray_support_pixels
                   << " contradict_pixels=" << ray_contradict_pixels
+                  << " ray_uv_reject=" << ray_uv_reject
+                  << " ray_pixel_x_reject=" << ray_pixel_x_reject
+                  << " ray_pixel_y_reject=" << ray_pixel_y_reject
                   << " intersections_outside_atlas="
-                  << ray_intersections_outside_atlas << std::endl;
+                  << (ray_uv_reject + ray_pixel_x_reject + ray_pixel_y_reject)
+                  << std::endl;
         std::clog << "[WINDOWS_RAY_PLANE_CELLS] support_view0=" << ray_support_cells[0]
                   << " support_view1=" << ray_support_cells[1]
                   << " support_view2=" << ray_support_cells[2]
@@ -3118,8 +3300,17 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
             confidence = floor_cells_[source].confidence;
         }
 #if defined(_WIN32)
+        const bool has_propagated_color = !has_direct_color
+            && nearest_floor_source[cell] >= 0;
         if (!has_direct_color) {
             ++completion_geometry_without_direct_rgb;
+        }
+        if (has_direct_color) {
+            ++completion_direct_rgb_cells;
+        } else if (has_propagated_color) {
+            ++completion_propagated_rgb_cells;
+        } else {
+            ++completion_without_texture_source;
         }
 #endif
         const int logical_x = static_cast<int>(
@@ -3164,6 +3355,44 @@ GroupWorldFusionResult GroupWorldFusion::fuse(
                   << completion_geometry_without_direct_rgb
                   << " geometry_dropped_due_rgb="
                   << completion_geometry_dropped_due_rgb << std::endl;
+        std::clog << "[WINDOWS_COMPLETION_TEXTURE] direct_rgb="
+                  << completion_direct_rgb_cells
+                  << " propagated_rgb=" << completion_propagated_rgb_cells
+                  << " without_texture_source=" << completion_without_texture_source
+                  << std::endl;
+
+        // BGR channels encode observed floor (R), F1/F2/F3 completion (G),
+        // and accepted R1/R2 ray underlay (B). This is a coverage diagnostic
+        // only; it never participates in geometry acceptance.
+        cv::Mat atlas_coverage(logical_height_, logical_width_, CV_8UC3,
+            cv::Scalar(0, 0, 0));
+        for (int y = 0; y < logical_height_; ++y) {
+            for (int x = 0; x < logical_width_; ++x) {
+                const std::size_t cell = static_cast<std::size_t>(y)
+                    * static_cast<std::size_t>(logical_width_)
+                    + static_cast<std::size_t>(x);
+                cv::Vec3b& pixel = atlas_coverage.at<cv::Vec3b>(y, x);
+                if (current_observed_floor_mask[cell] != 0U) {
+                    pixel[2] = 255U;
+                }
+                if (floor_completion_tier[cell] != 0U) {
+                    pixel[1] = 255U;
+                }
+                if (ray_completion_tier[cell] != 0U) {
+                    pixel[0] = 255U;
+                }
+            }
+        }
+        cv::Mat atlas_coverage_visual;
+        cv::resize(atlas_coverage, atlas_coverage_visual,
+            cv::Size(canvas_width_, canvas_height_), 0.0, 0.0, cv::INTER_NEAREST);
+        try {
+            if (!cv::imwrite("tmp/atlas_canvas_coverage.png", atlas_coverage_visual)) {
+                std::clog << "[WINDOWS_ATLAS_COVERAGE] write_failed=1" << std::endl;
+            }
+        } catch (const cv::Exception&) {
+            std::clog << "[WINDOWS_ATLAS_COVERAGE] write_failed=1" << std::endl;
+        }
     }
 #endif
 
